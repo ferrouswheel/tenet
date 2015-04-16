@@ -8,6 +8,7 @@ def msg_count():
         _msg_count += 1
     return _msg_count
 
+
 class MessageTypes(object):
     # A status update to be shared with everyone
     BROADCAST = msg_count()
@@ -71,6 +72,7 @@ class MessageSerializer(object):
     def encrypt(self, msg):
         return [(msg.recipients, msg)]
 
+
 class MessageRouter(object):
     """
     Given a recipient and a message, and the fact that the recipient might
@@ -106,7 +108,9 @@ class Transport(object):
         """
         pass
 
+
 class InvalidAddress(Exception): pass
+
 
 class DictTransport(Transport):
     """
