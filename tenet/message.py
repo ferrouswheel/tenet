@@ -169,56 +169,65 @@ class MessageSerializer(object):
                 ciphertext)
 
     def decrypt(self, blob, peer):
-
         # To decrypt, first slice off the bloom_header, and check if there's a chance
         # one of the bridge_keys can be decrypted.
-        # If so, then check each...
+        num_bridge_keys, offset = self._num_keys_to_check(blob, peer)
+        if num_bridge_keys == 0:
+            return None
+
+        current_index = offset
+
+        bridge_key = None
+        for i in range(0, num_bridge_keys):
+            ciphertext = blob[current_index:current_index+128]
+            bridge_key = self._decrypt_bridge_key(ciphertext, peer.key)
+            current_index += 128
+            if bridge_key:
+                break
+
+        if not bridge_key:
+            return None
+
+        msg = self._decrypt_message_object(blob[current_index:], bridge_key)
+
+        return msg
+
+    def _num_keys_to_check(self, blob, peer):
         filter_size = settings.MSG_BLOOM_FILTER_SIZE 
 
         bloom_end_index = int(filter_size/8)
         bloom_header = bitarray()
         bloom_header.frombytes(blob[:bloom_end_index])
 
-        if bloom_hash(peer.address, filter_size):
-            pass
+        if (bloom_hash(peer.address, filter_size) | bloom_header) != bloom_header:
+            return (0, None)
 
         num_bridge_keys = int.from_bytes(blob[bloom_end_index:bloom_end_index+1],
                 byteorder='little')
-        current_index = bloom_end_index+1
+        return (num_bridge_keys, bloom_end_index+1)
 
-        bridge_key = None
-        for i in range(0,num_bridge_keys):
-            ciphertext = blob[current_index:current_index+128]
+    def _decrypt_bridge_key(self, ciphertext, priv_key):
+        dsize = SHA.digest_size
+        sentinel = Random.new().read(15+dsize) # Let's assume that average data length is 15
 
-            dsize = SHA.digest_size
-            sentinel = Random.new().read(15+dsize) # Let's assume that average data length is 15
+        cipher = PKCS1_v1_5.new(priv_key)
+        bridge_key = cipher.decrypt(ciphertext, sentinel)
 
-            cipher = PKCS1_v1_5.new(peer.key)
-            bridge_key = cipher.decrypt(ciphertext, sentinel)
+        digest = SHA.new(bridge_key[:-dsize]).digest()
+        if digest==bridge_key[-dsize:]: # Note how we DO NOT look for the sentinel
+            bridge_key = bridge_key[:-dsize]
+        else:
+            bridge_key = None
+        return bridge_key
 
-            digest = SHA.new(bridge_key[:-dsize]).digest()
-            if digest==bridge_key[-dsize:]: # Note how we DO NOT look for the sentinel
-                print("Decryption was correct.")
-                bridge_key = bridge_key[:-dsize]
-                current_index += 128
-                break
-            else:
-                bridge_key = None
-                print("Decryption was not correct, trying next bridge key.")
-            current_index += 128
-
-        if not bridge_key:
-            return None
-
-        iv = blob[current_index:(current_index + Blowfish.block_size)]
-        cipher = Blowfish.new(bridge_key, Blowfish.MODE_CBC, iv)
+    def _decrypt_message_object(self, ciphertext, key):
+        iv = ciphertext[0:Blowfish.block_size]
+        cipher = Blowfish.new(key, Blowfish.MODE_CBC, iv)
         #print("length of blowfish ciphertext ", len(blob[current_index+Blowfish.block_size:]))
-        message_text = cipher.decrypt(blob[current_index+Blowfish.block_size:])
+        message_text = cipher.decrypt(ciphertext[Blowfish.block_size:])
         num_padding = int.from_bytes([message_text[-1]], byteorder='little')
         message_text = message_text[:-1 * num_padding]
-        msg = Message.from_bytes(message_text)
-
-        return msg
+        return Message.from_bytes(message_text)
 
 class MessageRouter(object):
     """
