@@ -1,5 +1,8 @@
 import random
+import simpy
 import networkx as nx
+
+from Crypto.PublicKey import RSA
 
 from tenet.message import (
         Message,
@@ -13,13 +16,56 @@ class Peer(object):
         self.address = address
         self.friends = []
 
+        self.key = RSA.generate(1024)
+
         self.my_messages = []
 
         self.post_office = {}
 
-    def handle_message(self, msg):
-        self.my_messages.append(msg)
-        print("{} recieved a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+        # Store blobs by their content hash, to
+        # allow deduplication
+        self.blobs_by_content_hash = {}
+        # Store blobs in order to allow requests for updates since T=t
+        self.ordered_blobs = []
+        # Store blobs by local id/counter, probably not needed if we have
+        # ordered blobs
+        self.blobs_by_local_id = {}
+
+        # The local id of the last message we recieved from the network
+        self.id_counter = 0
+        print("Created peer {}".format(self.address))
+
+    def handle_message(self, blob):
+        serializer = MessageSerializer()
+        msg = serializer.decrypt(blob, self)
+
+        # Should store the blob, not the decrypted content
+        if self.store_message(msg):
+            print("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+        else:
+            print("{} recieved a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+
+    def store_message(self, msg):
+        """ Returns true is this message already exists """
+        self.id_counter += 1
+        self.ordered_blobs.append((self.id_counter, msg))
+        self.blobs_by_local_id[self.id_counter] = msg
+
+        digest = msg.__hash__().digest()
+        if digest in self.blobs_by_content_hash:
+            return True
+        self.blobs_by_content_hash[digest] = msg
+        return False
+
+    def send(self, msg, transport, router):
+        serializer = MessageSerializer()
+        message_blobs = serializer.encrypt(msg)
+        for recipients, blob in message_blobs:
+            for r in recipients:
+                # Allow router to inspect message
+                dest = router.route(r, msg)
+                # Transport only sees encrypted blob
+                transport.send_to(dest, blob)
 
     def check_pending_messages(self, peer_address):
         """ Do I have any messages for peer_address? """
@@ -29,6 +75,12 @@ class Peer(object):
         # - Needs to be robust against peers being silly.
         if peer_address not in self.post_office:
             return None
+
+    def simulate(self, router, transport, env):
+        while True:
+            wait_duration = random.randint(0,90)
+            yield env.timeout(wait_duration)
+            random_message(transport, router, self)
 
     def __str__(self):
         return "Peer %s" % self.address
@@ -63,30 +115,28 @@ def random_friendships(peers, G=None, density=0.1):
         #print('{} and {} are now friends'.format(p1, p2))
 
 
-def random_message(transport, router, peers):
-    sender = random.choice(peers)
+def random_message(transport, router, sender):
     recipient = None
+    if not sender.friends:
+        print("{} has no friends :-(".format(sender))
+        return
     while recipient is None or recipient == sender:
-        recipient = random.choice(peers)
+        recipient = random.choice(sender.friends)
 
-    msg = Message(sender, [recipient.address], MessageTypes.MESSAGE, text="Hello {}!".format(recipient))
+    msg = Message(sender, [recipient], MessageTypes.MESSAGE, text="Hello {}!".format(recipient))
 
-    serializer = MessageSerializer()
-    messages = serializer.encrypt(msg)
-    for recipients, message in messages:
-        for r in recipients:
-            dest = router.route(r, msg)
-            transport.send_to(dest, msg)
+    sender.send(msg, transport, router)
 
 
 def random_messaging(transport, router, peers, num_messages=1000):
     for i in range(0, num_messages):
-        random_message(transport, router, peers)
+        sender = random.choice(peers)
+        random_message(transport, router, sender)
 
-def gen_social_graph_1():
+def gen_social_graph_1(num_people=10):
     G=nx.Graph()
 
-    peers = [x for x in generate_random_peers()]
+    peers = [x for x in generate_random_peers(num_people)]
     [print(x) for x in peers]
 
     for p in peers:
@@ -96,8 +146,8 @@ def gen_social_graph_1():
     return (peers, G)
 
 
-def gen_social_graph_2():
-    G=nx.random_geometric_graph(200,0.125)
+def gen_social_graph_2(num_people=10):
+    G=nx.random_geometric_graph(num_people,0.125)
 
     peer_by_id = {}
     for n in G.nodes():
@@ -139,8 +189,8 @@ def draw_graph(G):
 
         
 if __name__ == '__main__':
-    #(peers, G) = gen_social_graph_1()
-    (peers_iter, G) = gen_social_graph_2()
+    #(peers, G) = gen_social_graph_1(10)
+    (peers_iter, G) = gen_social_graph_2(20)
     peers = list(peers_iter)
 
     print("graph has %d nodes with %d edges"\
@@ -153,6 +203,12 @@ if __name__ == '__main__':
 
     router = MessageRouter()
 
-    random_messaging(transport, router, peers)
+    env = simpy.Environment()
+    for p in peers:
+        env.process(p.simulate(router, transport, env))
+
+    env.run(until=1000)
+
+    #random_messaging(transport, router, peers)
 
     draw_graph(G)
