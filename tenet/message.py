@@ -1,4 +1,3 @@
-import hashlib
 import json
 import codecs
 import tenet.settings as settings
@@ -36,6 +35,7 @@ class MessageTypes(object):
     # Comment on another message, though may only be supported for certain types
     COMMENT = msg_count()
 
+    PEER_ONLINE = msg_count() 
     # Ask to peer and share keys
     PEER_REQUEST = msg_count() 
     # Accept peer request
@@ -80,13 +80,6 @@ class Message(object):
     @classmethod
     def from_dict(cls, d):
         return Message(d['author'], d['recipients'], d['type'], **d['data'])
-
-    def __hash__(self):
-        h = hashlib.sha256()
-        for k in self.data:
-            h.update(k.encode('utf-8'))
-            h.update(self.data[k].encode('utf-8'))
-        return h
 
 
 class MessageSerializer(object):

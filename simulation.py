@@ -1,4 +1,5 @@
 import random
+import hashlib
 import simpy
 import networkx as nx
 
@@ -40,21 +41,23 @@ class Peer(object):
         msg = serializer.decrypt(blob, self)
 
         # Should store the blob, not the decrypted content
-        if self.store_message(msg):
+        if self.store_message(blob):
             print("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
         else:
-            print("{} recieved a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            print("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
 
-    def store_message(self, msg):
+    def store_message(self, blob):
         """ Returns true is this message already exists """
         self.id_counter += 1
-        self.ordered_blobs.append((self.id_counter, msg))
-        self.blobs_by_local_id[self.id_counter] = msg
+        self.ordered_blobs.append((self.id_counter, blob))
+        self.blobs_by_local_id[self.id_counter] = blob
 
-        digest = msg.__hash__().digest()
+        md5sum = hashlib.md5()
+        md5sum.update(blob)
+        digest = md5sum.digest()
         if digest in self.blobs_by_content_hash:
             return True
-        self.blobs_by_content_hash[digest] = msg
+        self.blobs_by_content_hash[digest] = blob
         return False
 
     def send(self, msg, transport, router):
