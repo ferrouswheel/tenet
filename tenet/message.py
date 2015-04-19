@@ -69,6 +69,14 @@ class Message(object):
             "data": self.data
         }
 
+    def as_bytes(self):
+        return json.dumps(self.as_dict()).encode('utf-8')
+
+    @classmethod
+    def from_bytes(cls, message_bytes):
+        msg_dict = json.loads(codecs.decode(message_bytes, 'utf-8'))
+        return Message.from_dict(msg_dict)
+
     @classmethod
     def from_dict(cls, d):
         return Message(d['author'], d['recipients'], d['type'], **d['data'])
@@ -107,8 +115,19 @@ class MessageSerializer(object):
         from tenet.utils import chunks
 
         blobs = []
+        total_size = 0
+        blob_count = 0
+        orig_size = len(msg.as_bytes())
         for recipients in chunks(msg.recipients, settings.MAX_RECIPIENTS_PER_MESSAGE):
-            blobs.append((recipients, self._encrypt_for_recipients(recipients, msg)))
+            blob = self._encrypt_for_recipients(recipients, msg)
+            blob_count += 1
+            total_size += len(blob)
+            blobs.append((recipients, blob))
+
+        print("Total size of encrypted message is {} (orig: {} bytes, +{:.2f}%), across {} blobs.".format(
+            total_size, orig_size, ((total_size - orig_size) * 100.0)/orig_size,
+            blob_count
+            ))
 
         return blobs
 
@@ -118,14 +137,13 @@ class MessageSerializer(object):
         bloom_header.setall(False)
         bridge_keys = []
 
-        message = json.dumps(msg.as_dict()).encode('utf-8')
+        message = msg.as_bytes()
 
         msg_key = Random.new().read(56)
-        print("Bridge key is", codecs.encode(msg_key, 'hex'))
+        #print("Bridge key is", codecs.encode(msg_key, 'hex'))
 
         bs = Blowfish.block_size
         iv = Random.new().read(bs)
-        print("iv is ", codecs.encode(iv, 'hex'))
 
         cipher = Blowfish.new(msg_key, Blowfish.MODE_CBC, iv)
         plen = bs - divmod(len(message),bs)[1]
@@ -133,7 +151,7 @@ class MessageSerializer(object):
         padding = pack('b'*plen, *padding)
         
         ciphertext = iv + cipher.encrypt(message + padding)
-        print(codecs.encode(ciphertext, 'hex'))
+        #print(codecs.encode(ciphertext, 'hex'))
 
         for recipient in recipients:
             # TODO don't use recipients for the bloom filter, use their
@@ -143,8 +161,6 @@ class MessageSerializer(object):
             h = SHA.new(msg_key)
             cipher = PKCS1_v1_5.new(recipient.key)
             bk = cipher.encrypt(msg_key+h.digest())
-            print(bk)
-            print(len(bk))
             bridge_keys.append(bk)
 
         
@@ -194,19 +210,13 @@ class MessageSerializer(object):
         if not bridge_key:
             return None
 
-        print("Bridge key was", codecs.encode(bridge_key, 'hex'))
-
         iv = blob[current_index:(current_index + Blowfish.block_size)]
-        print("iv is ", codecs.encode(iv, 'hex'))
-
         cipher = Blowfish.new(bridge_key, Blowfish.MODE_CBC, iv)
-        print("length of blowfish ciphertext ", len(blob[current_index+Blowfish.block_size:]))
+        #print("length of blowfish ciphertext ", len(blob[current_index+Blowfish.block_size:]))
         message_text = cipher.decrypt(blob[current_index+Blowfish.block_size:])
         num_padding = int.from_bytes([message_text[-1]], byteorder='little')
         message_text = message_text[:-1 * num_padding]
-        print(message_text)
-        msg_dict = json.loads(codecs.decode(message_text, 'utf-8'))
-        msg = Message.from_dict(msg_dict)
+        msg = Message.from_bytes(message_text)
 
         return msg
 
