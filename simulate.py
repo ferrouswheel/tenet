@@ -1,22 +1,56 @@
 #!/usr/bin/env python3
-
+import logging
+from logging.config import dictConfig
 import simpy
 import networkx as nx
 
 from tenet.simulation import gen_social_graph_2, draw_graph
+from tenet.utils import ColorFormatter
 
 from tenet.message import (
         DictTransport, MessageRouter
         )
+
+
+logging_config = dict(
+    version = 1,
+    disable_existing_loggers = False,
+    formatters = {
+        'f': {
+            '()': ColorFormatter,
+            'format':
+              #'%(asctime)s %(name)-16s %(levelname)-6s %(message)s',
+              '$COLOR%(levelname)s $RESET %(asctime)s $BOLD$GREEN%(name)-16s$RESET %(message)s'
+              }
+        },
+    handlers = {
+        'h': {'class': 'logging.StreamHandler',
+              'formatter': 'f',
+              'level': logging.DEBUG}
+        },
+    #loggers = {
+        #'root': {'handlers': ['h'],
+                 #'level': logging.DEBUG}
+        #},
+    root = {
+      "level": logging.DEBUG,
+      "handlers": ['h']
+    }
+)
+
+dictConfig(logging_config)
+
+log = logging.getLogger(__name__)
+
 
 if __name__ == '__main__':
     #(peers, G) = gen_social_graph_1(10)
     (peers_iter, G) = gen_social_graph_2(20)
     simulated_peers = list(peers_iter)
 
-    print("graph has %d nodes with %d edges"\
+    log.debug("graph has %d nodes with %d edges"\
           %(nx.number_of_nodes(G),nx.number_of_edges(G)))
-    print(nx.number_connected_components(G),"connected components")
+    log.debug(str(nx.number_connected_components(G)) + " connected components")
 
     transport = DictTransport()
     for sp in simulated_peers:

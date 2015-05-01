@@ -1,4 +1,5 @@
 import hashlib
+import logging
 
 from Crypto.PublicKey import RSA
 
@@ -6,6 +7,8 @@ from tenet.message import (
         Message,
         DictTransport, MessageRouter, MessageSerializer, MessageTypes
         )
+
+log = logging.getLogger(__name__)
 
 
 class Peer(object):
@@ -31,7 +34,7 @@ class Peer(object):
 
         # The local id of the last message we recieved from the network
         self.id_counter = 0
-        print("Created peer {}".format(self.address))
+        log.debug("Created peer {}".format(self.address))
 
     def handle_message(self, blob):
         serializer = MessageSerializer()
@@ -39,9 +42,9 @@ class Peer(object):
 
         # Should store the blob, not the decrypted content
         if self.store_message(blob):
-            print("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            log.debug("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
         else:
-            print("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            log.debug("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
 
     def store_message(self, blob):
         """ Returns true is this message already exists """

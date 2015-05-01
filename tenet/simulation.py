@@ -1,4 +1,5 @@
 import random
+import logging
 import networkx as nx
 
 from tenet.message import (
@@ -6,6 +7,10 @@ from tenet.message import (
         DictTransport, MessageRouter, MessageSerializer, MessageTypes
         )
 from tenet.peer import Peer
+
+
+log = logging.getLogger(__name__)
+
 
 class SimulatedPeer(object):
 
@@ -22,7 +27,7 @@ class SimulatedPeer(object):
         sender = self.peer
         recipient = None
         if not sender.friends:
-            print("{} has no friends :-(".format(sender))
+            log.debug("{} has no friends :-(".format(sender))
             return
         while recipient is None or recipient == sender:
             recipient = random.choice(sender.friends)
@@ -59,20 +64,14 @@ def random_friendships(peers, G=None, density=0.1):
         p1.friends.append(p2)
         p2.friends.append(p1)
 
-        #print('{} and {} are now friends'.format(p1, p2))
+        #log.debug('{} and {} are now friends'.format(p1, p2))
 
-
-
-def random_messaging(transport, router, peers, num_messages=1000):
-    for i in range(0, num_messages):
-        sender = random.choice(peers)
-        random_message(transport, router, sender)
 
 def gen_social_graph_1(num_people=10):
     G=nx.Graph()
 
     peers = [x for x in generate_random_peers(num_people)]
-    [print(x) for x in peers]
+    [log.debug(x) for x in peers]
 
     for p in peers:
         G.add_node(p.address)

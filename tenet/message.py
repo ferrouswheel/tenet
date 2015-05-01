@@ -1,5 +1,7 @@
 import json
 import codecs
+import logging
+
 import tenet.settings as settings
 
 from bitarray import bitarray
@@ -13,6 +15,8 @@ from struct import pack
 
 from tenet.hash import bloom_hash
 from tenet.utils import chunks
+
+log = logging.getLogger(__name__)
 
 
 _msg_count = None
@@ -117,7 +121,7 @@ class MessageSerializer(object):
             total_size += len(blob)
             blobs.append((recipients, blob))
 
-        print("Total size of encrypted message is {} (orig: {} bytes, +{:.2f}%), across {} blobs.".format(
+        log.debug("Total size of encrypted message is {} (orig: {} bytes, +{:.2f}%), across {} blobs.".format(
             total_size, orig_size, ((total_size - orig_size) * 100.0)/orig_size,
             blob_count
             ))
@@ -133,7 +137,7 @@ class MessageSerializer(object):
         message = msg.as_bytes()
 
         msg_key = Random.new().read(56)
-        #print("Bridge key is", codecs.encode(msg_key, 'hex'))
+        #log.debug("Bridge key is", codecs.encode(msg_key, 'hex'))
 
         bs = Blowfish.block_size
         iv = Random.new().read(bs)
@@ -144,7 +148,7 @@ class MessageSerializer(object):
         padding = pack('b'*plen, *padding)
         
         ciphertext = iv + cipher.encrypt(message + padding)
-        #print(codecs.encode(ciphertext, 'hex'))
+        #log.debug(codecs.encode(ciphertext, 'hex'))
 
         for recipient in recipients:
             # TODO don't use recipients for the bloom filter, use their
@@ -216,7 +220,7 @@ class MessageSerializer(object):
     def _decrypt_message_object(self, ciphertext, key):
         iv = ciphertext[0:Blowfish.block_size]
         cipher = Blowfish.new(key, Blowfish.MODE_CBC, iv)
-        #print("length of blowfish ciphertext ", len(blob[current_index+Blowfish.block_size:]))
+        #log.debug("length of blowfish ciphertext ", len(blob[current_index+Blowfish.block_size:]))
         message_text = cipher.decrypt(ciphertext[Blowfish.block_size:])
         num_padding = int.from_bytes([message_text[-1]], byteorder='little')
         message_text = message_text[:-1 * num_padding]
