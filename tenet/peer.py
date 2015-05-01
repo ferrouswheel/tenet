@@ -42,9 +42,9 @@ class Peer(object):
 
         # Should store the blob, not the decrypted content
         if self.store_message(blob):
-            log.debug("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            log.warning("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
         else:
-            log.debug("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            log.info("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
 
     def store_message(self, blob):
         """ Returns true is this message already exists """

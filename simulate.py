@@ -20,7 +20,7 @@ logging_config = dict(
             '()': ColorFormatter,
             'format':
               #'%(asctime)s %(name)-16s %(levelname)-6s %(message)s',
-              '$COLOR%(levelname)s $RESET %(asctime)s $BOLD$GREEN%(name)-16s$RESET %(message)s'
+              '$COLOR%(levelname)-8s$RESET %(asctime)s $BOLD$GREEN%(name)-16s$RESET %(message)s'
               }
         },
     handlers = {
@@ -48,9 +48,9 @@ if __name__ == '__main__':
     (peers_iter, G) = gen_social_graph_2(20)
     simulated_peers = list(peers_iter)
 
-    log.debug("graph has %d nodes with %d edges"\
+    log.info("Generated social graph has %d nodes with %d edges"\
           %(nx.number_of_nodes(G),nx.number_of_edges(G)))
-    log.debug(str(nx.number_connected_components(G)) + " connected components")
+    log.info(str(nx.number_connected_components(G)) + " connected components")
 
     transport = DictTransport()
     for sp in simulated_peers:
