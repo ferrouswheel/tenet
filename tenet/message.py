@@ -12,6 +12,8 @@ from Crypto import Random
 from struct import pack
 
 from tenet.hash import bloom_hash
+from tenet.utils import chunks
+
 
 _msg_count = None
 def msg_count():
@@ -105,8 +107,6 @@ class MessageSerializer(object):
     """
 
     def encrypt(self, msg):
-        from tenet.utils import chunks
-
         blobs = []
         total_size = 0
         blob_count = 0
