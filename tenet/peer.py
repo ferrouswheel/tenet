@@ -30,6 +30,9 @@ class Peer(object):
         # ordered blobs
         self.blobs_by_local_id = {}
 
+        self.traffic_sent = 0
+        self.traffic_received = 0
+
         # The local id of the last message we recieved from the network
         self.id_counter = 0
         log.debug("Created peer {}".format(self.address))
@@ -47,6 +50,12 @@ class Peer(object):
             "total": total,
         }
 
+    def metrics(self):
+        m = self.storage_size()
+        m['net_in'] = self.traffic_received
+        m['net_out'] = self.traffic_sent
+        return m
+
     def blob_digest(self, blob):
         md5sum = hashlib.md5()
         md5sum.update(blob)
@@ -54,6 +63,8 @@ class Peer(object):
 
     def handle_message(self, blob):
         serializer = MessageSerializer()
+
+        self.traffic_received += len(blob)
 
         digest = self.blob_digest(blob)
         if self.store_message(digest, blob):
@@ -65,7 +76,6 @@ class Peer(object):
             log.info("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
         except Exception:
             log.error("Failed to decrypt blob", exc_info=True)
-
 
     def store_message(self, digest, blob):
         """ Returns true is this message already exists """
@@ -88,6 +98,7 @@ class Peer(object):
                 dest = router.route(r, msg)
                 # Transport only sees encrypted blob
                 transport.send_to(dest, blob)
+                self.traffic_sent += len(blob)
 
     def check_pending_messages(self, peer_address):
         """ Do I have any messages for peer_address? """

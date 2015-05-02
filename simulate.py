@@ -67,6 +67,6 @@ if __name__ == '__main__':
     #random_messaging(transport, router, peers)
 
     for sp in simulated_peers:
-        log.info(str(sp.peer) + " storage size: " + repr(sp.peer.storage_size()))
+        log.info(str(sp.peer) + " metrics: " + repr(sp.peer.metrics()))
 
     draw_graph(G)
