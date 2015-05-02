@@ -51,9 +51,13 @@ class Peer(object):
         }
 
     def metrics(self):
-        m = self.storage_size()
-        m['net_in'] = self.traffic_received
-        m['net_out'] = self.traffic_sent
+        m = {
+            'storage': self.storage_size(),
+            'net': {
+                'in': self.traffic_received,
+                'out': self.traffic_sent,
+            }
+        }
         return m
 
     def blob_digest(self, blob):
