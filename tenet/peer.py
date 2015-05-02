@@ -21,8 +21,6 @@ class Peer(object):
 
         self.my_messages = []
 
-        self.post_office = {}
-
         # Store blobs by their content hash, to
         # allow deduplication
         self.blobs_by_content_hash = {}
@@ -36,27 +34,48 @@ class Peer(object):
         self.id_counter = 0
         log.debug("Created peer {}".format(self.address))
 
+    def storage_size(self):
+        """ Calculate total storage of messages """
+
+        total = sum([len(x) for x in self.blobs_by_content_hash.values()])
+        ours = sum(
+            [ len(self.blobs_by_content_hash[msg.blob_digest])
+              for msg in self.my_messages ])
+
+        return {
+            "ours": ours,
+            "total": total,
+        }
+
+    def blob_digest(self, blob):
+        md5sum = hashlib.md5()
+        md5sum.update(blob)
+        return md5sum.digest()
+
     def handle_message(self, blob):
         serializer = MessageSerializer()
-        msg = serializer.decrypt(blob, self)
 
-        # Should store the blob, not the decrypted content
-        if self.store_message(blob):
-            log.warning("{} recieved a duplicate message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
-        else:
+        digest = self.blob_digest(blob)
+        if self.store_message(digest, blob):
+            log.warning("{} recieved a duplicate blob from {}".format(self, "TODO"))
+        try:
+            msg = serializer.decrypt(blob, self)
+            msg.blob_digest = digest
+            self.my_messages.append(msg)
             log.info("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+        except Exception:
+            log.error("Failed to decrypt blob", exc_info=True)
 
-    def store_message(self, blob):
+
+    def store_message(self, digest, blob):
         """ Returns true is this message already exists """
+        if digest in self.blobs_by_content_hash:
+            return True
+
         self.id_counter += 1
         self.ordered_blobs.append((self.id_counter, blob))
         self.blobs_by_local_id[self.id_counter] = blob
 
-        md5sum = hashlib.md5()
-        md5sum.update(blob)
-        digest = md5sum.digest()
-        if digest in self.blobs_by_content_hash:
-            return True
         self.blobs_by_content_hash[digest] = blob
         return False
 
@@ -76,8 +95,7 @@ class Peer(object):
         # - Peers could keep track of which messages have already been sent to each other peer?
         # - Requesting peer could also say when they last asked.
         # - Needs to be robust against peers being silly.
-        if peer_address not in self.post_office:
-            return None
+        return None
 
     def __str__(self):
         return "Peer %s" % self.address
