@@ -8,9 +8,10 @@ will depend on these:
 
 * People will have personal "smart" devices connected to the internet for
   a large proportion of the time.
-* Centralisation of societies social connections, meta data, and our own
+* Centralisation of society's social connections, meta-data, and our own
   personal interactions with friends will become more politicised. We will want
-  to assert some control over just who has access to our relationship data.
+  to assert some control over just who has access to our relationship and
+  communication data.
 
 It would be nice if this became true:
 
@@ -18,28 +19,34 @@ It would be nice if this became true:
   devices.
   
 However, supporting non-direct transports will mean this isn't strictly
-necessary. A third party server could act as a dumb router, or indeed PGP
-envrypted blobs could be sent via email.
+necessary. A third party server could act as a dumb router, encrypted blobs
+could be sent via email.
 
 ## A distributed social fabric
 
 The basic idea is that every node/user in the social network will store and
-download not only the updates that are addressed to them, but also the updates
-addressed to their friends, or friends of friends. The idea being partly that
-your social network should be more trustworthy than a centralised server that
-gets to decide who was root access to the world's online social interactions.
-It also distributes the risk, because even if some disconnected part of the p2p
-network is compromised in some way (social or techical) it is only a `risk` if
-they are part of your social group.
+recieve not only the updates that are addressed to them, but also the updates
+addressed to their friends, or friends of friends. While it's not completely
+true that your social network is more trustworthy than a centralised server, it
+does make it harder for an arbitrary authority to decide who has root access to
+the world's online social interactions.
 
-To summarise: we require that each user be a node participating in distributing
-content, including the content they can’t read.
+This approach also distributes the risk, because even if some disconnected part
+of the p2p network is compromised in some way (social or technical) it is only
+a risk if they are part of your social group.
+
+We require that each user be a node participating in distributing content,
+including the content they can’t read.
 
 How do we determine which content can be read? All messages between peers are
-encrypted using PGP. Each message has a header and key preamble that allows
-a message to be addressed to multiple recipients with different PGP key pairs
-(this is an assumption I've made that appears to be "safe", but I'm keen to
-here from cryptographers as to whether it is)
+encrypted. Each message has a header and key preamble that allows
+a message to be addressed to multiple recipients with different key pairs.
+
+(**NOTE**: This is an assumption I've made that appears to be "safe", but I'm keen to
+here from experts/cryptographers as to whether it is. I believe it wouldn't be
+a deal breaker to the overall protocol if we had to replace the message format.
+In fact, I'm sure the message format will evolve to support the things that
+people want to share with one another)
 
 ## Alternatives
 
@@ -50,12 +57,10 @@ could be consider more a "federated" solution to social networking, where tenet
 is meant to be "peer to peer" in the same way that we think of bittorrent and
 other file sharing applications to be.
 
-(Could a bridge be possible between diaspora and tenet? It'd be better to
-allow connectivity than exclude protocols unnnecessarily.)
-
 [Camlistore](https://camlistore.org/) is promising appraoch for allowing people
 to sharing a blob filestystem, which may be useful for guiding tenet or for
-providing a transport.
+providing a more robust transport not dependent on an individual's smart device
+connection.
 
 A number of p2p social networks have also come and gone, but have been based on
 the idea of people running things on their local computer. The reality however
@@ -66,30 +71,32 @@ connected, and ubiquitous.
 I also believe that usability is fundamental. It doesn't matter how cool the
 p2p technology, encryption, or geekiness of tenet is, if non-techs can't
 easily use the platform... they won't. Being in control of one's social data
-should only by a small part of the offering.
+should only be one part of the offering. Cultivating a social movement is key
+for any substantial uptake.
 
-## Technical Assumption
+## Technical Properties
 
-* [Transience]() - Each node will only store a recent history of shared
+* **Transience** - Each node will only store a recent history of shared
   memory/content. It’s up to users to connect frequently enough to get all
   updates. This should be fine, since very rarely do we have to look back over
   other people's posts unless it's something we remember seeing. This has the
   side effect that "forgetting" is intrinsic to the social network. If you were
   not around at the time when stuff was shared, then you can't go back and try
   and dig up dirt on people after the fact.
-* [Transports]() - Most people’s phones won’t be able to run internet
-  accessible servers, so we'll need a router. Initially we could use dumb
-  websockets which just allow the user to connect to others. This transport layer
+* [Transports](#transports) - Most people’s phones won’t be able to run internet
+  accessible servers, so we'll need a router. This transport layer
   should be easily replaceable so long as it provides the hooks expected by
-  tenet.
-* [Multi-party decryption](#mpd) We can encrypt blobs that are addressed to
+  tenet. Server administrators can use DNS TXT records to define how to connect
+  to users under a certain domain (but for the non-technical, we can provide
+  a default domain that routes messages directly)
+* [Multi-party decryption](#mpd) - We can encrypt blobs that are addressed to
   multiple recipients, and do this without duplicating and encrypting the
   entire message for each recipient.
 
 
 ### <a name="mpd"></a>Multi-party Decryption
 
-What follows is a message format that allows for decryption by multiple parties
+The message format needs to allow for decryption by multiple parties
 using different keys.
 
 When friend requests are accepted, users exchange their public keys. If
@@ -101,9 +108,9 @@ of the following format:
 ```
 
 NOTE: If for some reason this design can't work, or we can’t have shared decryption
-in general, then we’ll need to store N encrypted blobs for N users.  This is
+in general, then we’ll need to store N encrypted blobs for N users. This is
 much less efficient, and may make the exchange of updates much less scalable
-for real-world social networks. Although bandwidth is alwasy getting cheaper.
+for real-world social networks. Although bandwidth is always getting cheaper.
 
 **Bloom header**
 
@@ -159,6 +166,8 @@ Message types:
 - new message - direct chat with users
 - new comment (optional with attachment)
 - is peer online?
+- get updates since X - ask friend to send any messages that may be for them
+  since a given timestamp
 - request peering / friend request
 - accept peer / accept friend
 - friend delete (or unsubscribe and silently stop providing updates)
@@ -197,7 +206,7 @@ Create message with:
 }
 ```
 
-## Transports
+## <a name="mpd"></a> Transports
 
 While bittorrent uses direct TCP/UDP, our aim is to able to practically run
 clients on user's phones. Most cell phones however cannot have direct externally
@@ -237,7 +246,8 @@ https://github.com/miniupnp/miniupnp/blob/master/miniupnpc/testupnpigd.py
 
 - use bonjour/avahi/mdns to announce a a service joel-tenet.local or something
   similar. show a login key on cell phone, and pair.
-- one problem is we can’t use https without having a self-signed certificate.
+- one problem is we can’t use https without having a self-signed certificate so
+  if only sensible on trusted wifi networks.
 
 ## Account Creation Flow
 
