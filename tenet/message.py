@@ -176,7 +176,7 @@ class MessageSerializer(object):
         # To decrypt, first slice off the bloom_header, and check if there's a chance
         # one of the bridge_keys can be decrypted.
         num_bridge_keys, offset = self._num_keys_to_check(blob, peer)
-        log.debug("we have %d bridge keys to check", num_bridge_keys)
+        log.debug("We have %d bridge keys to check", num_bridge_keys)
         if num_bridge_keys == 0:
             return None
 
@@ -248,9 +248,24 @@ class MessageRouter(object):
     behalf.
     """
 
-    def route(self, destination, message):
-        """ Don't get fancy yet """
-        return destination
+    def connection_ranking(self, recipients, online_peers):
+        return set(online_peers) - set(recipients)
+
+    def route(self, recipients, online_peers, message):
+        """
+        Iterator will keep returning potential destinations to
+        receive the message. Might not be the actual recipient if they are
+        offline, but it's a guess at who might be valid path to get the message
+        to them.
+        """
+
+        # First, try to send to all recipients we think are online
+        for r in recipients:
+            if r in online_peers:
+                yield r
+
+        for o in self.connection_ranking(recipients, online_peers):
+            yield o
 
 
 class Transport(object):
@@ -278,6 +293,8 @@ class Transport(object):
 
 class InvalidAddress(Exception): pass
 
+class PeerOffline(Exception): pass
+
 
 class DictTransport(Transport):
     """
@@ -290,7 +307,12 @@ class DictTransport(Transport):
 
     def send_to(self, dest, message):
         p = self.peers.get(dest.address)
+
         if p is None:
             raise InvalidAddress(dest.address)
-        p.handle_message(message)
+
+        if p.connected:
+            p.handle_message(message)
+        else:
+            raise PeerOffline
         return True

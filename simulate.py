@@ -52,19 +52,16 @@ if __name__ == '__main__':
           %(nx.number_of_nodes(G),nx.number_of_edges(G)))
     log.info(str(nx.number_connected_components(G)) + " connected components")
 
+    # Initialise the dummy transport for simulation
     transport = DictTransport()
     for sp in simulated_peers:
         transport.peers[sp.peer.address] = sp.peer
 
-    router = MessageRouter()
-
     env = simpy.Environment()
     for sp in simulated_peers:
-        env.process(sp.simulate(router, transport, env))
+        env.process(sp.simulate(transport, env))
 
     env.run(until=1000)
-
-    #random_messaging(transport, router, peers)
 
     for sp in simulated_peers:
         log.info(str(sp.peer) + " metrics: " + repr(sp.peer.metrics()))

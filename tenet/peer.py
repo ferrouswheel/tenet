@@ -5,7 +5,8 @@ from Crypto.PublicKey import RSA
 
 from tenet.message import (
         Message,
-        DictTransport, MessageRouter, MessageSerializer, MessageTypes
+        DictTransport, MessageRouter, MessageSerializer, MessageTypes,
+        PeerOffline
         )
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ class Peer(object):
         self.key = RSA.generate(1024)
 
         self.my_messages = []
+        self.connected = False
 
         # Store blobs by their content hash, to
         # allow deduplication
@@ -32,6 +34,8 @@ class Peer(object):
 
         self.traffic_sent = 0
         self.traffic_received = 0
+
+        self.router = MessageRouter()
 
         # The local id of the last message we recieved from the network
         self.id_counter = 0
@@ -75,9 +79,14 @@ class Peer(object):
             log.warning("{} recieved a duplicate blob from {}".format(self, "TODO"))
         try:
             msg = serializer.decrypt(blob, self)
-            msg.blob_digest = digest
-            self.my_messages.append(msg)
-            log.info("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            if msg:
+                msg.blob_digest = digest
+                self.my_messages.append(msg)
+                log.info("{} received a message from {}, it said '{}'".format(self, msg.author, msg.data.get('text')))
+            else:
+                # TODO:
+                # Time a check to see if we should forward messages to friends
+                log.info("Received a blob we can't decrypt")
         except Exception:
             log.error("Failed to decrypt blob", exc_info=True)
 
@@ -93,16 +102,34 @@ class Peer(object):
         self.blobs_by_content_hash[digest] = blob
         return False
 
-    def send(self, msg, transport, router):
+    @property
+    def online_friends(self):
+        # TODO this needs to handle the lack of knowledge about whether a friend is
+        # ACTUALLY online, or if they've timed out. Create a friend class to represent
+        # peers from the point of view of a specific person. This won't have
+        # direct access to their connected state
+        return [f for f in self.friends if f.connected]
+
+    def send(self, msg, transport):
         serializer = MessageSerializer()
         message_blobs = serializer.encrypt(msg)
         for recipients, blob in message_blobs:
-            for r in recipients:
-                # Allow router to inspect message
-                dest = router.route(r, msg)
-                # Transport only sees encrypted blob
-                transport.send_to(dest, blob)
-                self.traffic_sent += len(blob)
+            min_copies = max(len(recipients), len(self.online_friends))
+
+            msg_route = self.router.route(recipients, self.online_friends, msg)
+            for copy in range(0, min_copies):
+                success = False
+                while success is False:
+                    dest = next(msg_route)
+
+                    try:
+                        # Transport only sees encrypted blob
+                        transport.send_to(dest, blob)
+                        self.traffic_sent += len(blob)
+                        success = True
+                    except PeerOffline:
+                        log.warning("Tried to send to {} but they are offline".format(dest))
+
 
     def check_pending_messages(self, peer_address):
         """ Do I have any messages for peer_address? """

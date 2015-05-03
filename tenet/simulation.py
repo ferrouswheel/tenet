@@ -4,7 +4,7 @@ import networkx as nx
 
 from tenet.message import (
         Message,
-        DictTransport, MessageRouter, MessageSerializer, MessageTypes
+        DictTransport, MessageSerializer, MessageTypes
         )
 from tenet.peer import Peer
 
@@ -18,11 +18,11 @@ class SimulatedPeer(object):
         self.peer = peer
         self.connected = True
 
-    def simulate(self, router, transport, env):
+    def simulate(self, transport, env):
         actions = ['friend_post', 'send_msg']
         while True:
             available_actions = list(actions)
-            if self.connected:
+            if self.peer.connected:
                 available_actions.append('disconnect')
             else:
                 # NOTE: maybe simulate offline posts
@@ -33,21 +33,21 @@ class SimulatedPeer(object):
             a = random.choice(available_actions)
 
             if a == 'send_msg':
-                self.random_message(transport, router)
+                self.random_message(transport)
             elif a == 'friend_post':
-                self.random_post(transport, router)
+                self.random_post(transport)
             elif a == 'disconnect':
                 log.info("{} has disconnected".format(self.peer))
-                self.connected = False
+                self.peer.connected = False
             elif a == 'connect':
                 log.info("{} has reconnected".format(self.peer))
-                self.connected = True
+                self.peer.connected = True
 
             wait_duration = random.randint(0,90)
             yield env.timeout(wait_duration)
 
 
-    def random_post(self, transport, router):
+    def random_post(self, transport):
         sender = self.peer
         recipients = set()
         if not sender.friends:
@@ -61,9 +61,9 @@ class SimulatedPeer(object):
 
         msg = Message(sender, list(recipients), MessageTypes.SHARE, text="This is a general post to mah friends!")
 
-        sender.send(msg, transport, router)
+        sender.send(msg, transport)
 
-    def random_message(self, transport, router):
+    def random_message(self, transport):
         sender = self.peer
         recipient = None
         if not sender.friends:
@@ -74,7 +74,7 @@ class SimulatedPeer(object):
 
         msg = Message(sender, [recipient], MessageTypes.MESSAGE, text="Hello {}!".format(recipient))
 
-        sender.send(msg, transport, router)
+        sender.send(msg, transport)
 
 
 def random_address(i):
