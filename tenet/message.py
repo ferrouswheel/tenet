@@ -66,6 +66,7 @@ class Message(object):
         self.recipients = recipients
         self.message_type = msg_type
         self.data = data
+        self.blob_digest = None
 
     def as_dict(self):
         return {
@@ -183,9 +184,10 @@ class MessageSerializer(object):
         # To decrypt, first slice off the bloom_header, and check if there's a chance
         # one of the bridge_keys can be decrypted.
         num_bridge_keys, offset = self._num_keys_to_check(blob, peer)
-        log.debug("We have %d bridge keys to check", num_bridge_keys)
         if num_bridge_keys == 0:
             return None
+
+        log.debug("We have %d bridge keys to check", num_bridge_keys)
 
         current_index = offset
         msg_offset = offset + (128 * num_bridge_keys)

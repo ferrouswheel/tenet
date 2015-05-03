@@ -75,7 +75,7 @@ class Peer(object):
         self.traffic_received += len(blob)
 
         digest = self.blob_digest(blob)
-        if self.store_message(digest, blob):
+        if self.store_message(blob, digest):
             log.warning("{} recieved a duplicate blob from {}".format(self, "TODO"))
         try:
             msg = serializer.decrypt(blob, self)
@@ -90,7 +90,7 @@ class Peer(object):
         except Exception:
             log.error("Failed to decrypt blob", exc_info=True)
 
-    def store_message(self, digest, blob):
+    def store_message(self, blob, digest=None):
         """ Returns true is this message already exists """
         if digest in self.blobs_by_content_hash:
             return True
@@ -114,6 +114,9 @@ class Peer(object):
         serializer = MessageSerializer()
 
         message_blobs = serializer.encrypt(msg, {f.address : f.key for f in self.friends})
+
+        # We store message we've sent too, in case a peer asks us directly for updates.
+        [self.store_message(b[1]) for b in message_blobs]
 
         for recipients, blob in message_blobs:
             min_copies = max(len(recipients), len(self.online_friends))
