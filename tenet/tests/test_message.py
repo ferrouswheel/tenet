@@ -55,3 +55,89 @@ class TestMessage(TestCase):
         self.assertEqual(m.as_dict(),
                 msg_dict,
                 "Loading from dict, message is correct")
+
+
+class TestMessageSerializer(TestCase):
+
+    def setUp(self):
+        pass
+
+    def test_encrypt_cycle(self):
+        m = Message("blah@blah.com", ["blah@blah.com"], MessageTypes.MESSAGE,
+                testdata="hello joe")
+
+        p = Peer('blah@blah.com')
+        ms = MessageSerializer()
+        blobs = ms.encrypt(m, {'blah@blah.com' : p.key} )
+
+        self.assertEqual(len(blobs), 1, "only one blob")
+
+        (recipients, blob) = blobs[0]
+
+        self.assertEqual(recipients, ['blah@blah.com'], "blob is for recipient")
+        self.assertEqual(ms._num_keys_to_check(blob, p), (1, 11), "only one bridge key to check")
+
+        d_m = ms.decrypt(blob, p)
+
+        self.assertEqual(d_m.as_dict(), m.as_dict(),
+                "Message is the same after encryption and decryption")
+
+    def test_encrypt_cycle_multi_recipients(self):
+        m = Message("blah@blah.com",
+                ["blah0@blah.com", "blah1@blah.com", "blah2@blah.com"],
+                MessageTypes.MESSAGE,
+                testdata="hello joe")
+
+        peers = []
+        keys = {}
+        for p in range(0, 3):
+            address = 'blah%d@blah.com' % p
+            pp = Peer(address)
+            peers.append(pp)
+            keys[address] = pp.key
+
+        ms = MessageSerializer()
+        blobs = ms.encrypt(m, keys)
+
+        self.assertEqual(len(blobs), 1, "only one blob")
+
+        (recipients, blob) = blobs[0]
+
+        for p in peers:
+            self.assertTrue(p.address in recipients, "blob is for recipient")
+            d_m = ms.decrypt(blob, p)
+
+            self.assertEqual(ms._num_keys_to_check(blob, p), (3, 11))
+
+            self.assertEqual(d_m.as_dict(), m.as_dict(),
+                "Message is the same after encryption and decryption")
+
+    def test_encrypt_cycle_wrong_recipient(self):
+        m = Message("blah@blah.com",
+                ["blah0@blah.com", "blah1@blah.com", "blah2@blah.com"],
+                MessageTypes.MESSAGE,
+                testdata="hello joe")
+
+        peers = []
+        keys = {}
+        for p in range(0, 3):
+            address = 'blah%d@blah.com' % p
+            pp = Peer(address)
+            peers.append(pp)
+            keys[address] = pp.key
+
+        ms = MessageSerializer()
+        blobs = ms.encrypt(m, keys)
+
+        self.assertEqual(len(blobs), 1, "only one blob")
+
+        (recipients, blob) = blobs[0]
+
+        pp = Peer('someoneelse@blah.com')
+        self.assertFalse(pp.address in recipients, "blob is not for recipient")
+
+        self.assertEqual(ms._num_keys_to_check(blob, pp), (0, None))
+
+        d_m = ms.decrypt(blob, pp)
+
+        self.assertTrue(d_m is None)
