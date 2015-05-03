@@ -16,12 +16,52 @@ class SimulatedPeer(object):
 
     def __init__(self, peer):
         self.peer = peer
+        self.connected = True
 
     def simulate(self, router, transport, env):
+        actions = ['friend_post', 'send_msg']
         while True:
+            available_actions = list(actions)
+            if self.connected:
+                available_actions.append('disconnect')
+            else:
+                # NOTE: maybe simulate offline posts
+                # so that connection behaviour and a sudden egress of messages
+                # doesn't mess things up
+                available_actions = ['connect', 'disconnect']
+
+            a = random.choice(available_actions)
+
+            if a == 'send_msg':
+                self.random_message(transport, router)
+            elif a == 'friend_post':
+                self.random_post(transport, router)
+            elif a == 'disconnect':
+                log.info("{} has disconnected".format(self.peer))
+                self.connected = False
+            elif a == 'connect':
+                log.info("{} has reconnected".format(self.peer))
+                self.connected = True
+
             wait_duration = random.randint(0,90)
             yield env.timeout(wait_duration)
-            self.random_message(transport, router)
+
+
+    def random_post(self, transport, router):
+        sender = self.peer
+        recipients = set()
+        if not sender.friends:
+            log.debug("{} has no friends :-(".format(sender))
+            return
+
+        num_recipients = random.randint(1, len(sender.friends))
+        while len(recipients) < num_recipients:
+            r = random.choice(sender.friends)
+            recipients.add(r)
+
+        msg = Message(sender, list(recipients), MessageTypes.SHARE, text="This is a general post to mah friends!")
+
+        sender.send(msg, transport, router)
 
     def random_message(self, transport, router):
         sender = self.peer

@@ -129,16 +129,23 @@ class MessageSerializer(object):
         return blobs
 
     def _encrypt_for_recipients(self, recipients, msg):
+
+        # initialise the bloom filter
         filter_size = settings.MSG_BLOOM_FILTER_SIZE 
         bloom_header = bitarray(filter_size)
         bloom_header.setall(False)
+
+        # keep a list of bridge_keys, each is the encrypted bridge key for
+        # a particular recipient
         bridge_keys = []
 
         message = msg.as_bytes()
 
+        # This is the secret inside each bridge key ciphertext
         msg_key = Random.new().read(56)
-        #log.debug("Bridge key is", codecs.encode(msg_key, 'hex'))
+        log.debug("Bridge key is " + str(codecs.encode(msg_key, 'hex')))
 
+        # Encrypt the message with the secret
         bs = Blowfish.block_size
         iv = Random.new().read(bs)
 
@@ -148,10 +155,11 @@ class MessageSerializer(object):
         padding = pack('b'*plen, *padding)
         
         ciphertext = iv + cipher.encrypt(message + padding)
-        #log.debug(codecs.encode(ciphertext, 'hex'))
+        log.debug(codecs.encode(ciphertext, 'hex'))
 
+        # Now encrypt the bridge key using each recipients public key
         for recipient in recipients:
-            # TODO don't use recipients for the bloom filter, use their
+            # TODO don't use recipients email for the bloom filter, use their
             # public keys
             bloom_header |= bloom_hash(recipient.address, filter_size)
 
@@ -159,7 +167,6 @@ class MessageSerializer(object):
             cipher = PKCS1_v1_5.new(recipient.key)
             bk = cipher.encrypt(msg_key+h.digest())
             bridge_keys.append(bk)
-
         
         return (bloom_header.tobytes() +
                 bytes([len(recipients)]) + b''.join(bridge_keys) +
@@ -169,23 +176,30 @@ class MessageSerializer(object):
         # To decrypt, first slice off the bloom_header, and check if there's a chance
         # one of the bridge_keys can be decrypted.
         num_bridge_keys, offset = self._num_keys_to_check(blob, peer)
+        log.debug("we have %d bridge keys to check", num_bridge_keys)
         if num_bridge_keys == 0:
             return None
 
         current_index = offset
+        msg_offset = offset + (128 * num_bridge_keys)
 
+        msg = None
         bridge_key = None
         for i in range(0, num_bridge_keys):
             ciphertext = blob[current_index:current_index+128]
             bridge_key = self._decrypt_bridge_key(ciphertext, peer.key)
             current_index += 128
-            if bridge_key:
-                break
+
+            try:
+                if bridge_key:
+                    log.debug("trying to decrypt with bridge_key %s", codecs.encode(bridge_key, 'hex'))
+                    msg = self._decrypt_message_object(blob[msg_offset:], bridge_key)
+                    break
+            except UnicodeDecodeError:
+                pass
 
         if not bridge_key:
             return None
-
-        msg = self._decrypt_message_object(blob[current_index:], bridge_key)
 
         return msg
 
