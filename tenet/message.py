@@ -69,8 +69,8 @@ class Message(object):
 
     def as_dict(self):
         return {
-            "author": self.author.address,
-            "recipients": [r.address for r in self.recipients],
+            "author": self.author,
+            "recipients": self.recipients,
             "type": self.message_type,
             "data": self.data
         }
@@ -110,10 +110,14 @@ class MessageSerializer(object):
     [ bloom header ][ C_key1 ][ C_key2 ]…[ C_keyN ][ shared encrypted blob]
     """
 
-    def encrypt(self, msg):
+    def __init__(self):
+        self.public_keys = {}
+
+    def encrypt(self, msg, public_keys):
         blobs = []
         total_size = 0
         blob_count = 0
+        self.public_keys.update(public_keys)
         orig_size = len(msg.as_bytes())
         for recipients in chunks(msg.recipients, settings.MAX_RECIPIENTS_PER_MESSAGE):
             blob = self._encrypt_for_recipients(recipients, msg)
@@ -127,6 +131,9 @@ class MessageSerializer(object):
             ))
 
         return blobs
+
+    def _key_for(self, address, private=False):
+        return self.public_keys[address]
 
     def _encrypt_for_recipients(self, recipients, msg):
 
@@ -155,16 +162,16 @@ class MessageSerializer(object):
         padding = pack('b'*plen, *padding)
         
         ciphertext = iv + cipher.encrypt(message + padding)
-        log.debug(codecs.encode(ciphertext, 'hex'))
+        #log.debug(codecs.encode(ciphertext, 'hex'))
 
         # Now encrypt the bridge key using each recipients public key
         for recipient in recipients:
             # TODO don't use recipients email for the bloom filter, use their
             # public keys
-            bloom_header |= bloom_hash(recipient.address, filter_size)
+            bloom_header |= bloom_hash(recipient, filter_size)
 
             h = SHA.new(msg_key)
-            cipher = PKCS1_v1_5.new(recipient.key)
+            cipher = PKCS1_v1_5.new(self._key_for(recipient))
             bk = cipher.encrypt(msg_key+h.digest())
             bridge_keys.append(bk)
         

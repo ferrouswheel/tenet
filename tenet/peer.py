@@ -112,7 +112,9 @@ class Peer(object):
 
     def send(self, msg, transport):
         serializer = MessageSerializer()
-        message_blobs = serializer.encrypt(msg)
+
+        message_blobs = serializer.encrypt(msg, {f.address : f.key for f in self.friends})
+
         for recipients, blob in message_blobs:
             min_copies = max(len(recipients), len(self.online_friends))
 

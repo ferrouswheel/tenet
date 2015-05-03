@@ -59,7 +59,7 @@ class SimulatedPeer(object):
             r = random.choice(sender.friends)
             recipients.add(r)
 
-        msg = Message(sender, list(recipients), MessageTypes.SHARE, text="This is a general post to mah friends!")
+        msg = Message(sender.address, [r.address for r in recipients], MessageTypes.SHARE, text="This is a general post to mah friends!")
 
         sender.send(msg, transport)
 
@@ -72,7 +72,7 @@ class SimulatedPeer(object):
         while recipient is None or recipient == sender:
             recipient = random.choice(sender.friends)
 
-        msg = Message(sender, [recipient], MessageTypes.MESSAGE, text="Hello {}!".format(recipient))
+        msg = Message(sender.address, [recipient.address], MessageTypes.MESSAGE, text="Hello {}!".format(recipient))
 
         sender.send(msg, transport)
 
@@ -121,7 +121,7 @@ def gen_social_graph_1(num_people=10):
 
 
 def gen_social_graph_2(num_people=10):
-    G=nx.random_geometric_graph(num_people,0.125)
+    G=nx.random_geometric_graph(num_people,0.225)
 
     peer_by_id = {}
     for n in G.nodes():
