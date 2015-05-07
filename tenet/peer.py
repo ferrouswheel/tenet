@@ -12,11 +12,19 @@ from tenet.message import (
 log = logging.getLogger(__name__)
 
 
+class Friend(object):
+
+    def __init__(self, address, key):
+        self.address = address
+        # TODO: check it is only public key
+        self.public_key = key
+        self.online = False
+
 class Peer(object):
 
     def __init__(self, address):
         self.address = address
-        self.friends = []
+        self.friends = {}
 
         self.key = RSA.generate(1024)
 
@@ -40,6 +48,10 @@ class Peer(object):
         # The local id of the last message we recieved from the network
         self.id_counter = 0
         log.debug("Created peer {}".format(self.address))
+
+    def on_connect(self):
+        """ Called when a peer has come back online """
+
 
     def storage_size(self):
         """ Calculate total storage of messages """
@@ -69,8 +81,11 @@ class Peer(object):
         md5sum.update(blob)
         return md5sum.digest()
 
-    def handle_message(self, blob):
+    def handle_message(self, from_peer, blob):
         serializer = MessageSerializer()
+
+        if from_peer.address in self.friends:
+            self.friends[from_peer.address].online = True
 
         self.traffic_received += len(blob)
 
@@ -90,6 +105,12 @@ class Peer(object):
         except Exception:
             log.error("Failed to decrypt blob", exc_info=True)
 
+    def add_friend(self, address, key):
+        if address in self.friends:
+            raise Exception('Already a friend!')
+
+        self.friends[address] = Friend(address, key)
+
     def store_message(self, blob, digest=None):
         """ Returns true is this message already exists """
         if digest in self.blobs_by_content_hash:
@@ -108,7 +129,7 @@ class Peer(object):
         # ACTUALLY online, or if they've timed out. Create a friend class to represent
         # peers from the point of view of a specific person. This won't have
         # direct access to their connected state
-        return [f for f in self.friends if f.connected]
+        return [f for _address, f in self.friends.items() if f.online]
 
     def send(self, msg, transport):
         serializer = MessageSerializer()
@@ -130,10 +151,13 @@ class Peer(object):
                     try:
                         # Transport only sees encrypted blob
                         transport.send_to(dest, blob)
+                        self.friends[dest.address].online = True
+
                         self.traffic_sent += len(blob)
                         success = True
                     except PeerOffline:
                         log.warning("Tried to send to {} but they are offline".format(dest))
+                        self.friends[dest.address].online = False
 
 
     def check_pending_messages(self, peer_address):
