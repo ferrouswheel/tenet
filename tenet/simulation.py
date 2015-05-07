@@ -6,7 +6,7 @@ from tenet.message import (
         Message,
         DictTransport, MessageSerializer, MessageTypes
         )
-from tenet.peer import Peer
+from tenet.peer import Peer, Friend
 
 
 log = logging.getLogger(__name__)
@@ -54,9 +54,9 @@ class SimulatedPeer(object):
             log.debug("{} has no friends :-(".format(sender))
             return
 
-        num_recipients = random.randint(1, len(sender.friends))
+        num_recipients = random.randint(1, len(list(sender.friends.values())))
         while len(recipients) < num_recipients:
-            r = random.choice(sender.friends)
+            r = random.choice(list(sender.friends.values()))
             recipients.add(r)
 
         msg = Message(sender.address, [r.address for r in recipients], MessageTypes.SHARE, text="This is a general post to mah friends!")
@@ -70,7 +70,7 @@ class SimulatedPeer(object):
             log.debug("{} has no friends :-(".format(sender))
             return
         while recipient is None or recipient == sender:
-            recipient = random.choice(sender.friends)
+            recipient = random.choice(list(sender.friends.values()))
 
         msg = Message(sender.address, [recipient.address], MessageTypes.MESSAGE, text="Hello {}!".format(recipient))
 
@@ -101,8 +101,8 @@ def random_friendships(peers, G=None, density=0.1):
 
         G.add_edge(p1.address, p2.address)
         # TODO exchange keys too
-        p1.friends.append(p2)
-        p2.friends.append(p1)
+        p1.friends[p2.address] = Friend(p2.address, p2.key)
+        p2.friends[p1.address] = Friend(p1.address, p1.key)
 
         #log.debug('{} and {} are now friends'.format(p1, p2))
 
@@ -128,10 +128,10 @@ def gen_social_graph_2(num_people=10):
         peer_by_id[n] = SimulatedPeer(Peer(random_address(n)))
 
     for e in G.edges():
-        f1 = peer_by_id[e[0]]
-        f2 = peer_by_id[e[1]]
-        f1.peer.friends.append(f2.peer)
-        f2.peer.friends.append(f1.peer)
+        p1 = peer_by_id[e[0]]
+        p2 = peer_by_id[e[1]]
+        p1.peer.friends[p2.peer.address] = Friend(p2.peer.address, p2.peer.key)
+        p2.peer.friends[p1.peer.address] = Friend(p1.peer.address, p1.peer.key)
 
     return peer_by_id.values(), G
 

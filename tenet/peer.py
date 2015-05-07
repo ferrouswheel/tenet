@@ -17,7 +17,7 @@ class Friend(object):
     def __init__(self, address, key):
         self.address = address
         # TODO: check it is only public key
-        self.public_key = key
+        self.key = key
         self.online = False
 
 class Peer(object):
@@ -134,7 +134,7 @@ class Peer(object):
     def send(self, msg, transport):
         serializer = MessageSerializer()
 
-        message_blobs = serializer.encrypt(msg, {f.address : f.key for f in self.friends})
+        message_blobs = serializer.encrypt(msg, {address : f.key for address, f in self.friends.items()})
 
         # We store message we've sent too, in case a peer asks us directly for updates.
         [self.store_message(b[1]) for b in message_blobs]
