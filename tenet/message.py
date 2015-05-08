@@ -6,7 +6,7 @@ import tenet.settings as settings
 
 from bitarray import bitarray
 
-from Crypto.Cipher import PKCS1_v1_5
+from Crypto.Cipher import PKCS1_v1_5, PKCS1_OAEP
 from Crypto.Hash import SHA
 from Crypto.Cipher import Blowfish
 from Crypto import Random
@@ -41,6 +41,7 @@ class MessageTypes(object):
     # Comment on another message, though may only be supported for certain types
     COMMENT = msg_count()
 
+    # indicate we've come online and ask for recent messages
     PEER_ONLINE = msg_count() 
     # Ask to peer and share keys
     PEER_REQUEST = msg_count() 
@@ -171,9 +172,9 @@ class MessageSerializer(object):
             # public keys
             bloom_header |= bloom_hash(recipient, filter_size)
 
-            h = SHA.new(msg_key)
-            cipher = PKCS1_v1_5.new(self._key_for(recipient))
-            bk = cipher.encrypt(msg_key+h.digest())
+            #h = SHA.new(msg_key)
+            cipher = PKCS1_OAEP.new(self._key_for(recipient))
+            bk = cipher.encrypt(msg_key) #+h.digest())
             bridge_keys.append(bk)
         
         return (bloom_header.tobytes() +
@@ -196,8 +197,11 @@ class MessageSerializer(object):
         bridge_key = None
         for i in range(0, num_bridge_keys):
             ciphertext = blob[current_index:current_index+128]
-            bridge_key = self._decrypt_bridge_key(ciphertext, peer.key)
             current_index += 128
+            try:
+                bridge_key = self._decrypt_bridge_key(ciphertext, peer.key)
+            except ValueError:
+                continue
 
             try:
                 if bridge_key:
@@ -227,18 +231,13 @@ class MessageSerializer(object):
         return (num_bridge_keys, bloom_end_index+1)
 
     def _decrypt_bridge_key(self, ciphertext, priv_key):
-        dsize = SHA.digest_size
-        sentinel = Random.new().read(15+dsize) # Let's assume that average data length is 15
+        #dsize = SHA.digest_size
+        #sentinel = Random.new().read(15+dsize) # Let's assume that average data length is 15
 
-        cipher = PKCS1_v1_5.new(priv_key)
-        bridge_key = cipher.decrypt(ciphertext, sentinel)
-
-        digest = SHA.new(bridge_key[:-dsize]).digest()
-        if digest==bridge_key[-dsize:]: # Note how we DO NOT look for the sentinel
-            bridge_key = bridge_key[:-dsize]
-        else:
-            bridge_key = None
-        return bridge_key
+        cipher = PKCS1_OAEP.new(priv_key)
+        bridge_key = cipher.decrypt(ciphertext)# sentinel)
+        bk = bridge_key #[:-dsize]
+        return bk
 
     def _decrypt_message_object(self, ciphertext, key):
         iv = ciphertext[0:Blowfish.block_size]
