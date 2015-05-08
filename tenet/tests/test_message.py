@@ -105,9 +105,10 @@ class TestMessageSerializer(TestCase):
 
         for p in peers:
             self.assertTrue(p.address in recipients, "blob is for recipient")
+            self.assertEqual(ms._num_keys_to_check(blob, p), (3, 11))
+
             d_m = ms.decrypt(blob, p)
 
-            self.assertEqual(ms._num_keys_to_check(blob, p), (3, 11))
 
             self.assertEqual(d_m.as_dict(), m.as_dict(),
                 "Message is the same after encryption and decryption")

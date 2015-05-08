@@ -49,9 +49,12 @@ class Peer(object):
         self.id_counter = 0
         log.debug("Created peer {}".format(self.address))
 
-    def on_connect(self):
+    def on_connect(self, transport):
         """ Called when a peer has come back online """
 
+        for address, f in self.friends.items():
+            msg = Message(self.address, [address], MessageTypes.PEER_ONLINE)
+            self.send(msg, transport)
 
     def storage_size(self):
         """ Calculate total storage of messages """

@@ -42,6 +42,7 @@ class SimulatedPeer(object):
             elif a == 'connect':
                 log.info("{} has reconnected".format(self.peer))
                 self.peer.connected = True
+                self.peer.on_connect(transport)
 
             wait_duration = random.randint(0,90)
             yield env.timeout(wait_duration)
