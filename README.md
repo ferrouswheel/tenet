@@ -1,6 +1,10 @@
 tenet
 =====
 
+> **NOTICE** - Since I wrote this, I became aware of [Secure Scuttlebutt](https://github.com/ssbc/secure-scuttlebutt)
+> I totally recommend checking that out, as if I have the time to contribute to a p2p social fabric, then
+> I'll probably work with something people are already using instead of taking Tenet any further.
+
 A protocol for a p2p social network with reference implementation.
 
 tenet makes the following assumptions, it's long term viability in large part
