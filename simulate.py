@@ -54,14 +54,16 @@ if __name__ == '__main__':
 
     # Initialise the dummy transport for simulation
     transport = DictTransport()
+    import pprint
     for sp in simulated_peers:
         transport.peers[sp.peer.address] = sp.peer
+    pprint.pprint(transport.peers)
 
     env = simpy.Environment()
     for sp in simulated_peers:
         env.process(sp.simulate(transport, env))
 
-    env.run(until=1000)
+    env.run(until=2000)
 
     for sp in simulated_peers:
         log.info(str(sp.peer) + " metrics: " + repr(sp.peer.metrics()))

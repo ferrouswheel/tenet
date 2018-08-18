@@ -7,6 +7,7 @@ from tenet.message import (
         DictTransport, MessageSerializer, MessageTypes
         )
 from tenet.peer import Peer, Friend
+from tenet.utils import weighted_choice
 
 
 log = logging.getLogger(__name__)
@@ -19,32 +20,34 @@ class SimulatedPeer(object):
         self.connected = True
 
     def simulate(self, transport, env):
-        actions = ['friend_post', 'send_msg']
+        actions = [('friend_post', 4), ('send_msg', 4)]
         while True:
             available_actions = list(actions)
             if self.peer.connected:
-                available_actions.append('disconnect')
+                available_actions.append(('disconnect', 2))
             else:
                 # NOTE: maybe simulate offline posts
                 # so that connection behaviour and a sudden egress of messages
                 # doesn't mess things up
-                available_actions = ['connect', 'disconnect']
+                available_actions = [('connect', 1), ('none', 3)]
 
-            a = random.choice(available_actions)
+            a = weighted_choice(available_actions)
 
             if a == 'send_msg':
+                log.debug("{} will send a message.".format(self.peer))
                 self.random_message(transport)
             elif a == 'friend_post':
+                log.debug("{} will make a post.".format(self.peer))
                 self.random_post(transport)
             elif a == 'disconnect':
-                log.info("{} has disconnected".format(self.peer))
+                log.info("{} disconnecting".format(self.peer))
                 self.peer.connected = False
             elif a == 'connect':
-                log.info("{} has reconnected".format(self.peer))
+                log.info("{} reconnecting".format(self.peer))
                 self.peer.connected = True
                 self.peer.on_connect(transport)
 
-            wait_duration = random.randint(0,90)
+            wait_duration = random.randint(1,4)
             yield env.timeout(wait_duration)
 
 
@@ -122,7 +125,7 @@ def gen_social_graph_1(num_people=10):
 
 
 def gen_social_graph_2(num_people=10):
-    G=nx.random_geometric_graph(num_people,0.225)
+    G=nx.random_geometric_graph(num_people,0.325)
 
     peer_by_id = {}
     for n in G.nodes():
