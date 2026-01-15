@@ -9,6 +9,8 @@ __pycache__/
 .Python
 env/
 bin/
+!src/bin/
+!src/bin/*.rs
 build/
 develop-eggs/
 dist/
