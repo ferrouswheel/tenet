@@ -6,6 +6,7 @@ use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use std::fmt;
 
 pub const CONTENT_KEY_SIZE: usize = 32;
 pub const NONCE_SIZE: usize = 12;
@@ -22,6 +23,18 @@ pub enum CryptoError {
     Hpke(hpke::HpkeError),
     Aead(chacha20poly1305::aead::Error),
 }
+
+impl fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CryptoError::InvalidLength(message) => write!(f, "invalid length: {message}"),
+            CryptoError::Hpke(error) => write!(f, "hpke error: {error}"),
+            CryptoError::Aead(error) => write!(f, "aead error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CryptoError {}
 
 impl From<hpke::HpkeError> for CryptoError {
     fn from(error: hpke::HpkeError) -> Self {
