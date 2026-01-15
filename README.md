@@ -103,3 +103,8 @@ Tenet is a peer-distributed, mobile-aware social protocol that favors simplicity
 best-effort delivery, and standard cryptography. The system assumes intermittent
 connectivity, favors replaceable transport layers, and keeps local history short
 to reduce risk and storage costs.
+
+## MVP Scope
+
+See the MVP feature list, non-goals, minimal protocol flows, and storage quotas in
+[docs/mvp.md](docs/mvp.md).
