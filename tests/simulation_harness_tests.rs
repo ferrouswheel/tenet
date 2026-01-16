@@ -18,6 +18,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         retry_backoff: Vec::new(),
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
     };
     let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
 
@@ -99,6 +100,7 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
         retry_backoff: Vec::new(),
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
     };
     let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
 
@@ -139,6 +141,7 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
         retry_backoff: Vec::new(),
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
     };
     let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
 

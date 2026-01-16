@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io;
+use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -16,8 +18,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use tenet::simulation::{
-    run_simulation_scenario, run_simulation_scenario_with_progress, RollingLatencySnapshot,
-    SimulationScenarioConfig, SimulationStepUpdate,
+    run_simulation_scenario, RollingLatencySnapshot, SimulationScenarioConfig, SimulationStepUpdate,
 };
 
 #[tokio::main]
@@ -53,6 +54,7 @@ async fn main() -> Result<(), String> {
 async fn run_with_tui(
     scenario: SimulationScenarioConfig,
 ) -> Result<tenet::simulation::SimulationReport, String> {
+    const RELAY_LOG_LIMIT: usize = 200;
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|err| err.to_string())?;
@@ -60,28 +62,79 @@ async fn run_with_tui(
     let mut terminal = Terminal::new(backend).map_err(|err| err.to_string())?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+    let mut relay_config = scenario.relay.clone().into_relay_config();
+    relay_config.log_sink = Some(Arc::new(move |line: String| {
+        let _ = log_tx.send(line);
+    }));
     let scenario_for_task = scenario.clone();
     let sim_handle = tokio::spawn(async move {
-        run_simulation_scenario_with_progress(scenario_for_task, |update| {
-            let _ = tx.send(update);
-        })
-        .await
+        let (base_url, shutdown_tx) = tenet::simulation::start_relay(relay_config).await;
+        let inputs = tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
+        let mut harness = tenet::simulation::SimulationHarness::new(
+            base_url,
+            inputs.nodes,
+            inputs.direct_links,
+            scenario_for_task.direct_enabled.unwrap_or(true),
+            scenario_for_task.relay.ttl_seconds,
+            inputs.encryption,
+            inputs.keypairs,
+        );
+        let metrics = harness
+            .run_with_progress(
+                scenario_for_task.simulation.steps,
+                inputs.planned_sends,
+                |update| {
+                    let _ = tx.send(update);
+                },
+            )
+            .await;
+        let report = harness.metrics_report();
+        shutdown_tx.send(()).ok();
+        Ok(tenet::simulation::SimulationReport { metrics, report })
     });
 
     let mut last_update: Option<SimulationStepUpdate> = None;
-    while let Some(update) = rx.recv().await {
-        render(
-            &mut terminal,
-            &update,
-            "Simulation running. Terminal will wait for q on completion.",
-        )
-        .map_err(|err| err.to_string())?;
-        last_update = Some(update);
-    }
+    let mut relay_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
 
-    let result = sim_handle
-        .await
-        .map_err(|err| format!("simulation task failed: {err}"))?;
+    loop {
+        tokio::select! {
+            update = rx.recv() => {
+                match update {
+                    Some(update) => {
+                        last_update = Some(update.clone());
+                        render(
+                            &mut terminal,
+                            &update,
+                            relay_logs.make_contiguous(),
+                            "Simulation running. Terminal will wait for q on completion.",
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                    None => break,
+                }
+            }
+            log_line = log_rx.recv() => {
+                if let Some(line) = log_line {
+                    if relay_logs.len() == RELAY_LOG_LIMIT {
+                        relay_logs.pop_front();
+                    }
+                    relay_logs.push_back(line);
+                    if let Some(update) = &last_update {
+                        render(
+                            &mut terminal,
+                            update,
+                            relay_logs.make_contiguous(),
+                            "Simulation running. Terminal will wait for q on completion.",
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                } else if rx.is_closed() {
+                    break;
+                }
+            }
+        }
+    }
 
     let completion_update = last_update.unwrap_or_else(|| SimulationStepUpdate {
         step: scenario.simulation.steps,
@@ -100,6 +153,7 @@ async fn run_with_tui(
     render(
         &mut terminal,
         &completion_update,
+        relay_logs.make_contiguous(),
         "Simulation complete. Press q to exit.",
     )
     .map_err(|err| err.to_string())?;
@@ -109,12 +163,15 @@ async fn run_with_tui(
     execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|err| err.to_string())?;
     terminal.show_cursor().map_err(|err| err.to_string())?;
 
-    result
+    sim_handle
+        .await
+        .map_err(|err| format!("simulation task failed: {err}"))?
 }
 
 fn render(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     update: &SimulationStepUpdate,
+    relay_logs: &[String],
     status: &str,
 ) -> io::Result<()> {
     terminal
@@ -126,7 +183,8 @@ fn render(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(6),
-                    Constraint::Min(3),
+                    Constraint::Min(8),
+                    Constraint::Length(3),
                 ])
                 .split(size);
 
@@ -162,9 +220,24 @@ fn render(
                 .block(Block::default().borders(Borders::ALL).title("Step Metrics"));
             frame.render_widget(metrics_block, chunks[1]);
 
+            let relay_lines = relay_logs
+                .iter()
+                .rev()
+                .take(chunks[2].height.saturating_sub(2) as usize)
+                .cloned()
+                .collect::<Vec<_>>();
+            let relay_lines = relay_lines
+                .into_iter()
+                .rev()
+                .map(Line::from)
+                .collect::<Vec<_>>();
+            let relay_block = Paragraph::new(relay_lines)
+                .block(Block::default().borders(Borders::ALL).title("Relay Logs"));
+            frame.render_widget(relay_block, chunks[2]);
+
             let hint = Paragraph::new(status)
                 .block(Block::default().borders(Borders::ALL).title("Status"));
-            frame.render_widget(hint, chunks[2]);
+            frame.render_widget(hint, chunks[3]);
         })
         .map(|_| ())
 }

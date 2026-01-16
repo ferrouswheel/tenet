@@ -95,6 +95,7 @@ async fn relay_expires_messages_after_ttl() {
         retry_backoff: Vec::new(),
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
     })
     .await;
 
@@ -147,6 +148,7 @@ async fn relay_deduplicates_by_message_id() {
         retry_backoff: Vec::new(),
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
     })
     .await;
 
@@ -200,6 +202,7 @@ async fn node_can_send_and_receive_through_relay() {
         retry_backoff: Vec::new(),
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
     })
     .await;
 

@@ -125,6 +125,7 @@ impl RelayConfigToml {
                 .collect(),
             peer_log_window: Duration::from_secs(self.peer_log_window_seconds.unwrap_or(60)),
             peer_log_interval: Duration::from_secs(self.peer_log_interval_seconds.unwrap_or(30)),
+            log_sink: None,
         }
     }
 }

@@ -18,6 +18,7 @@ async fn main() {
         }),
         peer_log_window: Duration::from_secs(env_u64("TENET_RELAY_PEER_LOG_WINDOW_SECS", 60)),
         peer_log_interval: Duration::from_secs(env_u64("TENET_RELAY_PEER_LOG_INTERVAL_SECS", 30)),
+        log_sink: None,
     };
 
     let state = RelayState::new(config);
