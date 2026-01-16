@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io;
 
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -67,13 +68,42 @@ async fn run_with_tui(
         .await
     });
 
+    let mut last_update: Option<SimulationStepUpdate> = None;
     while let Some(update) = rx.recv().await {
-        render(&mut terminal, &update).map_err(|err| err.to_string())?;
+        render(
+            &mut terminal,
+            &update,
+            "Simulation running. Terminal will wait for q on completion.",
+        )
+        .map_err(|err| err.to_string())?;
+        last_update = Some(update);
     }
 
     let result = sim_handle
         .await
         .map_err(|err| format!("simulation task failed: {err}"))?;
+
+    let completion_update = last_update.unwrap_or_else(|| SimulationStepUpdate {
+        step: scenario.simulation.steps,
+        total_steps: scenario.simulation.steps,
+        online_nodes: 0,
+        sent_messages: 0,
+        received_messages: 0,
+        rolling_latency: RollingLatencySnapshot {
+            min: None,
+            max: None,
+            average: None,
+            samples: 0,
+            window: 0,
+        },
+    });
+    render(
+        &mut terminal,
+        &completion_update,
+        "Simulation complete. Press q to exit.",
+    )
+    .map_err(|err| err.to_string())?;
+    wait_for_quit().map_err(|err| err.to_string())?;
 
     disable_raw_mode().map_err(|err| err.to_string())?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|err| err.to_string())?;
@@ -85,6 +115,7 @@ async fn run_with_tui(
 fn render(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     update: &SimulationStepUpdate,
+    status: &str,
 ) -> io::Result<()> {
     terminal
         .draw(|frame| {
@@ -131,11 +162,22 @@ fn render(
                 .block(Block::default().borders(Borders::ALL).title("Step Metrics"));
             frame.render_widget(metrics_block, chunks[1]);
 
-            let hint = Paragraph::new("Simulation running. Terminal will exit on completion.")
+            let hint = Paragraph::new(status)
                 .block(Block::default().borders(Borders::ALL).title("Status"));
             frame.render_widget(hint, chunks[2]);
         })
         .map(|_| ())
+}
+
+fn wait_for_quit() -> io::Result<()> {
+    loop {
+        if let Event::Key(key) = event::read()? {
+            if key.code == KeyCode::Char('q') {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn format_latency(snapshot: &RollingLatencySnapshot) -> String {
