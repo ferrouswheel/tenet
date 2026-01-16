@@ -43,6 +43,23 @@ TENET_RELAY_MAX_BYTES=5242880 \
   cargo run --bin relay
 ```
 
+Run the toy UI (spawns N peers, defaults to 3):
+
+```bash
+cargo run --bin toy_ui -- --peers 4 --relay http://127.0.0.1:8080
+```
+
+Once running, try:
+
+```bash
+peers
+send peer-1 peer-2 hello there
+sync peer-2
+feed peer-2
+offline peer-3
+online peer-3
+```
+
 ## Tests
 
 ```bash
