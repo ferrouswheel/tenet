@@ -1,5 +1,5 @@
 use tenet_crypto::protocol::{
-    AttachmentRef, ContentId, Envelope, MessageHeader, Payload, RecipientKey,
+    AttachmentRef, ContentId, Envelope, Header, HeaderError, Payload, ProtocolVersion,
 };
 
 #[test]
@@ -15,20 +15,24 @@ fn envelope_roundtrips_via_json() {
         }],
     };
 
-    let header = MessageHeader {
+    let version = ProtocolVersion::V1;
+    let mut header = Header {
         sender_id: "sender-id".to_string(),
+        recipient_id: "recipient-id".to_string(),
         timestamp: 1_700_000_000,
-        payload_id: payload.id.clone(),
-        recipients: vec![RecipientKey {
-            recipient_id: "recipient-id".to_string(),
-            key_scheme: "hpke-x25519".to_string(),
-            encrypted_key: "base64-key".to_string(),
-        }],
-        signature: Some("sig".to_string()),
+        message_id: ContentId::from_bytes(b"message-1"),
+        ttl_seconds: 3_600,
+        payload_size: payload.body.len() as u64,
+        signature: None,
     };
+    header.signature = Some(
+        header
+            .expected_signature(version)
+            .expect("signature generation"),
+    );
 
     let envelope = Envelope {
-        id: ContentId::from_value(&header).expect("content id"),
+        version,
         header,
         payload,
     };
@@ -37,4 +41,21 @@ fn envelope_roundtrips_via_json() {
     let decoded: Envelope = serde_json::from_str(&json).expect("deserialize envelope");
 
     assert_eq!(decoded, envelope);
+}
+
+#[test]
+fn header_signature_fails_with_invalid_signature() {
+    let version = ProtocolVersion::V1;
+    let header = Header {
+        sender_id: "sender-id".to_string(),
+        recipient_id: "recipient-id".to_string(),
+        timestamp: 1_700_000_001,
+        message_id: ContentId::from_bytes(b"message-2"),
+        ttl_seconds: 120,
+        payload_size: 42,
+        signature: Some("bad-signature".to_string()),
+    };
+
+    let err = header.verify_signature(version).expect_err("invalid signature");
+    assert_eq!(err, HeaderError::InvalidSignature);
 }
