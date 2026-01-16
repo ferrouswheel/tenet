@@ -153,3 +153,9 @@ peer_log_interval_seconds = 30
 The relay logging fields are optional; when omitted they default to a 60-second window with a
 30-second summary interval. Relay TTLs are meant to be short-lived; the sample default is 3600s,
 and values must stay within protocol bounds (1s minimum, 7 days maximum).
+
+## Manual TUI test
+
+1. Run a simulation with the TUI enabled: `cargo run --bin tenet-sim -- --tui scenarios/basic.toml`.
+2. Wait for the simulation to complete and confirm the status panel displays the completion prompt.
+3. Press `q` and confirm the TUI exits back to the terminal.
