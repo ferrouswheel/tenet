@@ -54,6 +54,60 @@ recipient id, timestamp, and message id).
 * **Feed**: an ordered log of updates per user, truncated by local retention policy.
 * **Attachments**: optional blobs referenced by content hash.
 
+## MVP Feature Scope
+
+* **Identity**: long-term keypairs per user, stable IDs derived from public keys, and a locally stored
+  friend/peer list (manual exchange or QR/URL bootstrap).
+* **Envelope encryption**: per-recipient authenticated encryption with a signed metadata header
+  (sender ID, recipient ID, timestamp, message ID, TTL, payload size).
+* **Relay transport**: store-and-forward relays for NATed/offline peers; relays retain opaque blobs
+  with minimal metadata and provide best-effort delivery.
+* **Local store**: append-only per-peer feeds with rolling retention and message ID indexing for
+  deduplication.
+* **TTL enforcement**: messages carry a TTL that bounds relay storage and local retention windows.
+
+## Minimal Protocol Flows
+
+### 1) Send
+
+1. Sender composes payload and selects recipients.
+2. For each recipient:
+   * Encrypt payload with recipient key (or group key if supported).
+   * Construct header: sender ID, recipient ID, timestamp, message ID, TTL, payload size.
+   * Sign header.
+3. Write encrypted message to local outbox and feed.
+4. Submit envelope to relay (or direct peer if available).
+
+### 2) Relay
+
+1. Relay accepts envelope and stores it with minimal metadata.
+2. Relay enforces TTL and size caps; expired envelopes are dropped.
+3. Recipient polls relay (or relay pushes if supported) to fetch envelopes.
+
+### 3) Receive
+
+1. Recipient fetches envelopes from relay.
+2. Validate header signature and sender ID.
+3. Check TTL; discard if expired.
+4. Decrypt payload and append to local feed.
+5. Update dedup index with message ID.
+
+### 4) Dedup
+
+1. Before storing, check message ID against local index.
+2. If already present, discard duplicate envelope.
+3. Keep latest-seen metadata (e.g., most recent relay source) for diagnostics.
+
+## Storage and TTL Constraints
+
+* **Local feed retention**: rolling window by size and time (e.g., last N MB or N days).
+* **Attachment cache**: fixed-size LRU, keyed by content hash.
+* **Relay quotas**:
+  * Per-recipient storage cap (e.g., max total bytes per user).
+  * Per-sender rate limits to mitigate spam.
+  * TTL enforced; expired data is removed without notice.
+* **Index bounds**: dedup index pruned alongside feed compaction.
+
 ## Getting Started (Rust)
 
 Minimal crates for a Rust MVP:
