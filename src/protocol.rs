@@ -237,6 +237,71 @@ pub struct Payload {
 
 pub const PLAINTEXT_CONTENT_TYPE: &str = "text/plain";
 pub const ENCRYPTED_CONTENT_TYPE: &str = "application/json;type=tenet.encrypted";
+pub const META_CONTENT_TYPE: &str = "application/json;type=tenet.meta";
+
+/// Metadata-only protocol messages (e.g., presence and recovery hints).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MetaMessage {
+    Online {
+        peer_id: String,
+        timestamp: u64,
+    },
+    Ack {
+        peer_id: String,
+        online_timestamp: u64,
+    },
+    MessageRequest {
+        peer_id: String,
+        since_timestamp: u64,
+    },
+}
+
+#[derive(Debug)]
+pub enum MetaMessageError {
+    Serde(serde_json::Error),
+    InvalidContentType { expected: String, actual: String },
+}
+
+impl std::fmt::Display for MetaMessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetaMessageError::Serde(error) => write!(f, "serde error: {error}"),
+            MetaMessageError::InvalidContentType { expected, actual } => {
+                write!(f, "invalid content type: expected {expected}, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetaMessageError {}
+
+impl From<serde_json::Error> for MetaMessageError {
+    fn from(error: serde_json::Error) -> Self {
+        MetaMessageError::Serde(error)
+    }
+}
+
+pub fn build_meta_payload(meta: &MetaMessage) -> Result<Payload, serde_json::Error> {
+    let body = serde_json::to_string(meta)?;
+    let payload_id = ContentId::from_bytes(body.as_bytes());
+    Ok(Payload {
+        id: payload_id,
+        content_type: META_CONTENT_TYPE.to_string(),
+        body,
+        attachments: Vec::new(),
+    })
+}
+
+pub fn decode_meta_payload(payload: &Payload) -> Result<MetaMessage, MetaMessageError> {
+    if payload.content_type != META_CONTENT_TYPE {
+        return Err(MetaMessageError::InvalidContentType {
+            expected: META_CONTENT_TYPE.to_string(),
+            actual: payload.content_type.clone(),
+        });
+    }
+    Ok(serde_json::from_str(&payload.body)?)
+}
 
 /// Build a plaintext payload with a salted content ID to avoid collisions.
 pub fn build_plaintext_payload(body: impl Into<String>, salt: impl AsRef<[u8]>) -> Payload {

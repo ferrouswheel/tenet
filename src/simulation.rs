@@ -12,13 +12,15 @@ use tokio::sync::oneshot;
 
 use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
 use crate::protocol::{
-    build_encrypted_payload, build_envelope_from_payload, build_plaintext_payload,
-    decrypt_encrypted_payload, ContentId, Envelope, MessageKind, Payload,
+    build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
+    build_plaintext_payload, decrypt_encrypted_payload, ContentId, Envelope, MessageKind,
+    MetaMessage, Payload,
 };
 use crate::relay::{app, RelayConfig, RelayState};
 
 const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
 const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
+const SIMULATION_ACK_WINDOW_STEPS: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationConfig {
@@ -162,6 +164,10 @@ pub struct SimulationMetricsReport {
     pub per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
     pub first_delivery_latency: LatencyHistogram,
     pub all_recipients_delivery_latency: LatencyHistogram,
+    pub online_broadcasts_sent: usize,
+    pub acks_received: usize,
+    pub missed_message_requests_sent: usize,
+    pub missed_message_deliveries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +241,20 @@ impl Node {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HistoricalMessage {
+    send_step: usize,
+    envelope: Envelope,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOnlineBroadcast {
+    sender_id: String,
+    recipient_id: String,
+    sent_step: usize,
+    expires_at: usize,
+}
+
 #[derive(Debug)]
 pub struct SimulationInputs {
     pub nodes: Vec<Node>,
@@ -248,10 +268,15 @@ pub struct SimulationHarness {
     relay_base_url: String,
     nodes: HashMap<String, Node>,
     direct_links: HashSet<(String, String)>,
+    neighbors: HashMap<String, Vec<String>>,
     direct_enabled: bool,
     ttl_seconds: u64,
     encryption: MessageEncryption,
     keypairs: HashMap<String, StoredKeypair>,
+    last_seen_by_peer: HashMap<String, HashMap<String, u64>>,
+    message_history: HashMap<(String, String), Vec<HistoricalMessage>>,
+    message_send_steps: HashMap<String, usize>,
+    pending_online_broadcasts: Vec<PendingOnlineBroadcast>,
     metrics: SimulationMetrics,
     metrics_tracker: MetricsTracker,
 }
@@ -267,6 +292,17 @@ impl SimulationHarness {
         keypairs: HashMap<String, StoredKeypair>,
     ) -> Self {
         let planned_messages = 0;
+        let mut neighbors: HashMap<String, Vec<String>> = HashMap::new();
+        for (sender, recipient) in &direct_links {
+            neighbors
+                .entry(sender.clone())
+                .or_default()
+                .push(recipient.clone());
+        }
+        let mut last_seen_by_peer = HashMap::new();
+        for node in &nodes {
+            last_seen_by_peer.insert(node.id.clone(), HashMap::new());
+        }
         Self {
             relay_base_url,
             nodes: nodes
@@ -274,10 +310,15 @@ impl SimulationHarness {
                 .map(|node| (node.id.clone(), node))
                 .collect(),
             direct_links,
+            neighbors,
             direct_enabled,
             ttl_seconds,
             encryption,
             keypairs,
+            last_seen_by_peer,
+            message_history: HashMap::new(),
+            message_send_steps: HashMap::new(),
+            pending_online_broadcasts: Vec::new(),
             metrics: SimulationMetrics {
                 planned_messages,
                 sent_messages: 0,
@@ -296,6 +337,142 @@ impl SimulationHarness {
         self.metrics_tracker.report()
     }
 
+    fn record_message_send(&mut self, message: &SimMessage, step: usize, envelope: &Envelope) {
+        self.message_send_steps.insert(message.id.clone(), step);
+        self.message_history
+            .entry((message.sender.clone(), message.recipient.clone()))
+            .or_default()
+            .push(HistoricalMessage {
+                send_step: step,
+                envelope: envelope.clone(),
+            });
+    }
+
+    fn update_last_seen(&mut self, recipient_id: &str, sender_id: &str, message_id: &str) {
+        let Some(send_step) = self.message_send_steps.get(message_id) else {
+            return;
+        };
+        let entry = self
+            .last_seen_by_peer
+            .entry(recipient_id.to_string())
+            .or_default()
+            .entry(sender_id.to_string())
+            .or_insert(0);
+        *entry = (*entry).max(*send_step as u64);
+    }
+
+    fn last_seen_for(&self, recipient_id: &str, sender_id: &str) -> u64 {
+        self.last_seen_by_peer
+            .get(recipient_id)
+            .and_then(|map| map.get(sender_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn enqueue_online_broadcasts(&mut self, node_id: &str, step: usize) {
+        let Some(neighbors) = self.neighbors.get(node_id) else {
+            return;
+        };
+        for neighbor in neighbors {
+            let meta = MetaMessage::Online {
+                peer_id: node_id.to_string(),
+                timestamp: step as u64,
+            };
+            let _ = build_meta_payload(&meta);
+            self.pending_online_broadcasts.push(PendingOnlineBroadcast {
+                sender_id: node_id.to_string(),
+                recipient_id: neighbor.clone(),
+                sent_step: step,
+                expires_at: step.saturating_add(SIMULATION_ACK_WINDOW_STEPS),
+            });
+            self.metrics_tracker.record_online_broadcast();
+        }
+    }
+
+    fn process_pending_online_broadcasts(
+        &mut self,
+        step: usize,
+        online_nodes: &HashSet<String>,
+    ) -> usize {
+        let pending = std::mem::take(&mut self.pending_online_broadcasts);
+        let mut remaining = Vec::with_capacity(pending.len());
+        let mut delivered: usize = 0;
+        for pending in pending {
+            if step > pending.expires_at {
+                continue;
+            }
+            if online_nodes.contains(&pending.recipient_id) {
+                let ack = MetaMessage::Ack {
+                    peer_id: pending.recipient_id.clone(),
+                    online_timestamp: pending.sent_step as u64,
+                };
+                let _ = build_meta_payload(&ack);
+                self.metrics_tracker.record_ack();
+                delivered = delivered.saturating_add(self.handle_message_request(
+                    &pending.sender_id,
+                    &pending.recipient_id,
+                    step,
+                ));
+                continue;
+            }
+            remaining.push(pending);
+        }
+        self.pending_online_broadcasts = remaining;
+        delivered
+    }
+
+    fn handle_message_request(&mut self, requester: &str, responder: &str, step: usize) -> usize {
+        let last_seen = self.last_seen_for(requester, responder);
+        let request = MetaMessage::MessageRequest {
+            peer_id: responder.to_string(),
+            since_timestamp: last_seen,
+        };
+        let _ = build_meta_payload(&request);
+        self.metrics_tracker.record_missed_message_request();
+        let Some(history) = self
+            .message_history
+            .get(&(responder.to_string(), requester.to_string()))
+        else {
+            return 0;
+        };
+        let entries: Vec<HistoricalMessage> = history
+            .iter()
+            .filter(|entry| entry.send_step as u64 >= last_seen)
+            .cloned()
+            .collect();
+        let mut delivered = 0;
+        for entry in entries {
+            if self.deliver_missed_message(&entry.envelope, requester, step) {
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+
+    fn deliver_missed_message(
+        &mut self,
+        envelope: &Envelope,
+        recipient_id: &str,
+        step: usize,
+    ) -> bool {
+        let message_id = envelope.header.message_id.0.clone();
+        let message = self.decode_envelope(envelope, &message_id, recipient_id);
+        let Some(message) = message else {
+            return false;
+        };
+        let Some(node) = self.nodes.get_mut(recipient_id) else {
+            return false;
+        };
+        if node.receive(message.clone()) {
+            self.metrics_tracker.record_missed_message_delivery();
+            self.metrics_tracker
+                .record_delivery(&message_id, recipient_id, step);
+            self.update_last_seen(recipient_id, &message.sender, &message_id);
+            return true;
+        }
+        false
+    }
+
     pub async fn run(&mut self, steps: usize, plan: Vec<PlannedSend>) -> SimulationMetrics {
         self.metrics.planned_messages = plan.len();
         let mut sends_by_step: HashMap<usize, Vec<SimMessage>> = HashMap::new();
@@ -305,6 +482,9 @@ impl SimulationHarness {
                 .or_default()
                 .push(item.message);
         }
+
+        let mut previous_online: HashMap<String, bool> =
+            self.nodes.keys().map(|id| (id.clone(), false)).collect();
 
         for step in 0..steps {
             if let Some(messages) = sends_by_step.get(&step) {
@@ -330,23 +510,68 @@ impl SimulationHarness {
                 .filter(|(_, node)| node.online_at(step))
                 .map(|(id, _)| id.clone())
                 .collect();
+            let online_set: HashSet<String> = online_ids.iter().cloned().collect();
+            let newly_online: Vec<String> = online_ids
+                .iter()
+                .filter(|id| !previous_online.get(*id).copied().unwrap_or(false))
+                .cloned()
+                .collect();
 
-            for node_id in online_ids {
-                let envelopes = fetch_inbox(&self.relay_base_url, &node_id)
+            for node_id in &newly_online {
+                let envelopes = fetch_inbox(&self.relay_base_url, node_id)
                     .await
                     .unwrap_or_default();
                 for envelope in envelopes {
                     let message_id = envelope.header.message_id.0.clone();
-                    let message = self.decode_envelope(&envelope, &message_id, &node_id);
+                    let message = self.decode_envelope(&envelope, &message_id, node_id);
                     if let Some(message) = message {
-                        if let Some(node) = self.nodes.get_mut(&node_id) {
-                            if node.receive(message) {
+                        if let Some(node) = self.nodes.get_mut(node_id) {
+                            if node.receive(message.clone()) {
                                 self.metrics.inbox_deliveries += 1;
                                 self.metrics_tracker
-                                    .record_delivery(&message_id, &node_id, step);
+                                    .record_delivery(&message_id, node_id, step);
+                                self.update_last_seen(node_id, &message.sender, &message_id);
                             }
                         }
                     }
+                }
+            }
+
+            for node_id in &newly_online {
+                self.enqueue_online_broadcasts(node_id, step);
+            }
+
+            let _ = self.process_pending_online_broadcasts(step, &online_set);
+
+            for node_id in &online_ids {
+                if newly_online.contains(node_id) {
+                    continue;
+                }
+                let envelopes = fetch_inbox(&self.relay_base_url, node_id)
+                    .await
+                    .unwrap_or_default();
+                for envelope in envelopes {
+                    let message_id = envelope.header.message_id.0.clone();
+                    let message = self.decode_envelope(&envelope, &message_id, node_id);
+                    if let Some(message) = message {
+                        if let Some(node) = self.nodes.get_mut(node_id) {
+                            if node.receive(message.clone()) {
+                                self.metrics.inbox_deliveries += 1;
+                                self.metrics_tracker
+                                    .record_delivery(&message_id, node_id, step);
+                                self.update_last_seen(node_id, &message.sender, &message_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for node_id in &online_ids {
+                previous_online.insert(node_id.clone(), true);
+            }
+            for (node_id, was_online) in previous_online.iter_mut() {
+                if !online_set.contains(node_id) {
+                    *was_online = false;
                 }
             }
         }
@@ -373,6 +598,8 @@ impl SimulationHarness {
         }
 
         let mut rolling_latency = RollingLatencyTracker::new(100);
+        let mut previous_online: HashMap<String, bool> =
+            self.nodes.keys().map(|id| (id.clone(), false)).collect();
 
         for step in 0..steps {
             let mut sent_messages = 0;
@@ -402,8 +629,14 @@ impl SimulationHarness {
                 .filter(|(_, node)| node.online_at(step))
                 .map(|(id, _)| id.clone())
                 .collect();
+            let online_set: HashSet<String> = online_ids.iter().cloned().collect();
+            let newly_online: Vec<String> = online_ids
+                .iter()
+                .filter(|id| !previous_online.get(*id).copied().unwrap_or(false))
+                .cloned()
+                .collect();
 
-            for node_id in &online_ids {
+            for node_id in &newly_online {
                 let envelopes = fetch_inbox(&self.relay_base_url, node_id)
                     .await
                     .unwrap_or_default();
@@ -412,7 +645,7 @@ impl SimulationHarness {
                     let message = self.decode_envelope(&envelope, &message_id, node_id);
                     if let Some(message) = message {
                         if let Some(node) = self.nodes.get_mut(node_id) {
-                            if node.receive(message) {
+                            if node.receive(message.clone()) {
                                 self.metrics.inbox_deliveries += 1;
                                 if let Some(latency) =
                                     self.metrics_tracker
@@ -420,10 +653,55 @@ impl SimulationHarness {
                                 {
                                     rolling_latency.record(latency);
                                 }
+                                self.update_last_seen(node_id, &message.sender, &message_id);
                                 received_messages += 1;
                             }
                         }
                     }
+                }
+            }
+
+            for node_id in &newly_online {
+                self.enqueue_online_broadcasts(node_id, step);
+            }
+
+            let missed_deliveries = self.process_pending_online_broadcasts(step, &online_set);
+            received_messages += missed_deliveries;
+
+            for node_id in &online_ids {
+                if newly_online.contains(node_id) {
+                    continue;
+                }
+                let envelopes = fetch_inbox(&self.relay_base_url, node_id)
+                    .await
+                    .unwrap_or_default();
+                for envelope in envelopes {
+                    let message_id = envelope.header.message_id.0.clone();
+                    let message = self.decode_envelope(&envelope, &message_id, node_id);
+                    if let Some(message) = message {
+                        if let Some(node) = self.nodes.get_mut(node_id) {
+                            if node.receive(message.clone()) {
+                                self.metrics.inbox_deliveries += 1;
+                                if let Some(latency) =
+                                    self.metrics_tracker
+                                        .record_delivery(&message_id, node_id, step)
+                                {
+                                    rolling_latency.record(latency);
+                                }
+                                self.update_last_seen(node_id, &message.sender, &message_id);
+                                received_messages += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for node_id in &online_ids {
+                previous_online.insert(node_id.clone(), true);
+            }
+            for (node_id, was_online) in previous_online.iter_mut() {
+                if !online_set.contains(node_id) {
+                    *was_online = false;
                 }
             }
 
@@ -463,6 +741,7 @@ impl SimulationHarness {
             message.payload.clone(),
         )
         .ok()?;
+        self.record_message_send(message, step, &envelope);
         let mut direct_latency = None;
         if self.direct_enabled
             && self
@@ -477,12 +756,13 @@ impl SimulationHarness {
                 let decoded = self.decode_envelope(&envelope, &message.id, &message.recipient);
                 if let Some(decoded) = decoded {
                     if let Some(node) = self.nodes.get_mut(&message.recipient) {
-                        if node.receive(decoded) {
+                        if node.receive(decoded.clone()) {
                             direct_latency = self.metrics_tracker.record_delivery(
                                 &message.id,
                                 &message.recipient,
                                 step,
                             );
+                            self.update_last_seen(&message.recipient, &decoded.sender, &message.id);
                         }
                     }
                 }
@@ -580,6 +860,10 @@ struct MetricsTracker {
     first_delivery_latency: LatencyStats,
     all_recipients_delivery_latency: LatencyStats,
     messages: HashMap<String, MessageTracking>,
+    online_broadcasts_sent: usize,
+    acks_received: usize,
+    missed_message_requests_sent: usize,
+    missed_message_deliveries: usize,
 }
 
 impl MetricsTracker {
@@ -637,11 +921,31 @@ impl MetricsTracker {
         Some(latency)
     }
 
+    fn record_online_broadcast(&mut self) {
+        self.online_broadcasts_sent = self.online_broadcasts_sent.saturating_add(1);
+    }
+
+    fn record_ack(&mut self) {
+        self.acks_received = self.acks_received.saturating_add(1);
+    }
+
+    fn record_missed_message_request(&mut self) {
+        self.missed_message_requests_sent = self.missed_message_requests_sent.saturating_add(1);
+    }
+
+    fn record_missed_message_delivery(&mut self) {
+        self.missed_message_deliveries = self.missed_message_deliveries.saturating_add(1);
+    }
+
     fn report(&self) -> SimulationMetricsReport {
         SimulationMetricsReport {
             per_sender_recipient_counts: self.per_sender_recipient_counts.clone(),
             first_delivery_latency: self.first_delivery_latency.report(),
             all_recipients_delivery_latency: self.all_recipients_delivery_latency.report(),
+            online_broadcasts_sent: self.online_broadcasts_sent,
+            acks_received: self.acks_received,
+            missed_message_requests_sent: self.missed_message_requests_sent,
+            missed_message_deliveries: self.missed_message_deliveries,
         }
     }
 }

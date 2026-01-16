@@ -89,3 +89,98 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
     assert!(ids.remove(&message_a_id));
     assert!(ids.remove(&message_c_id));
 }
+
+#[tokio::test]
+async fn simulation_harness_tracks_online_handshake_metrics() {
+    let relay_config = RelayConfig {
+        ttl: Duration::from_secs(5),
+        max_messages: 100,
+        max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
+    };
+    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+
+    let nodes = vec![
+        tenet::simulation::Node::new("node-a", vec![false, true]),
+        tenet::simulation::Node::new("node-b", vec![true, true]),
+    ];
+    let mut direct_links = HashSet::new();
+    direct_links.insert(("node-a".to_string(), "node-b".to_string()));
+    direct_links.insert(("node-b".to_string(), "node-a".to_string()));
+
+    let mut harness = SimulationHarness::new(
+        base_url,
+        nodes,
+        direct_links,
+        true,
+        relay_config.ttl.as_secs(),
+        MessageEncryption::Plaintext,
+        Default::default(),
+    );
+
+    harness.run(2, Vec::new()).await;
+    shutdown_tx.send(()).ok();
+
+    let report = harness.metrics_report();
+    assert_eq!(report.online_broadcasts_sent, 2);
+    assert_eq!(report.acks_received, 2);
+    assert_eq!(report.missed_message_requests_sent, 2);
+    assert_eq!(report.missed_message_deliveries, 0);
+}
+
+#[tokio::test]
+async fn simulation_harness_delivers_missed_messages_after_handshake() {
+    let relay_config = RelayConfig {
+        ttl: Duration::from_secs(5),
+        max_messages: 100,
+        max_bytes: 0,
+        retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
+    };
+    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+
+    let nodes = vec![
+        tenet::simulation::Node::new("node-a", vec![false, true, true]),
+        tenet::simulation::Node::new("node-b", vec![true, true, true]),
+    ];
+    let mut direct_links = HashSet::new();
+    direct_links.insert(("node-a".to_string(), "node-b".to_string()));
+    direct_links.insert(("node-b".to_string(), "node-a".to_string()));
+
+    let mut harness = SimulationHarness::new(
+        base_url,
+        nodes,
+        direct_links,
+        true,
+        relay_config.ttl.as_secs(),
+        MessageEncryption::Plaintext,
+        Default::default(),
+    );
+
+    let payload = build_plaintext_payload("missed", b"missed-message");
+    let message_id = ContentId::from_value(&payload).expect("serialize payload");
+    let planned = vec![PlannedSend {
+        step: 0,
+        message: SimMessage {
+            id: message_id.0.clone(),
+            sender: "node-b".to_string(),
+            recipient: "node-a".to_string(),
+            body: "missed".to_string(),
+            payload,
+        },
+    }];
+
+    harness.run(3, planned).await;
+    shutdown_tx.send(()).ok();
+
+    let inbox = harness.inbox("node-a");
+    assert!(inbox.iter().any(|message| message.id == message_id.0));
+
+    let report = harness.metrics_report();
+    assert_eq!(report.missed_message_deliveries, 1);
+    assert_eq!(report.missed_message_requests_sent, 2);
+    assert_eq!(report.acks_received, 2);
+}
