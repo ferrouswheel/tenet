@@ -119,6 +119,8 @@ conversation or feed.
   * Per-recipient storage cap (e.g., max total bytes per user).
   * Per-sender rate limits to mitigate spam.
   * TTL enforced; expired data is removed without notice.
+  * Relay TTLs are intentionally short (default 3600s in the simulation scenarios) and should
+    remain within protocol bounds (1s minimum, 7 days maximum).
 * **Index bounds**: dedup index pruned alongside feed compaction.
 
 ## Getting Started (Rust)
