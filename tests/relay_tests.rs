@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-use tenet_crypto::crypto::{decrypt_payload, encrypt_payload, wrap_content_key, unwrap_content_key};
+use tenet_crypto::crypto::{
+    decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key,
+};
 use tenet_crypto::relay::{app, RelayConfig, RelayState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,7 @@ async fn relay_expires_messages_after_ttl() {
         ttl: Duration::from_millis(50),
         max_messages: 10,
         max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
     })
     .await;
 
@@ -141,6 +144,7 @@ async fn relay_deduplicates_by_message_id() {
         ttl: Duration::from_secs(5),
         max_messages: 10,
         max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
     })
     .await;
 
@@ -191,6 +195,7 @@ async fn node_can_send_and_receive_through_relay() {
         ttl: Duration::from_secs(5),
         max_messages: 10,
         max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
     })
     .await;
 
@@ -255,12 +260,8 @@ async fn node_can_send_and_receive_through_relay() {
         enc: hex::decode(&fetched.wrapped_key.enc_hex).expect("enc bytes"),
         ciphertext: hex::decode(&fetched.wrapped_key.ciphertext_hex).expect("cipher bytes"),
     };
-    let content_key = unwrap_content_key(
-        &recipient_private.to_bytes(),
-        &wrapped,
-        b"tenet-cli",
-    )
-    .expect("unwrap content key");
+    let content_key = unwrap_content_key(&recipient_private.to_bytes(), &wrapped, b"tenet-cli")
+        .expect("unwrap content key");
     let nonce = hex::decode(&fetched.payload.nonce_hex).expect("nonce bytes");
     let ciphertext = hex::decode(&fetched.payload.ciphertext_hex).expect("cipher bytes");
 

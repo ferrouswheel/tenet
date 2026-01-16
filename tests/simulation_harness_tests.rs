@@ -246,6 +246,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         ttl: Duration::from_secs(5),
         max_messages: 100,
         max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
     })
     .await;
 
@@ -255,10 +256,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         Node::new("node-c", vec![true, false, true, false, true, true]),
     ];
 
-    let direct_links = HashSet::from([(
-        "node-c".to_string(),
-        "node-b".to_string(),
-    )]);
+    let direct_links = HashSet::from([("node-c".to_string(), "node-b".to_string())]);
 
     let mut harness = SimulationHarness::new(base_url, nodes, direct_links, true);
 

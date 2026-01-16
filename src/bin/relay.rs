@@ -9,6 +9,13 @@ async fn main() {
         ttl: Duration::from_secs(env_u64("TENET_RELAY_TTL_SECS", 86_400)),
         max_messages: env_usize("TENET_RELAY_MAX_MESSAGES", 1_000),
         max_bytes: env_usize("TENET_RELAY_MAX_BYTES", 5 * 1024 * 1024),
+        retry_backoff: env_backoff("TENET_RELAY_RETRY_BACKOFF_MS").unwrap_or_else(|| {
+            vec![
+                Duration::from_millis(5),
+                Duration::from_millis(25),
+                Duration::from_millis(100),
+            ]
+        }),
     };
 
     let state = RelayState::new(config);
@@ -36,4 +43,23 @@ fn env_usize(key: &str, default_value: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default_value)
+}
+
+fn env_backoff(key: &str) -> Option<Vec<Duration>> {
+    let value = env::var(key).ok()?;
+    let mut delays = Vec::new();
+    for entry in value.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(ms) = trimmed.parse::<u64>() {
+            delays.push(Duration::from_millis(ms));
+        }
+    }
+    if delays.is_empty() {
+        None
+    } else {
+        Some(delays)
+    }
 }
