@@ -32,6 +32,10 @@ node_ids = ["node-a", "node-b", "node-c"]
 steps = 20
 seed = 7
 
+[simulation.simulated_time]
+seconds_per_step = 300
+default_speed_factor = 1.0
+
 [simulation.friends_per_node]
 type = "uniform"
 min = 2
@@ -39,14 +43,27 @@ max = 2
 
 [simulation.post_frequency]
 type = "weighted_schedule"
-weights = [1, 1, 1, 2, 1]
+weights = [0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9, 1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25]
 total_posts = 6
 
-[simulation.availability]
-type = "markov"
-p_online_given_online = 0.7
-p_online_given_offline = 0.2
-start_online_prob = 0.4
+[[simulation.cohorts]]
+name = "always-online"
+type = "always_online"
+share = 0.25
+
+[[simulation.cohorts]]
+name = "rarely-online"
+type = "rarely_online"
+share = 0.35
+online_probability = 0.2
+
+[[simulation.cohorts]]
+name = "diurnal"
+type = "diurnal"
+share = 0.4
+online_probability = 0.75
+timezone_offset_hours = -5
+hourly_weights = [0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9, 1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25]
 
 [simulation.message_size_distribution]
 type = "uniform"
@@ -70,9 +87,11 @@ The full scenario is available as `scenarios/store_and_forward_3.toml`.
 - `node_ids` (array of strings): IDs to use for simulated peers.
 - `steps` (integer): number of simulation steps.
 - `seed` (integer): RNG seed.
+- `simulated_time` (optional): simulated-time settings (see below).
 - `friends_per_node`: friend graph distribution (see below).
 - `post_frequency`: how often each node posts (see below).
-- `availability`: online/offline behavior (see below).
+- `availability` (optional): legacy online/offline behavior when no cohorts are defined.
+- `cohorts` (optional): cohort definitions for online behavior (see below).
 - `message_size_distribution`: message size generator (see below).
 - `clustering` (optional): cluster layout for dense subgraphs with sparse cross-links.
 - `encryption` (optional): message payload handling (`plaintext` or `encrypted`).
@@ -104,8 +123,10 @@ exponent = 1.2
 ```toml
 [simulation.post_frequency]
 type = "poisson"
-lambda_per_step = 0.4
+lambda_per_hour = 0.4
 ```
+
+`lambda_per_step` is still supported for legacy scenarios without simulated-time settings.
 
 ```toml
 [simulation.post_frequency]
@@ -114,6 +135,8 @@ weights = [1, 1, 2, 3, 5]
 # total posts per node
 total_posts = 20
 ```
+
+When `weights` contains 24 entries, they are treated as hourly weights over a simulated day.
 
 ### `availability`
 
@@ -129,6 +152,41 @@ type = "markov"
 p_online_given_online = 0.92
 p_online_given_offline = 0.25
 start_online_prob = 0.8
+```
+
+### `simulated_time` (optional)
+
+```toml
+[simulation.simulated_time]
+seconds_per_step = 300
+default_speed_factor = 1.0
+```
+
+### `cohorts` (optional)
+
+```toml
+[[simulation.cohorts]]
+name = "always-online"
+type = "always_online"
+share = 0.2
+```
+
+```toml
+[[simulation.cohorts]]
+name = "rarely-online"
+type = "rarely_online"
+share = 0.5
+online_probability = 0.1
+```
+
+```toml
+[[simulation.cohorts]]
+name = "diurnal"
+type = "diurnal"
+share = 0.3
+online_probability = 0.7
+timezone_offset_hours = 2
+hourly_weights = [0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9, 1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25]
 ```
 
 ### `message_size_distribution`

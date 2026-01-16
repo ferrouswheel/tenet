@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use tenet::protocol::{build_plaintext_payload, ContentId};
@@ -6,7 +6,7 @@ use tenet::relay::RelayConfig;
 use tenet::simulation::{
     build_simulation_inputs, start_relay, FriendsPerNode, MessageEncryption,
     MessageSizeDistribution, OnlineAvailability, PlannedSend, PostFrequency, SimMessage,
-    SimulationConfig, SimulationHarness,
+    SimulatedTimeConfig, SimulationConfig, SimulationHarness,
 };
 
 #[tokio::test]
@@ -29,13 +29,18 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
             "node-c".to_string(),
         ],
         steps: 6,
+        simulated_time: SimulatedTimeConfig {
+            seconds_per_step: 60,
+            default_speed_factor: 1.0,
+        },
         friends_per_node: FriendsPerNode::Uniform { min: 2, max: 2 },
         clustering: None,
         post_frequency: PostFrequency::WeightedSchedule {
             weights: vec![1.0, 1.0, 2.0, 1.0, 0.5, 0.5],
             total_posts: 3,
         },
-        availability: OnlineAvailability::Bernoulli { p_online: 1.0 },
+        availability: Some(OnlineAvailability::Bernoulli { p_online: 1.0 }),
+        cohorts: Vec::new(),
         message_size_distribution: MessageSizeDistribution::Uniform { min: 8, max: 32 },
         encryption: Some(MessageEncryption::Plaintext),
         seed: 42,
@@ -50,6 +55,8 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         relay_config.ttl.as_secs(),
         inputs.encryption,
         inputs.keypairs,
+        60.0,
+        inputs.cohort_online_rates,
     );
 
     let mut planned = inputs.planned_sends;
@@ -120,6 +127,8 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
         Default::default(),
+        60.0,
+        HashMap::new(),
     );
 
     harness.run(2, Vec::new()).await;
@@ -161,6 +170,8 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
         Default::default(),
+        60.0,
+        HashMap::new(),
     );
 
     let payload = build_plaintext_payload("missed", b"missed-message");

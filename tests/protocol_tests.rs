@@ -76,12 +76,7 @@ fn header_roundtrips_and_validates_message_kinds() {
         (MessageKind::Public, None, None, None),
         (MessageKind::Meta, None, None, None),
         (MessageKind::Direct, None, None, None),
-        (
-            MessageKind::FriendGroup,
-            Some("group-42"),
-            None,
-            None,
-        ),
+        (MessageKind::FriendGroup, Some("group-42"), None, None),
         (
             MessageKind::StoreForPeer,
             None,
