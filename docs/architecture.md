@@ -59,12 +59,17 @@ recipient id, timestamp, and message id).
 Headers include:
 
 * `sender_id`, `recipient_id`, `timestamp`, `message_id`, `ttl_seconds`, `payload_size`
-* `message_kind`: one of `public`, `meta`, `direct`, or `friend_group`
+* `store_for`, `storage_peer_id` (store-and-forward routing metadata)
+* `message_kind`: one of `public`, `meta`, `direct`, `friend_group`, or `store_for_peer`
 * `group_id`: required only when `message_kind` is `friend_group`
 
 Friend-group messages are addressed to a logical group identifier (`group_id`). The payload is
 encrypted with a group-scoped key, and recipients treat the message as part of the named group
 conversation or feed.
+
+Store-for-peer messages are addressed to a storage peer (`recipient_id`/`storage_peer_id`) with a
+`store_for` field identifying the intended final recipient. The payload contains an encrypted
+inner envelope that only the storage peer can decrypt while it holds the message.
 
 ## MVP Feature Scope
 
@@ -110,6 +115,16 @@ conversation or feed.
 1. Before storing, check message ID against local index.
 2. If already present, discard duplicate envelope.
 3. Keep latest-seen metadata (e.g., most recent relay source) for diagnostics.
+
+### 5) Peer Store-and-Forward
+
+1. Sender selects a mutual friend `C` when recipient `B` is offline.
+2. Sender builds a normal direct envelope for `B`.
+3. Sender wraps that inner envelope in an encrypted payload addressed to `C` and sends a
+   `store_for_peer` envelope with `store_for = B` and `storage_peer_id = C`.
+4. Storage peer `C` decrypts the outer payload, stores the inner envelope, and waits.
+5. When `B` comes online, `C` forwards the inner envelope to `B` (direct or via relay).
+6. `B` validates the inner envelope and decrypts the original payload.
 
 ## Storage and TTL Constraints
 

@@ -401,6 +401,8 @@ fn build_envelope(
     let mut header = Header {
         sender_id: sender.keypair.id.clone(),
         recipient_id: recipient_id.to_string(),
+        store_for: None,
+        storage_peer_id: None,
         timestamp,
         message_id,
         message_kind: MessageKind::Direct,

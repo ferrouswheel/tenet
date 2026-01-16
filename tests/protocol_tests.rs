@@ -19,6 +19,8 @@ fn envelope_roundtrips_via_json() {
     let mut header = Header {
         sender_id: "sender-id".to_string(),
         recipient_id: "recipient-id".to_string(),
+        store_for: None,
+        storage_peer_id: None,
         timestamp: 1_700_000_000,
         message_id: ContentId::from_bytes(b"message-1"),
         message_kind: MessageKind::Public,
@@ -51,6 +53,8 @@ fn header_signature_fails_with_invalid_signature() {
     let header = Header {
         sender_id: "sender-id".to_string(),
         recipient_id: "recipient-id".to_string(),
+        store_for: None,
+        storage_peer_id: None,
         timestamp: 1_700_000_001,
         message_id: ContentId::from_bytes(b"message-2"),
         message_kind: MessageKind::Direct,
@@ -69,17 +73,32 @@ fn header_signature_fails_with_invalid_signature() {
 #[test]
 fn header_roundtrips_and_validates_message_kinds() {
     let kinds = vec![
-        (MessageKind::Public, None),
-        (MessageKind::Meta, None),
-        (MessageKind::Direct, None),
-        (MessageKind::FriendGroup, Some("group-42")),
+        (MessageKind::Public, None, None, None),
+        (MessageKind::Meta, None, None, None),
+        (MessageKind::Direct, None, None, None),
+        (
+            MessageKind::FriendGroup,
+            Some("group-42"),
+            None,
+            None,
+        ),
+        (
+            MessageKind::StoreForPeer,
+            None,
+            Some("peer-b"),
+            Some("peer-c"),
+        ),
     ];
 
-    for (kind, group_id) in kinds {
+    for (kind, group_id, store_for, storage_peer_id) in kinds {
         let version = ProtocolVersion::V1;
         let mut header = Header {
             sender_id: "sender-id".to_string(),
-            recipient_id: "recipient-id".to_string(),
+            recipient_id: storage_peer_id
+                .map(str::to_string)
+                .unwrap_or_else(|| "recipient-id".to_string()),
+            store_for: store_for.map(str::to_string),
+            storage_peer_id: storage_peer_id.map(str::to_string),
             timestamp: 1_700_000_100,
             message_id: ContentId::from_bytes(b"message-kind"),
             message_kind: kind,
@@ -110,6 +129,8 @@ fn header_rejects_invalid_message_kind_combinations() {
     let mut header = Header {
         sender_id: "sender-id".to_string(),
         recipient_id: "recipient-id".to_string(),
+        store_for: None,
+        storage_peer_id: None,
         timestamp: 1_700_000_200,
         message_id: ContentId::from_bytes(b"message-invalid"),
         message_kind: MessageKind::FriendGroup,
@@ -149,6 +170,8 @@ fn header_signature_changes_with_message_kind() {
     let mut header = Header {
         sender_id: "sender-id".to_string(),
         recipient_id: "recipient-id".to_string(),
+        store_for: None,
+        storage_peer_id: None,
         timestamp: 1_700_000_300,
         message_id: ContentId::from_bytes(b"message-signature"),
         message_kind: MessageKind::Direct,
