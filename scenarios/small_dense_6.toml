@@ -3,6 +3,10 @@ node_ids = ["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]
 steps = 60
 seed = 42
 
+[simulation.simulated_time]
+seconds_per_step = 300
+default_speed_factor = 1.0
+
 [simulation.friends_per_node]
 type = "uniform"
 min = 4
@@ -10,11 +14,26 @@ max = 5
 
 [simulation.post_frequency]
 type = "poisson"
-lambda_per_step = 0.6
+lambda_per_hour = 7.0
 
-[simulation.availability]
-type = "bernoulli"
-p_online = 0.9
+[[simulation.cohorts]]
+name = "always-online"
+type = "always_online"
+share = 0.25
+
+[[simulation.cohorts]]
+name = "rarely-online"
+type = "rarely_online"
+share = 0.35
+online_probability = 0.2
+
+[[simulation.cohorts]]
+name = "diurnal"
+type = "diurnal"
+share = 0.4
+online_probability = 0.7
+timezone_offset_hours = -4
+hourly_weights = [0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9, 1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25]
 
 [simulation.message_size_distribution]
 type = "uniform"

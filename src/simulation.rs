@@ -21,18 +21,70 @@ use crate::relay::{app, RelayConfig, RelayState};
 const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
 const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
 const SIMULATION_ACK_WINDOW_STEPS: usize = 10;
+const SIMULATION_HOURS_PER_DAY: usize = 24;
+
+fn default_seconds_per_step() -> u64 {
+    60
+}
+
+fn default_speed_factor() -> f64 {
+    1.0
+}
+
+fn default_simulated_time() -> SimulatedTimeConfig {
+    SimulatedTimeConfig {
+        seconds_per_step: default_seconds_per_step(),
+        default_speed_factor: default_speed_factor(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationConfig {
     pub node_ids: Vec<String>,
     pub steps: usize,
+    #[serde(default = "default_simulated_time")]
+    pub simulated_time: SimulatedTimeConfig,
     pub friends_per_node: FriendsPerNode,
     pub clustering: Option<ClusteringConfig>,
     pub post_frequency: PostFrequency,
-    pub availability: OnlineAvailability,
+    #[serde(default)]
+    pub availability: Option<OnlineAvailability>,
+    #[serde(default)]
+    pub cohorts: Vec<OnlineCohortDefinition>,
     pub message_size_distribution: MessageSizeDistribution,
     pub encryption: Option<MessageEncryption>,
     pub seed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulatedTimeConfig {
+    #[serde(default = "default_seconds_per_step")]
+    pub seconds_per_step: u64,
+    #[serde(default = "default_speed_factor")]
+    pub default_speed_factor: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OnlineCohortDefinition {
+    AlwaysOnline {
+        name: String,
+        share: f64,
+    },
+    RarelyOnline {
+        name: String,
+        share: f64,
+        online_probability: f64,
+    },
+    Diurnal {
+        name: String,
+        share: f64,
+        online_probability: f64,
+        #[serde(default)]
+        timezone_offset_hours: i32,
+        #[serde(default)]
+        hourly_weights: Vec<f64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +112,10 @@ pub struct ClusteringConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PostFrequency {
     Poisson {
-        lambda_per_step: f64,
+        #[serde(default)]
+        lambda_per_step: Option<f64>,
+        #[serde(default)]
+        lambda_per_hour: Option<f64>,
     },
     WeightedSchedule {
         weights: Vec<f64>,
@@ -167,6 +222,9 @@ pub struct SimulationMetricsReport {
     pub per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
     pub first_delivery_latency: LatencyHistogram,
     pub all_recipients_delivery_latency: LatencyHistogram,
+    pub first_delivery_latency_seconds: LatencyHistogram,
+    pub all_recipients_delivery_latency_seconds: LatencyHistogram,
+    pub cohort_online_rates: HashMap<String, f64>,
     pub online_broadcasts_sent: usize,
     pub acks_received: usize,
     pub missed_message_requests_sent: usize,
@@ -279,6 +337,7 @@ pub struct SimulationInputs {
     pub direct_links: HashSet<(String, String)>,
     pub keypairs: HashMap<String, StoredKeypair>,
     pub encryption: MessageEncryption,
+    pub cohort_online_rates: HashMap<String, f64>,
 }
 
 enum IncomingEnvelopeAction {
@@ -314,6 +373,8 @@ impl SimulationHarness {
         ttl_seconds: u64,
         encryption: MessageEncryption,
         keypairs: HashMap<String, StoredKeypair>,
+        simulated_seconds_per_step: f64,
+        cohort_online_rates: HashMap<String, f64>,
     ) -> Self {
         let planned_messages = 0;
         let mut neighbors: HashMap<String, Vec<String>> = HashMap::new();
@@ -354,7 +415,7 @@ impl SimulationHarness {
                 store_forwards_forwarded: 0,
                 store_forwards_delivered: 0,
             },
-            metrics_tracker: MetricsTracker::default(),
+            metrics_tracker: MetricsTracker::new(simulated_seconds_per_step, cohort_online_rates),
         }
     }
 
@@ -1065,12 +1126,16 @@ impl LatencyStats {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MetricsTracker {
     per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
     first_delivery_latency: LatencyStats,
     all_recipients_delivery_latency: LatencyStats,
+    first_delivery_latency_seconds: LatencyStats,
+    all_recipients_delivery_latency_seconds: LatencyStats,
     messages: HashMap<String, MessageTracking>,
+    cohort_online_rates: HashMap<String, f64>,
+    simulated_seconds_per_step: f64,
     online_broadcasts_sent: usize,
     acks_received: usize,
     missed_message_requests_sent: usize,
@@ -1081,6 +1146,26 @@ struct MetricsTracker {
 }
 
 impl MetricsTracker {
+    fn new(simulated_seconds_per_step: f64, cohort_online_rates: HashMap<String, f64>) -> Self {
+        Self {
+            per_sender_recipient_counts: HashMap::new(),
+            first_delivery_latency: LatencyStats::default(),
+            all_recipients_delivery_latency: LatencyStats::default(),
+            first_delivery_latency_seconds: LatencyStats::default(),
+            all_recipients_delivery_latency_seconds: LatencyStats::default(),
+            messages: HashMap::new(),
+            cohort_online_rates,
+            simulated_seconds_per_step: simulated_seconds_per_step.max(0.0),
+            online_broadcasts_sent: 0,
+            acks_received: 0,
+            missed_message_requests_sent: 0,
+            missed_message_deliveries: 0,
+            store_forwards_stored: 0,
+            store_forwards_forwarded: 0,
+            store_forwards_delivered: 0,
+        }
+    }
+
     fn record_send(&mut self, message: &SimMessage, step: usize) {
         let key = SenderRecipient {
             sender: message.sender.clone(),
@@ -1124,12 +1209,19 @@ impl MetricsTracker {
         let latency = step.saturating_sub(tracking.send_step);
         if !tracking.first_delivery_recorded {
             self.first_delivery_latency.record(latency);
+            let latency_seconds =
+                ((latency as f64) * self.simulated_seconds_per_step).round() as usize;
+            self.first_delivery_latency_seconds.record(latency_seconds);
             tracking.first_delivery_recorded = true;
         }
         if tracking.delivered_recipients.len() == tracking.recipients.len()
             && !tracking.all_delivery_recorded
         {
             self.all_recipients_delivery_latency.record(latency);
+            let latency_seconds =
+                ((latency as f64) * self.simulated_seconds_per_step).round() as usize;
+            self.all_recipients_delivery_latency_seconds
+                .record(latency_seconds);
             tracking.all_delivery_recorded = true;
         }
         Some(latency)
@@ -1168,6 +1260,11 @@ impl MetricsTracker {
             per_sender_recipient_counts: self.per_sender_recipient_counts.clone(),
             first_delivery_latency: self.first_delivery_latency.report(),
             all_recipients_delivery_latency: self.all_recipients_delivery_latency.report(),
+            first_delivery_latency_seconds: self.first_delivery_latency_seconds.report(),
+            all_recipients_delivery_latency_seconds: self
+                .all_recipients_delivery_latency_seconds
+                .report(),
+            cohort_online_rates: self.cohort_online_rates.clone(),
             online_broadcasts_sent: self.online_broadcasts_sent,
             acks_received: self.acks_received,
             missed_message_requests_sent: self.missed_message_requests_sent,
@@ -1185,6 +1282,7 @@ pub async fn run_simulation_scenario(
     let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
+    let simulated_seconds_per_step = simulated_seconds_per_step(&scenario.simulation);
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
@@ -1193,6 +1291,8 @@ pub async fn run_simulation_scenario(
         relay_config.ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
+        simulated_seconds_per_step,
+        inputs.cohort_online_rates,
     );
     let metrics = harness
         .run(scenario.simulation.steps, inputs.planned_sends)
@@ -1212,6 +1312,7 @@ where
     let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
+    let simulated_seconds_per_step = simulated_seconds_per_step(&scenario.simulation);
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
@@ -1220,6 +1321,8 @@ where
         relay_config.ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
+        simulated_seconds_per_step,
+        inputs.cohort_online_rates,
     );
     let metrics = harness
         .run_with_progress(scenario.simulation.steps, inputs.planned_sends, |update| {
@@ -1285,7 +1388,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
         .unwrap_or(MessageEncryption::Plaintext);
     let mut crypto_rng = ChaCha20Rng::seed_from_u64(config.seed ^ 0x5A17_5EED);
     let graph = build_friend_graph(config, &mut rng);
-    let schedules = build_online_schedules(config, &mut rng);
+    let schedule_plan = build_online_schedules(config, &mut rng);
     let mut keypairs = HashMap::new();
     for node_id in &config.node_ids {
         keypairs.insert(node_id.clone(), generate_keypair_with_rng(&mut crypto_rng));
@@ -1310,7 +1413,11 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
                 direct_links.insert((node_id.clone(), friend.clone()));
             }
         }
-        let schedule = schedules.get(node_id).cloned().unwrap_or_default();
+        let schedule = schedule_plan
+            .schedules
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default();
         nodes.push(Node::new(node_id, schedule));
     }
     SimulationInputs {
@@ -1319,6 +1426,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
         direct_links,
         keypairs,
         encryption,
+        cohort_online_rates: schedule_plan.cohort_online_rates,
     }
 }
 
@@ -1441,38 +1549,170 @@ fn sample_friends_target(
     }
 }
 
-pub fn build_online_schedules(
-    config: &SimulationConfig,
+fn simulated_seconds_per_step(config: &SimulationConfig) -> f64 {
+    let seconds = config.simulated_time.seconds_per_step as f64;
+    let factor = config.simulated_time.default_speed_factor.max(0.0);
+    seconds * factor
+}
+
+fn select_cohort<'a>(
+    cohorts: &'a [OnlineCohortDefinition],
     rng: &mut impl Rng,
-) -> HashMap<String, Vec<bool>> {
-    let mut schedules = HashMap::new();
-    for node_id in &config.node_ids {
-        let schedule = match &config.availability {
-            OnlineAvailability::Bernoulli { p_online } => (0..config.steps)
-                .map(|_| rng.gen::<f64>() < *p_online)
-                .collect(),
-            OnlineAvailability::Markov {
-                p_online_given_online,
-                p_online_given_offline,
-                start_online_prob,
-            } => {
-                let mut schedule = Vec::with_capacity(config.steps);
-                let mut online = rng.gen::<f64>() < *start_online_prob;
-                for _ in 0..config.steps {
-                    schedule.push(online);
-                    let next_prob = if online {
-                        *p_online_given_online
-                    } else {
-                        *p_online_given_offline
-                    };
-                    online = rng.gen::<f64>() < next_prob;
-                }
-                schedule
+) -> &'a OnlineCohortDefinition {
+    let weights: Vec<f64> = cohorts.iter().map(cohort_share).collect();
+    let index = sample_weighted_index(rng, &weights);
+    cohorts
+        .get(index)
+        .unwrap_or_else(|| cohorts.first().expect("cohort list cannot be empty"))
+}
+
+fn cohort_share(cohort: &OnlineCohortDefinition) -> f64 {
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { share, .. }
+        | OnlineCohortDefinition::RarelyOnline { share, .. }
+        | OnlineCohortDefinition::Diurnal { share, .. } => *share,
+    }
+}
+
+fn cohort_name(cohort: &OnlineCohortDefinition) -> &str {
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { name, .. }
+        | OnlineCohortDefinition::RarelyOnline { name, .. }
+        | OnlineCohortDefinition::Diurnal { name, .. } => name,
+    }
+}
+
+fn build_availability_schedule(config: &SimulationConfig, rng: &mut impl Rng) -> Vec<bool> {
+    let Some(availability) = &config.availability else {
+        return vec![true; config.steps];
+    };
+    match availability {
+        OnlineAvailability::Bernoulli { p_online } => (0..config.steps)
+            .map(|_| rng.gen::<f64>() < *p_online)
+            .collect(),
+        OnlineAvailability::Markov {
+            p_online_given_online,
+            p_online_given_offline,
+            start_online_prob,
+        } => {
+            let mut schedule = Vec::with_capacity(config.steps);
+            let mut online = rng.gen::<f64>() < *start_online_prob;
+            for _ in 0..config.steps {
+                schedule.push(online);
+                let next_prob = if online {
+                    *p_online_given_online
+                } else {
+                    *p_online_given_offline
+                };
+                online = rng.gen::<f64>() < next_prob;
             }
+            schedule
+        }
+    }
+}
+
+fn build_cohort_schedule(
+    cohort: &OnlineCohortDefinition,
+    steps: usize,
+    simulated_seconds_per_step: f64,
+    rng: &mut impl Rng,
+) -> Vec<bool> {
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { .. } => vec![true; steps],
+        OnlineCohortDefinition::RarelyOnline {
+            online_probability, ..
+        } => (0..steps)
+            .map(|_| rng.gen::<f64>() < online_probability.clamp(0.0, 1.0))
+            .collect(),
+        OnlineCohortDefinition::Diurnal {
+            online_probability,
+            timezone_offset_hours,
+            hourly_weights,
+            ..
+        } => {
+            let weights = normalize_hourly_weights(hourly_weights);
+            let max_weight = weights
+                .iter()
+                .copied()
+                .fold(0.0_f64, |max, weight| max.max(weight));
+            let max_weight = if max_weight > 0.0 { max_weight } else { 1.0 };
+            let base_probability = online_probability.clamp(0.0, 1.0);
+            (0..steps)
+                .map(|step| {
+                    let hour = ((step as f64 * simulated_seconds_per_step) / 3600.0).floor() as i64;
+                    let hour = (hour + *timezone_offset_hours as i64)
+                        .rem_euclid(SIMULATION_HOURS_PER_DAY as i64)
+                        as usize;
+                    let weight_factor = weights[hour] / max_weight;
+                    rng.gen::<f64>() < (base_probability * weight_factor).clamp(0.0, 1.0)
+                })
+                .collect()
+        }
+    }
+}
+
+fn normalize_hourly_weights(weights: &[f64]) -> Vec<f64> {
+    if weights.len() == SIMULATION_HOURS_PER_DAY {
+        return weights.to_vec();
+    }
+    vec![
+        0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9,
+        1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25,
+    ]
+}
+
+pub struct OnlineSchedulePlan {
+    pub schedules: HashMap<String, Vec<bool>>,
+    pub cohort_online_rates: HashMap<String, f64>,
+}
+
+pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> OnlineSchedulePlan {
+    let mut schedules = HashMap::new();
+    let mut cohort_online_counts: HashMap<String, usize> = HashMap::new();
+    let mut cohort_total_counts: HashMap<String, usize> = HashMap::new();
+    let simulated_seconds_per_step = simulated_seconds_per_step(config);
+    let cohorts = if config.cohorts.is_empty() {
+        None
+    } else {
+        Some(config.cohorts.as_slice())
+    };
+
+    for node_id in &config.node_ids {
+        let (cohort_name, schedule) = if let Some(cohorts) = cohorts {
+            let cohort = select_cohort(cohorts, rng);
+            let name = cohort_name(cohort).to_string();
+            let schedule =
+                build_cohort_schedule(cohort, config.steps, simulated_seconds_per_step, rng);
+            (name, schedule)
+        } else {
+            let name = "legacy".to_string();
+            let schedule = build_availability_schedule(config, rng);
+            (name, schedule)
         };
+
+        let online_count = schedule.iter().filter(|online| **online).count();
+        *cohort_online_counts.entry(cohort_name.clone()).or_insert(0) += online_count;
+        *cohort_total_counts.entry(cohort_name.clone()).or_insert(0) += schedule.len();
         schedules.insert(node_id.clone(), schedule);
     }
-    schedules
+
+    let cohort_online_rates = cohort_total_counts
+        .into_iter()
+        .map(|(cohort, total)| {
+            let online = cohort_online_counts.get(&cohort).copied().unwrap_or(0);
+            let rate = if total > 0 {
+                online as f64 / total as f64
+            } else {
+                0.0
+            };
+            (cohort, rate)
+        })
+        .collect();
+
+    OnlineSchedulePlan {
+        schedules,
+        cohort_online_rates,
+    }
 }
 
 pub fn build_planned_sends(
@@ -1496,9 +1736,18 @@ pub fn build_planned_sends(
             continue;
         }
         match &config.post_frequency {
-            PostFrequency::Poisson { lambda_per_step } => {
+            PostFrequency::Poisson {
+                lambda_per_step,
+                lambda_per_hour,
+            } => {
+                let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
+                let per_step = if let Some(lambda_per_hour) = lambda_per_hour {
+                    lambda_per_hour * (simulated_seconds_per_step / 3600.0)
+                } else {
+                    lambda_per_step.unwrap_or(0.0)
+                };
                 for step in 0..config.steps {
-                    let count = sample_poisson(rng, *lambda_per_step);
+                    let count = sample_poisson(rng, per_step);
                     for _ in 0..count {
                         let recipient = friends[rng.gen_range(0..friends.len())].clone();
                         let body = generate_message_body(rng, &config.message_size_distribution);
@@ -1529,13 +1778,24 @@ pub fn build_planned_sends(
                 weights,
                 total_posts,
             } => {
-                let weights = if weights.len() == config.steps {
+                let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
+                let use_hourly_weights = weights.len() == SIMULATION_HOURS_PER_DAY;
+                let weights = if weights.len() == config.steps || use_hourly_weights {
                     weights.clone()
                 } else {
-                    vec![1.0; config.steps]
+                    vec![1.0; config.steps.max(1)]
                 };
                 for _ in 0..*total_posts {
-                    let step = sample_weighted_index(rng, &weights);
+                    let step = if use_hourly_weights {
+                        let hour = sample_weighted_index(rng, &weights);
+                        let offset_seconds = rng.gen_range(0.0..3600.0);
+                        let simulated_seconds = (hour as f64 * 3600.0) + offset_seconds;
+                        let step =
+                            (simulated_seconds / simulated_seconds_per_step).floor() as usize;
+                        step.min(config.steps.saturating_sub(1))
+                    } else {
+                        sample_weighted_index(rng, &weights)
+                    };
                     let recipient = friends[rng.gen_range(0..friends.len())].clone();
                     let body = generate_message_body(rng, &config.message_size_distribution);
                     let payload = build_message_payload(
