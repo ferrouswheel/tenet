@@ -1,0 +1,566 @@
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use axum::Router;
+use rand::distributions::Uniform;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+
+use crate::relay::{app, RelayConfig, RelayState};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationConfig {
+    pub node_ids: Vec<String>,
+    pub steps: usize,
+    pub friends_per_node: FriendsPerNode,
+    pub post_frequency: PostFrequency,
+    pub availability: OnlineAvailability,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FriendsPerNode {
+    Uniform { min: usize, max: usize },
+    Poisson { lambda: f64 },
+    Zipf { max: usize, exponent: f64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PostFrequency {
+    Poisson { lambda_per_step: f64 },
+    WeightedSchedule { weights: Vec<f64>, total_posts: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OnlineAvailability {
+    Bernoulli { p_online: f64 },
+    Markov {
+        p_online_given_online: f64,
+        p_online_given_offline: f64,
+        start_online_prob: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayConfigToml {
+    pub ttl_seconds: u64,
+    pub max_messages: usize,
+    pub max_bytes: usize,
+    pub retry_backoff_seconds: Vec<u64>,
+}
+
+impl RelayConfigToml {
+    pub fn into_relay_config(self) -> RelayConfig {
+        RelayConfig {
+            ttl: Duration::from_secs(self.ttl_seconds),
+            max_messages: self.max_messages,
+            max_bytes: self.max_bytes,
+            retry_backoff: self
+                .retry_backoff_seconds
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationScenarioConfig {
+    pub simulation: SimulationConfig,
+    pub relay: RelayConfigToml,
+    pub direct_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulationMetrics {
+    pub planned_messages: usize,
+    pub sent_messages: usize,
+    pub direct_deliveries: usize,
+    pub inbox_deliveries: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulationReport {
+    pub metrics: SimulationMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimMessage {
+    pub id: String,
+    pub sender: String,
+    pub recipient: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedSend {
+    pub step: usize,
+    pub message: SimMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct Node {
+    id: String,
+    schedule: Vec<bool>,
+    inbox: Vec<SimMessage>,
+    seen: HashSet<String>,
+}
+
+impl Node {
+    pub fn new(id: &str, schedule: Vec<bool>) -> Self {
+        Self {
+            id: id.to_string(),
+            schedule,
+            inbox: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    fn online_at(&self, step: usize) -> bool {
+        self.schedule.get(step).copied().unwrap_or(false)
+    }
+
+    fn receive(&mut self, message: SimMessage) -> bool {
+        if self.seen.insert(message.id.clone()) {
+            self.inbox.push(message);
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct SimulationInputs {
+    pub nodes: Vec<Node>,
+    pub planned_sends: Vec<PlannedSend>,
+    pub direct_links: HashSet<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Header {
+    sender_id: String,
+    recipient_id: String,
+    timestamp: u64,
+    content_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Payload {
+    body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Envelope {
+    message_id: String,
+    header: Header,
+    payload: Payload,
+}
+
+pub struct SimulationHarness {
+    relay_base_url: String,
+    nodes: HashMap<String, Node>,
+    direct_links: HashSet<(String, String)>,
+    direct_enabled: bool,
+    metrics: SimulationMetrics,
+}
+
+impl SimulationHarness {
+    pub fn new(
+        relay_base_url: String,
+        nodes: Vec<Node>,
+        direct_links: HashSet<(String, String)>,
+        direct_enabled: bool,
+    ) -> Self {
+        let planned_messages = 0;
+        Self {
+            relay_base_url,
+            nodes: nodes
+                .into_iter()
+                .map(|node| (node.id.clone(), node))
+                .collect(),
+            direct_links,
+            direct_enabled,
+            metrics: SimulationMetrics {
+                planned_messages,
+                sent_messages: 0,
+                direct_deliveries: 0,
+                inbox_deliveries: 0,
+            },
+        }
+    }
+
+    pub fn metrics(&self) -> SimulationMetrics {
+        self.metrics.clone()
+    }
+
+    pub async fn run(&mut self, steps: usize, plan: Vec<PlannedSend>) -> SimulationMetrics {
+        self.metrics.planned_messages = plan.len();
+        let mut sends_by_step: HashMap<usize, Vec<SimMessage>> = HashMap::new();
+        for item in plan {
+            sends_by_step
+                .entry(item.step)
+                .or_default()
+                .push(item.message);
+        }
+
+        for step in 0..steps {
+            if let Some(messages) = sends_by_step.get(&step) {
+                for message in messages {
+                    if self
+                        .nodes
+                        .get(&message.sender)
+                        .is_some_and(|node| node.online_at(step))
+                    {
+                        self.metrics.sent_messages += 1;
+                        let delivered_direct = self.route_message(step, message).await;
+                        if delivered_direct {
+                            self.metrics.direct_deliveries += 1;
+                        }
+                    }
+                }
+            }
+
+            let online_ids: Vec<String> = self
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.online_at(step))
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for node_id in online_ids {
+                let envelopes = fetch_inbox(&self.relay_base_url, &node_id)
+                    .await
+                    .unwrap_or_default();
+                if let Some(node) = self.nodes.get_mut(&node_id) {
+                    for envelope in envelopes {
+                        let message = SimMessage {
+                            id: envelope.message_id,
+                            sender: envelope.header.sender_id,
+                            recipient: envelope.header.recipient_id,
+                            body: envelope.payload.body,
+                        };
+                        if node.receive(message) {
+                            self.metrics.inbox_deliveries += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.metrics()
+    }
+
+    pub fn inbox(&self, node_id: &str) -> Vec<SimMessage> {
+        self.nodes
+            .get(node_id)
+            .map(|node| node.inbox.clone())
+            .unwrap_or_default()
+    }
+
+    async fn route_message(&mut self, step: usize, message: &SimMessage) -> bool {
+        let mut direct_delivered = false;
+        if self.direct_enabled
+            && self
+                .direct_links
+                .contains(&(message.sender.clone(), message.recipient.clone()))
+        {
+            let recipient_online = self
+                .nodes
+                .get(&message.recipient)
+                .is_some_and(|node| node.online_at(step));
+            if recipient_online {
+                if let Some(node) = self.nodes.get_mut(&message.recipient) {
+                    direct_delivered = node.receive(message.clone());
+                }
+            }
+        }
+
+        let envelope = Envelope {
+            message_id: message.id.clone(),
+            header: Header {
+                sender_id: message.sender.clone(),
+                recipient_id: message.recipient.clone(),
+                timestamp: step as u64,
+                content_type: "text/plain".to_string(),
+            },
+            payload: Payload {
+                body: message.body.clone(),
+            },
+        };
+        let _ = post_envelope(&self.relay_base_url, &envelope).await;
+
+        direct_delivered
+    }
+}
+
+pub async fn run_simulation_scenario(
+    scenario: SimulationScenarioConfig,
+) -> Result<SimulationReport, String> {
+    let (base_url, shutdown_tx) = start_relay(scenario.relay.into_relay_config()).await;
+    let inputs = build_simulation_inputs(&scenario.simulation);
+    let mut harness = SimulationHarness::new(
+        base_url,
+        inputs.nodes,
+        inputs.direct_links,
+        scenario.direct_enabled.unwrap_or(true),
+    );
+    let metrics = harness
+        .run(scenario.simulation.steps, inputs.planned_sends)
+        .await;
+    shutdown_tx.send(()).ok();
+    Ok(SimulationReport { metrics })
+}
+
+pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
+    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+    let graph = build_friend_graph(config, &mut rng);
+    let schedules = build_online_schedules(config, &mut rng);
+    let planned_sends = build_planned_sends(config, &mut rng, &graph);
+    let mut direct_links = HashSet::new();
+    let mut nodes = Vec::new();
+    for node_id in &config.node_ids {
+        if let Some(friends) = graph.get(node_id) {
+            for friend in friends {
+                direct_links.insert((node_id.clone(), friend.clone()));
+            }
+        }
+        let schedule = schedules.get(node_id).cloned().unwrap_or_default();
+        nodes.push(Node::new(node_id, schedule));
+    }
+    SimulationInputs {
+        nodes,
+        planned_sends,
+        direct_links,
+    }
+}
+
+pub fn build_friend_graph(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+) -> HashMap<String, Vec<String>> {
+    let mut graph = HashMap::new();
+    let uniform = Uniform::new_inclusive(0usize, config.node_ids.len().saturating_sub(1));
+    for node_id in &config.node_ids {
+        let friends_target = match config.friends_per_node {
+            FriendsPerNode::Uniform { min, max } => {
+                rng.gen_range(min..=max.min(config.node_ids.len().saturating_sub(1)))
+            }
+            FriendsPerNode::Poisson { lambda } => sample_poisson(rng, lambda)
+                .min(config.node_ids.len().saturating_sub(1)),
+            FriendsPerNode::Zipf { max, exponent } => {
+                sample_zipf(rng, max.min(config.node_ids.len().saturating_sub(1)), exponent)
+            }
+        };
+
+        let mut friends = HashSet::new();
+        while friends.len() < friends_target && friends.len() < config.node_ids.len().saturating_sub(1)
+        {
+            let idx = rng.sample(uniform);
+            let candidate = &config.node_ids[idx];
+            if candidate != node_id {
+                friends.insert(candidate.clone());
+            }
+        }
+        graph.insert(node_id.clone(), friends.into_iter().collect());
+    }
+    graph
+}
+
+pub fn build_online_schedules(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+) -> HashMap<String, Vec<bool>> {
+    let mut schedules = HashMap::new();
+    for node_id in &config.node_ids {
+        let schedule = match &config.availability {
+            OnlineAvailability::Bernoulli { p_online } => (0..config.steps)
+                .map(|_| rng.gen::<f64>() < *p_online)
+                .collect(),
+            OnlineAvailability::Markov {
+                p_online_given_online,
+                p_online_given_offline,
+                start_online_prob,
+            } => {
+                let mut schedule = Vec::with_capacity(config.steps);
+                let mut online = rng.gen::<f64>() < *start_online_prob;
+                for _ in 0..config.steps {
+                    schedule.push(online);
+                    let next_prob = if online {
+                        *p_online_given_online
+                    } else {
+                        *p_online_given_offline
+                    };
+                    online = rng.gen::<f64>() < next_prob;
+                }
+                schedule
+            }
+        };
+        schedules.insert(node_id.clone(), schedule);
+    }
+    schedules
+}
+
+pub fn build_planned_sends(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+    graph: &HashMap<String, Vec<String>>,
+) -> Vec<PlannedSend> {
+    let mut planned = Vec::new();
+    let mut counter = 0usize;
+    for node_id in &config.node_ids {
+        let friends = graph
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if friends.is_empty() {
+            continue;
+        }
+        match &config.post_frequency {
+            PostFrequency::Poisson { lambda_per_step } => {
+                for step in 0..config.steps {
+                    let count = sample_poisson(rng, *lambda_per_step);
+                    for _ in 0..count {
+                        let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                        let message = SimMessage {
+                            id: format!("msg-{}-{}", node_id, counter),
+                            sender: node_id.clone(),
+                            recipient,
+                            body: "hello from poisson".to_string(),
+                        };
+                        counter += 1;
+                        planned.push(PlannedSend { step, message });
+                    }
+                }
+            }
+            PostFrequency::WeightedSchedule {
+                weights,
+                total_posts,
+            } => {
+                let weights = if weights.len() == config.steps {
+                    weights.clone()
+                } else {
+                    vec![1.0; config.steps]
+                };
+                for _ in 0..*total_posts {
+                    let step = sample_weighted_index(rng, &weights);
+                    let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                    let message = SimMessage {
+                        id: format!("msg-{}-{}", node_id, counter),
+                        sender: node_id.clone(),
+                        recipient,
+                        body: "hello from weighted schedule".to_string(),
+                    };
+                    counter += 1;
+                    planned.push(PlannedSend { step, message });
+                }
+            }
+        }
+    }
+    planned
+}
+
+pub fn sample_poisson(rng: &mut impl Rng, lambda: f64) -> usize {
+    if lambda <= 0.0 {
+        return 0;
+    }
+    let l = (-lambda).exp();
+    let mut k = 0usize;
+    let mut p = 1.0;
+    while p > l {
+        k += 1;
+        p *= rng.gen::<f64>();
+    }
+    k.saturating_sub(1)
+}
+
+pub fn sample_zipf(rng: &mut impl Rng, max: usize, exponent: f64) -> usize {
+    let max = max.max(1);
+    let exponent = exponent.max(0.0);
+    let mut weights = Vec::with_capacity(max);
+    for k in 1..=max {
+        let weight = 1.0 / (k as f64).powf(exponent);
+        weights.push(weight);
+    }
+    let index = sample_weighted_index(rng, &weights);
+    index + 1
+}
+
+pub fn sample_weighted_index(rng: &mut impl Rng, weights: &[f64]) -> usize {
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return rng.gen_range(0..weights.len().max(1));
+    }
+    let mut target = rng.gen_range(0.0..total);
+    for (idx, weight) in weights.iter().enumerate() {
+        if *weight <= 0.0 {
+            continue;
+        }
+        if target < *weight {
+            return idx;
+        }
+        target -= *weight;
+    }
+    weights.len().saturating_sub(1)
+}
+
+pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>) {
+    let state = RelayState::new(config);
+    let app: Router = app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let addr = listener.local_addr().expect("relay addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = shutdown_rx.await;
+    });
+    tokio::spawn(async move {
+        let _ = server.await;
+    });
+
+    (format!("http://{}", addr), shutdown_tx)
+}
+
+async fn post_envelope(base_url: &str, envelope: &Envelope) -> Result<(), String> {
+    let body = serde_json::to_string(envelope).map_err(|err| err.to_string())?;
+    tokio::task::spawn_blocking({
+        let base_url = base_url.to_string();
+        let body = body.clone();
+        move || {
+            let response = ureq::post(&format!("{}/envelopes", base_url))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+                .map_err(|err| err.to_string())?;
+            if response.status() >= 400 {
+                return Err(format!("relay rejected envelope: {}", response.status()));
+            }
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+async fn fetch_inbox(base_url: &str, recipient_id: &str) -> Result<Vec<Envelope>, String> {
+    tokio::task::spawn_blocking({
+        let base_url = base_url.to_string();
+        let recipient_id = recipient_id.to_string();
+        move || {
+            let response = ureq::get(&format!("{}/inbox/{}", base_url, recipient_id))
+                .call()
+                .map_err(|err| err.to_string())?;
+            let body = response.into_string().map_err(|err| err.to_string())?;
+            serde_json::from_str(&body).map_err(|err| err.to_string())
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
