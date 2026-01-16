@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use tenet::crypto::generate_keypair;
 use tenet::protocol::{build_plaintext_payload, ContentId};
 use tenet::relay::RelayConfig;
 use tenet::simulation::{
     build_simulation_inputs, start_relay, FriendsPerNode, MessageEncryption,
-    MessageSizeDistribution, OnlineAvailability, PlannedSend, PostFrequency, SimMessage,
-    SimulatedTimeConfig, SimulationConfig, SimulationHarness,
+    MessageSizeDistribution, Node, OnlineAvailability, PlannedSend, PostFrequency, SimMessage,
+    SimulatedTimeConfig, SimulationConfig, SimulationControlCommand, SimulationHarness,
+    SimulationTimingConfig,
 };
+use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn simulation_harness_routes_relay_and_direct_with_dedup() {
@@ -55,7 +58,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         relay_config.ttl.as_secs(),
         inputs.encryption,
         inputs.keypairs,
-        60.0,
+        inputs.timing,
         inputs.cohort_online_rates,
     );
 
@@ -127,7 +130,11 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
         Default::default(),
-        60.0,
+        SimulationTimingConfig {
+            base_seconds_per_step: 60.0,
+            speed_factor: 1.0,
+            base_real_time_per_step: Duration::ZERO,
+        },
         HashMap::new(),
     );
 
@@ -170,7 +177,11 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
         Default::default(),
-        60.0,
+        SimulationTimingConfig {
+            base_seconds_per_step: 60.0,
+            speed_factor: 1.0,
+            base_real_time_per_step: Duration::ZERO,
+        },
         HashMap::new(),
     );
 
@@ -197,4 +208,67 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
     assert_eq!(report.missed_message_deliveries, 1);
     assert_eq!(report.missed_message_requests_sent, 2);
     assert_eq!(report.acks_received, 2);
+}
+
+#[tokio::test]
+async fn simulation_harness_applies_dynamic_updates() {
+    let relay_config = RelayConfig {
+        ttl: Duration::from_secs(5),
+        max_messages: 100,
+        max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
+        log_sink: None,
+    };
+    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+
+    let nodes = vec![
+        Node::new("node-a", vec![true; 4]),
+        Node::new("node-b", vec![true; 4]),
+    ];
+    let mut direct_links = HashSet::new();
+    direct_links.insert(("node-a".to_string(), "node-b".to_string()));
+    direct_links.insert(("node-b".to_string(), "node-a".to_string()));
+
+    let mut harness = SimulationHarness::new(
+        base_url,
+        nodes,
+        direct_links,
+        true,
+        relay_config.ttl.as_secs(),
+        MessageEncryption::Plaintext,
+        Default::default(),
+        SimulationTimingConfig {
+            base_seconds_per_step: 60.0,
+            speed_factor: 1.0,
+            base_real_time_per_step: Duration::ZERO,
+        },
+        HashMap::new(),
+    );
+
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let node_c = Node::new("node-c", vec![true; 4]);
+    let _ = control_tx.send(SimulationControlCommand::AddPeer {
+        node: node_c,
+        keypair: generate_keypair(),
+    });
+    let _ = control_tx.send(SimulationControlCommand::AddFriendship {
+        peer_a: "node-a".to_string(),
+        peer_b: "node-c".to_string(),
+    });
+    let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor { multiplier: 1.5 });
+    drop(control_tx);
+
+    let mut last_update = None;
+    harness
+        .run_with_progress_and_controls(4, Vec::new(), control_rx, |update| {
+            last_update = Some(update);
+        })
+        .await;
+    shutdown_tx.send(()).ok();
+
+    let update = last_update.expect("expected at least one update");
+    assert_eq!(harness.total_nodes(), 3);
+    assert!(update.speed_factor > 1.0);
 }
