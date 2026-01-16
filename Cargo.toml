@@ -14,5 +14,5 @@ rand_chacha = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1.37", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "time"] }
 ureq = { version = "2.10", features = ["tls"] }
