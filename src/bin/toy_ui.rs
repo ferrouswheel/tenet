@@ -257,16 +257,16 @@ fn send_message(
         return Err("send requires a message".into());
     }
 
+    let (recipient_id, recipient_public_key_hex) = {
+        let recipient = find_peer(peers, to)?;
+        (recipient.keypair.id.clone(), recipient.keypair.public_key_hex.clone())
+    };
+
     let sender = find_peer_mut(peers, from)?;
     if !sender.online {
         println!("{} is offline; cannot send", sender.name);
         return Ok(());
     }
-
-    let (recipient_id, recipient_public_key_hex) = {
-        let recipient = find_peer(peers, to)?;
-        (recipient.keypair.id.clone(), recipient.keypair.public_key_hex.clone())
-    };
 
     let envelope = build_envelope(sender, &recipient_id, &recipient_public_key_hex, &message)?;
 
@@ -408,10 +408,10 @@ fn post_envelope(config: &ToyUiConfig, envelope: &Envelope) -> Result<(), Box<dy
     let url = format!("{}/envelopes", config.relay_url.trim_end_matches('/'));
     let response = ureq::post(&url).send_json(serde_json::to_value(envelope)?);
 
-    if response.ok() {
-        Ok(())
-    } else {
-        Err(format!("relay error: {}", response.status()).into())
+    match response {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("relay error: {code}").into()),
+        Err(err) => Err(err.into()),
     }
 }
 
