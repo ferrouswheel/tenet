@@ -6,7 +6,7 @@ use hpke::aead::ChaCha20Poly1305 as HpkeChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable, Kem as _, OpModeR, OpModeS, Serializable};
-use rand::{rngs::OsRng, RngCore, SeedableRng};
+use rand::{rngs::OsRng, CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -117,7 +117,11 @@ pub fn derive_user_id_from_public_key(public_key_bytes: &[u8]) -> String {
 
 pub fn generate_keypair() -> StoredKeypair {
     let mut rng = OsRng;
-    let (private_key, public_key) = X25519HkdfSha256::gen_keypair(&mut rng);
+    generate_keypair_with_rng(&mut rng)
+}
+
+pub fn generate_keypair_with_rng(rng: &mut (impl RngCore + CryptoRng)) -> StoredKeypair {
+    let (private_key, public_key) = X25519HkdfSha256::gen_keypair(rng);
     let public_key_bytes = public_key.to_bytes();
     let private_key_bytes = private_key.to_bytes();
     let id = derive_user_id_from_public_key(&public_key_bytes);
@@ -184,7 +188,13 @@ pub fn encrypt_payload(
     let key = Key::from_slice(content_key);
     let aead = ChaCha20Poly1305::new(key);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = aead.encrypt(nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad })?;
+    let ciphertext = aead.encrypt(
+        nonce,
+        chacha20poly1305::aead::Payload {
+            msg: plaintext,
+            aad,
+        },
+    )?;
     Ok((nonce_bytes, ciphertext))
 }
 
@@ -204,7 +214,13 @@ pub fn decrypt_payload(
     let key = Key::from_slice(content_key);
     let aead = ChaCha20Poly1305::new(key);
     let nonce = Nonce::from_slice(nonce);
-    let plaintext = aead.decrypt(nonce, chacha20poly1305::aead::Payload { msg: ciphertext, aad })?;
+    let plaintext = aead.decrypt(
+        nonce,
+        chacha20poly1305::aead::Payload {
+            msg: ciphertext,
+            aad,
+        },
+    )?;
     Ok(plaintext)
 }
 
@@ -253,8 +269,7 @@ pub fn unwrap_content_key(
 ) -> Result<Vec<u8>, CryptoError> {
     let recipient_private_key =
         <X25519HkdfSha256 as hpke::Kem>::PrivateKey::from_bytes(recipient_private_key_bytes)?;
-    let encapped_key =
-        <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&wrapped_key.enc)?;
+    let encapped_key = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&wrapped_key.enc)?;
 
     let mut receiver_ctx = hpke::setup_receiver::<
         HpkeChaCha20Poly1305,
@@ -278,10 +293,9 @@ mod tests {
 
     #[test]
     fn encrypts_and_decrypts_payload_with_fixture() {
-        let content_key = hex::decode(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        )
-        .unwrap();
+        let content_key =
+            hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .unwrap();
         let nonce = hex::decode("000102030405060708090a0b").unwrap();
         let plaintext = b"payload:hello world";
         let aad = b"context";
@@ -305,10 +319,9 @@ mod tests {
         let (recipient_private_key, recipient_public_key) =
             X25519HkdfSha256::gen_keypair(&mut recipient_rng);
 
-        let content_key = hex::decode(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        )
-        .unwrap();
+        let content_key =
+            hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .unwrap();
 
         let info = b"tenet-hpke";
         let sender_seed = [9u8; 32];
@@ -329,12 +342,8 @@ mod tests {
             "e7c9e1e1948c5dd8c110e313a16afd1b5e2e9a53d99aecd6cad17e48bac00ca34eeee3a38557ec53763c500179030753"
         );
 
-        let unwrapped = unwrap_content_key(
-            &recipient_private_key.to_bytes(),
-            &wrapped,
-            info,
-        )
-        .unwrap();
+        let unwrapped =
+            unwrap_content_key(&recipient_private_key.to_bytes(), &wrapped, info).unwrap();
 
         assert_eq!(unwrapped, content_key);
     }
@@ -350,10 +359,8 @@ mod tests {
     #[test]
     fn stores_and_loads_keypairs_round_trip() {
         let keypair = generate_keypair();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "tenet-keypair-test-{}",
-            rand::random::<u64>()
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("tenet-keypair-test-{}", rand::random::<u64>()));
         fs::create_dir_all(&temp_dir).unwrap();
         let path = temp_dir.join("identity.json");
 

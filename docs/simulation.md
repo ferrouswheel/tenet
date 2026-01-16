@@ -30,6 +30,7 @@ the relay.
 - `availability`: online/offline behavior (see below).
 - `message_size_distribution`: message size generator (see below).
 - `clustering` (optional): cluster layout for dense subgraphs with sparse cross-links.
+- `encryption` (optional): message payload handling (`plaintext` or `encrypted`).
 
 ### `friends_per_node`
 
@@ -110,6 +111,18 @@ mean = 3.2
 std_dev = 0.7
 min = 40
 max = 400
+```
+
+### `encryption` (optional)
+
+```toml
+[simulation.encryption]
+type = "plaintext"
+```
+
+```toml
+[simulation.encryption]
+type = "encrypted"
 ```
 
 ### `clustering` (optional)
