@@ -69,6 +69,7 @@ pub enum MessageKind {
     Meta,
     Direct,
     FriendGroup,
+    StoreForPeer,
 }
 
 /// High-level metadata that binds a payload to a sender and recipient.
@@ -77,6 +78,8 @@ pub enum MessageKind {
 pub struct Header {
     pub sender_id: String,
     pub recipient_id: String,
+    pub store_for: Option<String>,
+    pub storage_peer_id: Option<String>,
     pub timestamp: u64,
     pub message_id: ContentId,
     pub message_kind: MessageKind,
@@ -92,6 +95,8 @@ struct CanonicalHeader<'a> {
     version: ProtocolVersion,
     sender_id: &'a str,
     recipient_id: &'a str,
+    store_for: Option<&'a str>,
+    storage_peer_id: Option<&'a str>,
     timestamp: u64,
     message_id: &'a ContentId,
     message_kind: &'a MessageKind,
@@ -150,6 +155,8 @@ impl Header {
             version,
             sender_id: &self.sender_id,
             recipient_id: &self.recipient_id,
+            store_for: self.store_for.as_deref(),
+            storage_peer_id: self.storage_peer_id.as_deref(),
             timestamp: self.timestamp,
             message_id: &self.message_id,
             message_kind: &self.message_kind,
@@ -197,16 +204,50 @@ impl Header {
 
     fn validate_message_kind(&self) -> Result<(), HeaderError> {
         match self.message_kind {
-            MessageKind::FriendGroup => match self.group_id.as_deref() {
-                Some(id) if !id.trim().is_empty() => Ok(()),
-                _ => Err(HeaderError::InvalidMessageKind(
-                    "friend_group requires a non-empty group_id".to_string(),
-                )),
-            },
+            MessageKind::FriendGroup => {
+                if self.store_for.is_some() || self.storage_peer_id.is_some() {
+                    return Err(HeaderError::InvalidMessageKind(
+                        "store_for and storage_peer_id are only valid for store_for_peer messages"
+                            .to_string(),
+                    ));
+                }
+                match self.group_id.as_deref() {
+                    Some(id) if !id.trim().is_empty() => Ok(()),
+                    _ => Err(HeaderError::InvalidMessageKind(
+                        "friend_group requires a non-empty group_id".to_string(),
+                    )),
+                }
+            }
+            MessageKind::StoreForPeer => {
+                if self.group_id.is_some() {
+                    return Err(HeaderError::InvalidMessageKind(
+                        "group_id is only valid for friend_group messages".to_string(),
+                    ));
+                }
+                let store_for = self.store_for.as_deref().unwrap_or("").trim();
+                let storage_peer = self.storage_peer_id.as_deref().unwrap_or("").trim();
+                if store_for.is_empty() || storage_peer.is_empty() {
+                    return Err(HeaderError::InvalidMessageKind(
+                        "store_for_peer requires store_for and storage_peer_id".to_string(),
+                    ));
+                }
+                if storage_peer != self.recipient_id {
+                    return Err(HeaderError::InvalidMessageKind(
+                        "storage_peer_id must match recipient_id for store_for_peer messages"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
             _ => {
                 if self.group_id.is_some() {
                     Err(HeaderError::InvalidMessageKind(
                         "group_id is only valid for friend_group messages".to_string(),
+                    ))
+                } else if self.store_for.is_some() || self.storage_peer_id.is_some() {
+                    Err(HeaderError::InvalidMessageKind(
+                        "store_for and storage_peer_id are only valid for store_for_peer messages"
+                            .to_string(),
                     ))
                 } else {
                     Ok(())
@@ -322,6 +363,8 @@ pub fn build_plaintext_payload(body: impl Into<String>, salt: impl AsRef<[u8]>) 
 pub fn build_envelope_from_payload(
     sender_id: impl Into<String>,
     recipient_id: impl Into<String>,
+    store_for: Option<String>,
+    storage_peer_id: Option<String>,
     timestamp: u64,
     ttl_seconds: u64,
     message_kind: MessageKind,
@@ -332,6 +375,8 @@ pub fn build_envelope_from_payload(
     let mut header = Header {
         sender_id: sender_id.into(),
         recipient_id: recipient_id.into(),
+        store_for,
+        storage_peer_id,
         timestamp,
         message_id,
         message_kind,
@@ -354,6 +399,8 @@ pub fn build_envelope_from_payload(
 pub fn build_plaintext_envelope(
     sender_id: impl Into<String>,
     recipient_id: impl Into<String>,
+    store_for: Option<String>,
+    storage_peer_id: Option<String>,
     timestamp: u64,
     ttl_seconds: u64,
     message_kind: MessageKind,
@@ -365,6 +412,8 @@ pub fn build_plaintext_envelope(
     build_envelope_from_payload(
         sender_id,
         recipient_id,
+        store_for,
+        storage_peer_id,
         timestamp,
         ttl_seconds,
         message_kind,
