@@ -27,6 +27,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         ],
         steps: 6,
         friends_per_node: FriendsPerNode::Uniform { min: 2, max: 2 },
+        clustering: None,
         post_frequency: PostFrequency::WeightedSchedule {
             weights: vec![1.0, 1.0, 2.0, 1.0, 0.5, 0.5],
             total_posts: 3,
