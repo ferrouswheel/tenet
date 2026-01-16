@@ -335,12 +335,11 @@ impl SimulationHarness {
                 let envelopes = fetch_inbox(&self.relay_base_url, &node_id)
                     .await
                     .unwrap_or_default();
-                if let Some(node) = self.nodes.get_mut(&node_id) {
-                    for envelope in envelopes {
-                        let message_id = envelope.header.message_id.0.clone();
-                        if let Some(message) =
-                            self.decode_envelope(&envelope, &message_id, &node_id)
-                        {
+                for envelope in envelopes {
+                    let message_id = envelope.header.message_id.0.clone();
+                    let message = self.decode_envelope(&envelope, &message_id, &node_id);
+                    if let Some(message) = message {
+                        if let Some(node) = self.nodes.get_mut(&node_id) {
                             if node.receive(message) {
                                 self.metrics.inbox_deliveries += 1;
                                 self.metrics_tracker
@@ -408,11 +407,11 @@ impl SimulationHarness {
                 let envelopes = fetch_inbox(&self.relay_base_url, node_id)
                     .await
                     .unwrap_or_default();
-                if let Some(node) = self.nodes.get_mut(node_id) {
-                    for envelope in envelopes {
-                        let message_id = envelope.header.message_id.0.clone();
-                        if let Some(message) = self.decode_envelope(&envelope, &message_id, node_id)
-                        {
+                for envelope in envelopes {
+                    let message_id = envelope.header.message_id.0.clone();
+                    let message = self.decode_envelope(&envelope, &message_id, node_id);
+                    if let Some(message) = message {
+                        if let Some(node) = self.nodes.get_mut(node_id) {
                             if node.receive(message) {
                                 self.metrics.inbox_deliveries += 1;
                                 if let Some(latency) =
@@ -450,30 +449,6 @@ impl SimulationHarness {
     }
 
     async fn route_message(&mut self, step: usize, message: &SimMessage) -> Option<usize> {
-        let mut direct_latency = None;
-        if self.direct_enabled
-            && self
-                .direct_links
-                .contains(&(message.sender.clone(), message.recipient.clone()))
-        {
-            let recipient_online = self
-                .nodes
-                .get(&message.recipient)
-                .is_some_and(|node| node.online_at(step));
-            if recipient_online {
-                if let Some(node) = self.nodes.get_mut(&message.recipient) {
-                    let direct_delivered = self.deliver_direct(node, message, &message.recipient);
-                    if direct_delivered {
-                        direct_latency = self.metrics_tracker.record_delivery(
-                            &message.id,
-                            &message.recipient,
-                            step,
-                        );
-                    }
-                }
-            }
-        }
-
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -486,30 +461,35 @@ impl SimulationHarness {
             message.payload.clone(),
         )
         .ok()?;
+        let mut direct_latency = None;
+        if self.direct_enabled
+            && self
+                .direct_links
+                .contains(&(message.sender.clone(), message.recipient.clone()))
+        {
+            let recipient_online = self
+                .nodes
+                .get(&message.recipient)
+                .is_some_and(|node| node.online_at(step));
+            if recipient_online {
+                let decoded = self.decode_envelope(&envelope, &message.id, &message.recipient);
+                if let Some(decoded) = decoded {
+                    if let Some(node) = self.nodes.get_mut(&message.recipient) {
+                        if node.receive(decoded) {
+                            direct_latency = self.metrics_tracker.record_delivery(
+                                &message.id,
+                                &message.recipient,
+                                step,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let _ = post_envelope(&self.relay_base_url, &envelope).await;
 
         direct_latency
-    }
-
-    fn deliver_direct(&self, node: &mut Node, message: &SimMessage, recipient_id: &str) -> bool {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let envelope = match build_envelope_from_payload(
-            message.sender.clone(),
-            message.recipient.clone(),
-            timestamp,
-            self.ttl_seconds,
-            message.payload.clone(),
-        ) {
-            Ok(envelope) => envelope,
-            Err(_) => return false,
-        };
-        if let Some(decoded) = self.decode_envelope(&envelope, &message.id, recipient_id) {
-            return node.receive(decoded);
-        }
-        false
     }
 
     fn decode_envelope(
@@ -661,14 +641,15 @@ impl MetricsTracker {
 pub async fn run_simulation_scenario(
     scenario: SimulationScenarioConfig,
 ) -> Result<SimulationReport, String> {
-    let (base_url, shutdown_tx) = start_relay(scenario.relay.into_relay_config()).await;
+    let relay_config = scenario.relay.clone();
+    let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
         inputs.direct_links,
         scenario.direct_enabled.unwrap_or(true),
-        scenario.relay.ttl_seconds,
+        relay_config.ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
     );
@@ -687,14 +668,15 @@ pub async fn run_simulation_scenario_with_progress<F>(
 where
     F: FnMut(SimulationStepUpdate),
 {
-    let (base_url, shutdown_tx) = start_relay(scenario.relay.into_relay_config()).await;
+    let relay_config = scenario.relay.clone();
+    let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
         inputs.direct_links,
         scenario.direct_enabled.unwrap_or(true),
-        scenario.relay.ttl_seconds,
+        relay_config.ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
     );
