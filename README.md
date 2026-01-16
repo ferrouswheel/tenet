@@ -10,7 +10,7 @@ A protocol concept for a peer-to-peer social network and a Rust reference implem
 ## Documentation
 
 * Architecture and design notes live in [docs/architecture.md](docs/architecture.md).
-* MVP scope lives in [docs/mvp.md](docs/mvp.md).
+* MVP scope lives in [docs/architecture.md](docs/architecture.md).
 
 ## Build
 
