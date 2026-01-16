@@ -259,6 +259,15 @@ and values must stay within protocol bounds (1s minimum, 7 days maximum).
 
 ## Manual TUI test
 
+### TUI key bindings
+
+When running `tenet-sim --tui`, use these keys to adjust the simulation while it runs:
+
+- `a`: add a peer (type an id, or press Enter for an auto-generated id).
+- `f`: add a friendship (enter two peer ids separated by space or comma).
+- `+` / `=`: speed up simulated time.
+- `-`: slow down simulated time.
+
 1. Run a simulation with the TUI enabled: `cargo run --bin tenet-sim -- --tui scenarios/basic.toml`.
 2. Wait for the simulation to complete and confirm the status panel displays the completion prompt.
 3. Press `q` and confirm the TUI exits back to the terminal.

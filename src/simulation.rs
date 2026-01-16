@@ -8,7 +8,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::{ChaCha20Rng, ChaCha8Rng};
 use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
 use crate::protocol::{
@@ -62,6 +62,27 @@ pub struct SimulatedTimeConfig {
     pub seconds_per_step: u64,
     #[serde(default = "default_speed_factor")]
     pub default_speed_factor: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulationTimingConfig {
+    pub base_seconds_per_step: f64,
+    pub speed_factor: f64,
+    pub base_real_time_per_step: Duration,
+}
+
+impl SimulationTimingConfig {
+    pub fn simulated_seconds_per_step(&self) -> f64 {
+        self.base_seconds_per_step * self.speed_factor.max(0.0)
+    }
+
+    pub fn real_time_per_step(&self) -> Duration {
+        if self.speed_factor <= 0.0 {
+            return Duration::ZERO;
+        }
+        self.base_real_time_per_step
+            .mul_f64(1.0 / self.speed_factor)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +276,8 @@ pub struct SimulationStepUpdate {
     pub step: usize,
     pub total_steps: usize,
     pub online_nodes: usize,
+    pub total_peers: usize,
+    pub speed_factor: f64,
     pub sent_messages: usize,
     pub received_messages: usize,
     pub rolling_latency: RollingLatencySnapshot,
@@ -339,6 +362,15 @@ pub struct SimulationInputs {
     pub keypairs: HashMap<String, StoredKeypair>,
     pub encryption: MessageEncryption,
     pub cohort_online_rates: HashMap<String, f64>,
+    pub timing: SimulationTimingConfig,
+}
+
+#[derive(Debug, Clone)]
+pub enum SimulationControlCommand {
+    AddPeer { node: Node, keypair: StoredKeypair },
+    AddFriendship { peer_a: String, peer_b: String },
+    AdjustSpeedFactor { multiplier: f64 },
+    SetSpeedFactor { speed_factor: f64 },
 }
 
 enum IncomingEnvelopeAction {
@@ -363,6 +395,7 @@ pub struct SimulationHarness {
     pending_forwarded_messages: HashSet<String>,
     metrics: SimulationMetrics,
     metrics_tracker: MetricsTracker,
+    timing: SimulationTimingConfig,
 }
 
 impl SimulationHarness {
@@ -374,7 +407,7 @@ impl SimulationHarness {
         ttl_seconds: u64,
         encryption: MessageEncryption,
         keypairs: HashMap<String, StoredKeypair>,
-        simulated_seconds_per_step: f64,
+        timing: SimulationTimingConfig,
         cohort_online_rates: HashMap<String, f64>,
     ) -> Self {
         let planned_messages = 0;
@@ -416,7 +449,11 @@ impl SimulationHarness {
                 store_forwards_forwarded: 0,
                 store_forwards_delivered: 0,
             },
-            metrics_tracker: MetricsTracker::new(simulated_seconds_per_step, cohort_online_rates),
+            metrics_tracker: MetricsTracker::new(
+                timing.simulated_seconds_per_step(),
+                cohort_online_rates,
+            ),
+            timing,
         }
     }
 
@@ -426,6 +463,64 @@ impl SimulationHarness {
 
     pub fn metrics_report(&self) -> SimulationMetricsReport {
         self.metrics_tracker.report()
+    }
+
+    pub fn total_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn speed_factor(&self) -> f64 {
+        self.timing.speed_factor
+    }
+
+    fn set_speed_factor(&mut self, speed_factor: f64) {
+        self.timing.speed_factor = speed_factor.max(0.0);
+        self.metrics_tracker
+            .set_simulated_seconds_per_step(self.timing.simulated_seconds_per_step());
+    }
+
+    fn apply_control_command(
+        &mut self,
+        command: SimulationControlCommand,
+        previous_online: &mut HashMap<String, bool>,
+    ) {
+        match command {
+            SimulationControlCommand::AddPeer { node, keypair } => {
+                let node_id = node.id.clone();
+                if self.nodes.contains_key(&node_id) {
+                    return;
+                }
+                self.nodes.insert(node_id.clone(), node);
+                self.keypairs.insert(node_id.clone(), keypair);
+                self.last_seen_by_peer
+                    .insert(node_id.clone(), HashMap::new());
+                self.neighbors.entry(node_id.clone()).or_default();
+                previous_online.entry(node_id).or_insert(false);
+            }
+            SimulationControlCommand::AddFriendship { peer_a, peer_b } => {
+                if !(self.nodes.contains_key(&peer_a) && self.nodes.contains_key(&peer_b)) {
+                    return;
+                }
+                if self.direct_links.insert((peer_a.clone(), peer_b.clone())) {
+                    self.neighbors
+                        .entry(peer_a.clone())
+                        .or_default()
+                        .push(peer_b.clone());
+                }
+                if self.direct_links.insert((peer_b.clone(), peer_a.clone())) {
+                    self.neighbors.entry(peer_b).or_default().push(peer_a);
+                }
+            }
+            SimulationControlCommand::AdjustSpeedFactor { multiplier } => {
+                if multiplier > 0.0 {
+                    let next = self.timing.speed_factor * multiplier;
+                    self.set_speed_factor(next);
+                }
+            }
+            SimulationControlCommand::SetSpeedFactor { speed_factor } => {
+                self.set_speed_factor(speed_factor);
+            }
+        }
     }
 
     fn record_message_send(&mut self, message: &SimMessage, step: usize, envelope: &Envelope) {
@@ -753,6 +848,23 @@ impl SimulationHarness {
     where
         F: FnMut(SimulationStepUpdate),
     {
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        self.run_with_progress_and_controls(steps, plan, control_rx, |update| {
+            on_step(update);
+        })
+        .await
+    }
+
+    pub async fn run_with_progress_and_controls<F>(
+        &mut self,
+        steps: usize,
+        plan: Vec<PlannedSend>,
+        mut control_rx: mpsc::UnboundedReceiver<SimulationControlCommand>,
+        mut on_step: F,
+    ) -> SimulationMetrics
+    where
+        F: FnMut(SimulationStepUpdate),
+    {
         self.metrics.planned_messages = plan.len();
         let mut sends_by_step: HashMap<usize, Vec<SimMessage>> = HashMap::new();
         for item in plan {
@@ -767,6 +879,9 @@ impl SimulationHarness {
             self.nodes.keys().map(|id| (id.clone(), false)).collect();
 
         for step in 0..steps {
+            while let Ok(command) = control_rx.try_recv() {
+                self.apply_control_command(command, &mut previous_online);
+            }
             let mut sent_messages = 0usize;
             let mut received_messages = 0usize;
             if let Some(messages) = sends_by_step.get(&step) {
@@ -880,11 +995,17 @@ impl SimulationHarness {
                 step: step + 1,
                 total_steps: steps,
                 online_nodes: online_ids.len(),
+                total_peers: self.nodes.len(),
+                speed_factor: self.timing.speed_factor,
                 sent_messages,
                 received_messages,
                 rolling_latency: rolling_latency.snapshot(),
             };
             on_step(update);
+            let delay = self.timing.real_time_per_step();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
         }
 
         self.metrics()
@@ -1167,6 +1288,10 @@ impl MetricsTracker {
         }
     }
 
+    fn set_simulated_seconds_per_step(&mut self, simulated_seconds_per_step: f64) {
+        self.simulated_seconds_per_step = simulated_seconds_per_step.max(0.0);
+    }
+
     fn record_send(&mut self, message: &SimMessage, step: usize) {
         let key = SenderRecipient {
             sender: message.sender.clone(),
@@ -1283,7 +1408,6 @@ pub async fn run_simulation_scenario(
     let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
-    let simulated_seconds_per_step = simulated_seconds_per_step(&scenario.simulation);
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
@@ -1292,7 +1416,7 @@ pub async fn run_simulation_scenario(
         relay_config.ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
-        simulated_seconds_per_step,
+        inputs.timing,
         inputs.cohort_online_rates,
     );
     let metrics = harness
@@ -1313,7 +1437,6 @@ where
     let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
-    let simulated_seconds_per_step = simulated_seconds_per_step(&scenario.simulation);
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
@@ -1322,7 +1445,7 @@ where
         relay_config.ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
-        simulated_seconds_per_step,
+        inputs.timing,
         inputs.cohort_online_rates,
     );
     let metrics = harness
@@ -1428,6 +1551,11 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
         keypairs,
         encryption,
         cohort_online_rates: schedule_plan.cohort_online_rates,
+        timing: SimulationTimingConfig {
+            base_seconds_per_step: config.simulated_time.seconds_per_step as f64,
+            speed_factor: config.simulated_time.default_speed_factor.max(0.0),
+            base_real_time_per_step: Duration::ZERO,
+        },
     }
 }
 

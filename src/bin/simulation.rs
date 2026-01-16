@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -17,9 +18,18 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+use tenet::crypto::generate_keypair;
 use tenet::simulation::{
-    run_simulation_scenario, RollingLatencySnapshot, SimulationScenarioConfig, SimulationStepUpdate,
+    run_simulation_scenario, RollingLatencySnapshot, SimulationControlCommand,
+    SimulationScenarioConfig, SimulationStepUpdate,
 };
+
+#[derive(Debug)]
+enum InputMode {
+    Normal,
+    AddPeer { buffer: String },
+    AddFriend { buffer: String },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -55,6 +65,9 @@ async fn run_with_tui(
     scenario: SimulationScenarioConfig,
 ) -> Result<tenet::simulation::SimulationReport, String> {
     const RELAY_LOG_LIMIT: usize = 200;
+    const REAL_TIME_STEP_DELAY_MS: u64 = 100;
+    const SPEED_UP_FACTOR: f64 = 1.25;
+    const SLOW_DOWN_FACTOR: f64 = 0.8;
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|err| err.to_string())?;
@@ -62,7 +75,9 @@ async fn run_with_tui(
     let mut terminal = Terminal::new(backend).map_err(|err| err.to_string())?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let mut relay_config = scenario.relay.clone().into_relay_config();
     relay_config.log_sink = Some(Arc::new(move |line: String| {
         let _ = log_tx.send(line);
@@ -70,7 +85,8 @@ async fn run_with_tui(
     let scenario_for_task = scenario.clone();
     let sim_handle = tokio::spawn(async move {
         let (base_url, shutdown_tx) = tenet::simulation::start_relay(relay_config).await;
-        let inputs = tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
+        let mut inputs = tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
+        inputs.timing.base_real_time_per_step = Duration::from_millis(REAL_TIME_STEP_DELAY_MS);
         let mut harness = tenet::simulation::SimulationHarness::new(
             base_url,
             inputs.nodes,
@@ -79,11 +95,14 @@ async fn run_with_tui(
             scenario_for_task.relay.ttl_seconds,
             inputs.encryption,
             inputs.keypairs,
+            inputs.timing,
+            inputs.cohort_online_rates,
         );
         let metrics = harness
-            .run_with_progress(
+            .run_with_progress_and_controls(
                 scenario_for_task.simulation.steps,
                 inputs.planned_sends,
+                control_rx,
                 |update| {
                     let _ = tx.send(update);
                 },
@@ -94,8 +113,24 @@ async fn run_with_tui(
         Ok(tenet::simulation::SimulationReport { metrics, report })
     });
 
+    let input_handle = tokio::task::spawn_blocking(move || loop {
+        match event::read() {
+            Ok(event) => {
+                if input_tx.send(event).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    });
+
     let mut last_update: Option<SimulationStepUpdate> = None;
     let mut relay_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
+    let mut input_mode = InputMode::Normal;
+    let mut status_message =
+        "Simulation running. Press a to add peers, f to add friends, +/- to adjust speed."
+            .to_string();
+    let mut auto_peer_index = 1usize;
 
     loop {
         tokio::select! {
@@ -107,7 +142,7 @@ async fn run_with_tui(
                             &mut terminal,
                             &update,
                             relay_logs.make_contiguous(),
-                            "Simulation running. Terminal will wait for q on completion.",
+                            &status_message,
                         )
                         .map_err(|err| err.to_string())?;
                     }
@@ -125,12 +160,35 @@ async fn run_with_tui(
                             &mut terminal,
                             update,
                             relay_logs.make_contiguous(),
-                            "Simulation running. Terminal will wait for q on completion.",
+                            &status_message,
                         )
                         .map_err(|err| err.to_string())?;
                     }
                 } else if rx.is_closed() {
                     break;
+                }
+            }
+            input_event = input_rx.recv() => {
+                if let Some(Event::Key(key)) = input_event {
+                    handle_key_event(
+                        key.code,
+                        &mut input_mode,
+                        &mut status_message,
+                        &control_tx,
+                        &mut auto_peer_index,
+                        scenario.simulation.steps,
+                        SPEED_UP_FACTOR,
+                        SLOW_DOWN_FACTOR,
+                    );
+                    if let Some(update) = &last_update {
+                        render(
+                            &mut terminal,
+                            update,
+                            relay_logs.make_contiguous(),
+                            &status_message,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
                 }
             }
         }
@@ -140,6 +198,8 @@ async fn run_with_tui(
         step: scenario.simulation.steps,
         total_steps: scenario.simulation.steps,
         online_nodes: 0,
+        total_peers: scenario.simulation.node_ids.len(),
+        speed_factor: scenario.simulation.simulated_time.default_speed_factor,
         sent_messages: 0,
         received_messages: 0,
         rolling_latency: RollingLatencySnapshot {
@@ -157,7 +217,10 @@ async fn run_with_tui(
         "Simulation complete. Press q to exit.",
     )
     .map_err(|err| err.to_string())?;
-    wait_for_quit().map_err(|err| err.to_string())?;
+    wait_for_quit(&mut input_rx)
+        .await
+        .map_err(|err| err.to_string())?;
+    input_handle.abort();
 
     disable_raw_mode().map_err(|err| err.to_string())?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|err| err.to_string())?;
@@ -182,7 +245,7 @@ fn render(
                 .margin(1)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Length(6),
+                    Constraint::Length(8),
                     Constraint::Min(8),
                     Constraint::Length(3),
                 ])
@@ -201,7 +264,12 @@ fn render(
             frame.render_widget(progress_gauge, chunks[0]);
 
             let metrics_lines = vec![
+                Line::from(Span::raw(format!("Total peers: {}", update.total_peers))),
                 Line::from(Span::raw(format!("Online nodes: {}", update.online_nodes))),
+                Line::from(Span::raw(format!(
+                    "Speed factor: {:.2}x",
+                    update.speed_factor
+                ))),
                 Line::from(Span::raw(format!(
                     "Messages sent (step): {}",
                     update.sent_messages
@@ -242,9 +310,9 @@ fn render(
         .map(|_| ())
 }
 
-fn wait_for_quit() -> io::Result<()> {
+async fn wait_for_quit(input_rx: &mut mpsc::UnboundedReceiver<Event>) -> io::Result<()> {
     loop {
-        if let Event::Key(key) = event::read()? {
+        if let Some(Event::Key(key)) = input_rx.recv().await {
             if key.code == KeyCode::Char('q') {
                 break;
             }
@@ -264,4 +332,112 @@ fn format_latency(snapshot: &RollingLatencySnapshot) -> String {
         "min {} / avg {:.2} / max {} ({} samples)",
         min, avg, max, snapshot.samples
     )
+}
+
+fn handle_key_event(
+    key: KeyCode,
+    input_mode: &mut InputMode,
+    status_message: &mut String,
+    control_tx: &mpsc::UnboundedSender<SimulationControlCommand>,
+    auto_peer_index: &mut usize,
+    total_steps: usize,
+    speed_up_factor: f64,
+    slow_down_factor: f64,
+) {
+    match input_mode {
+        InputMode::Normal => match key {
+            KeyCode::Char('a') => {
+                *input_mode = InputMode::AddPeer {
+                    buffer: String::new(),
+                };
+                *status_message =
+                    "Add peer: enter id (or press Enter for auto-generated id).".to_string();
+            }
+            KeyCode::Char('f') => {
+                *input_mode = InputMode::AddFriend {
+                    buffer: String::new(),
+                };
+                *status_message =
+                    "Add friends: enter two ids separated by space or comma.".to_string();
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor {
+                    multiplier: speed_up_factor,
+                });
+                *status_message = format!("Speeding up (x{speed_up_factor:.2}).");
+            }
+            KeyCode::Char('-') => {
+                let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor {
+                    multiplier: slow_down_factor,
+                });
+                *status_message = format!("Slowing down (x{slow_down_factor:.2}).");
+            }
+            _ => {}
+        },
+        InputMode::AddPeer { buffer } => match key {
+            KeyCode::Esc => {
+                *input_mode = InputMode::Normal;
+                *status_message = "Add peer cancelled.".to_string();
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                *status_message = format!("Add peer id: {buffer}");
+            }
+            KeyCode::Enter => {
+                let trimmed = buffer.trim();
+                let node_id = if trimmed.is_empty() {
+                    let id = format!("peer-{}", auto_peer_index);
+                    *auto_peer_index += 1;
+                    id
+                } else {
+                    trimmed.to_string()
+                };
+                let schedule = vec![true; total_steps];
+                let node = tenet::simulation::Node::new(&node_id, schedule);
+                let keypair = generate_keypair();
+                let _ = control_tx.send(SimulationControlCommand::AddPeer { node, keypair });
+                *input_mode = InputMode::Normal;
+                *status_message = format!("Added peer request queued for {node_id}.");
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                *status_message = format!("Add peer id: {buffer}");
+            }
+            _ => {}
+        },
+        InputMode::AddFriend { buffer } => match key {
+            KeyCode::Esc => {
+                *input_mode = InputMode::Normal;
+                *status_message = "Add friends cancelled.".to_string();
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                *status_message = format!("Add friends: {buffer}");
+            }
+            KeyCode::Enter => {
+                let peers: Vec<&str> = buffer
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                if peers.len() < 2 {
+                    *status_message =
+                        "Add friends needs two ids separated by space or comma.".to_string();
+                    return;
+                }
+                let peer_a = peers[0].to_string();
+                let peer_b = peers[1].to_string();
+                let _ = control_tx.send(SimulationControlCommand::AddFriendship {
+                    peer_a: peer_a.clone(),
+                    peer_b: peer_b.clone(),
+                });
+                *input_mode = InputMode::Normal;
+                *status_message = format!("Friendship request queued for {peer_a} and {peer_b}.");
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                *status_message = format!("Add friends: {buffer}");
+            }
+            _ => {}
+        },
+    }
 }
