@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use tenet_crypto::crypto::{
+use tenet::crypto::{
     decrypt_payload, derive_user_id_from_public_key, encrypt_payload, generate_content_key,
     generate_keypair, load_keypair, rotate_keypair, store_keypair, wrap_content_key,
     KeyRotation, StoredKeypair, WrappedKey,
@@ -89,7 +89,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_usage() {
     println!(
-        "tenet-crypto commands:\n\
+        "tenet commands:\n\
          \n\
          init\n\
          add-peer <name> <public_key_hex>\n\
@@ -405,7 +405,7 @@ fn decrypt_envelope(identity: &StoredKeypair, envelope: &Envelope) -> Result<Vec
 
     let recipient_private_key = hex::decode(&identity.private_key_hex)?;
     let content_key =
-        tenet_crypto::crypto::unwrap_content_key(&recipient_private_key, &wrapped, b"tenet-cli")?;
+        tenet::crypto::unwrap_content_key(&recipient_private_key, &wrapped, b"tenet-cli")?;
 
     let nonce = hex::decode(&envelope.payload.nonce_hex)?;
     let ciphertext = hex::decode(&envelope.payload.ciphertext_hex)?;

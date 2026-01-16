@@ -1,7 +1,7 @@
 use std::env;
 use std::time::Duration;
 
-use tenet_crypto::relay::{app, RelayConfig, RelayState};
+use tenet::relay::{app, RelayConfig, RelayState};
 
 #[tokio::main]
 async fn main() {
@@ -16,9 +16,12 @@ async fn main() {
                 Duration::from_millis(100),
             ]
         }),
+        peer_log_window: Duration::from_secs(env_u64("TENET_RELAY_PEER_LOG_WINDOW_SECS", 60)),
+        peer_log_interval: Duration::from_secs(env_u64("TENET_RELAY_PEER_LOG_INTERVAL_SECS", 30)),
     };
 
     let state = RelayState::new(config);
+    state.start_peer_log_task();
     let app = app(state);
 
     let bind = env::var("TENET_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

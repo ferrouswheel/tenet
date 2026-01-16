@@ -21,6 +21,8 @@ pub struct RelayConfig {
     pub max_messages: usize,
     pub max_bytes: usize,
     pub retry_backoff: Vec<Duration>,
+    pub peer_log_window: Duration,
+    pub peer_log_interval: Duration,
 }
 
 #[derive(Clone)]
@@ -32,6 +34,7 @@ pub struct RelayState {
 struct RelayStateInner {
     queues: HashMap<String, VecDeque<StoredEnvelope>>,
     dedup: HashMap<String, Instant>,
+    peer_last_seen: HashMap<String, Instant>,
 }
 
 struct StoredEnvelope {
@@ -91,8 +94,32 @@ impl RelayState {
             inner: Arc::new(Mutex::new(RelayStateInner {
                 queues: HashMap::new(),
                 dedup: HashMap::new(),
+                peer_last_seen: HashMap::new(),
             })),
         }
+    }
+
+    pub fn start_peer_log_task(&self) {
+        if self.config.peer_log_interval.is_zero() {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(state.config.peer_log_interval);
+            loop {
+                ticker.tick().await;
+                let now = Instant::now();
+                let count = {
+                    let inner = state.inner.lock().await;
+                    count_recent_peers(&inner, now, state.config.peer_log_window)
+                };
+                println!(
+                    "relay: {} peers connected in last {}s",
+                    count,
+                    state.config.peer_log_window.as_secs()
+                );
+            }
+        });
     }
 }
 
@@ -191,6 +218,7 @@ async fn fetch_inbox(
         Err(status) => return (status, "relay busy").into_response(),
     };
     let now = Instant::now();
+    record_peer_connection(&state.config, &mut inner, &recipient_id, now);
     let (expired_ids, envelopes) = match inner.queues.get_mut(&recipient_id) {
         Some(queue) => pop_envelopes(queue, query.limit, now),
         None => return (StatusCode::OK, Json(Vec::<Value>::new())).into_response(),
@@ -217,6 +245,7 @@ async fn fetch_inbox_batch(
     let mut results = HashMap::new();
 
     for recipient_id in request.recipient_ids {
+        record_peer_connection(&state.config, &mut inner, &recipient_id, now);
         let (expired, envelopes) = match inner.queues.get_mut(&recipient_id) {
             Some(queue) => pop_envelopes(queue, request.limit, now),
             None => (Vec::new(), Vec::new()),
@@ -236,6 +265,13 @@ async fn fetch_inbox_batch(
 fn recipient_id_from(value: &Value) -> Option<String> {
     value
         .pointer("/header/recipient_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn sender_id_from(value: &Value) -> Option<String> {
+    value
+        .pointer("/header/sender_id")
         .and_then(|value| value.as_str())
         .map(str::to_string)
 }
@@ -335,6 +371,11 @@ fn store_envelope_locked(
     now_epoch: SystemTime,
 ) -> Result<StoreDecision, StoreError> {
     let recipient_id = recipient_id_from(&payload).ok_or(StoreError::MissingRecipient)?;
+    let sender_id = sender_id_from(&payload);
+    record_peer_connection(config, inner, &recipient_id, now);
+    if let Some(sender_id) = sender_id.as_deref() {
+        record_peer_connection(config, inner, sender_id, now);
+    }
 
     let body_bytes = serde_json::to_vec(&payload)
         .map_err(|_| StoreError::InvalidPayload("invalid json".to_string()))?;
@@ -372,7 +413,7 @@ fn store_envelope_locked(
     {
         let queue = inner
             .queues
-            .entry(recipient_id)
+            .entry(recipient_id.clone())
             .or_insert_with(VecDeque::new);
         evicted_ids.extend(prune_expired(queue, now));
 
@@ -389,6 +430,18 @@ fn store_envelope_locked(
 
     for message_id in evicted_ids {
         inner.dedup.remove(&message_id);
+    }
+
+    if let Some(sender_id) = sender_id {
+        println!(
+            "relay: message sent {} -> {} (message_id: {})",
+            sender_id, recipient_id, message_id
+        );
+    } else {
+        println!(
+            "relay: message sent -> {} (message_id: {})",
+            recipient_id, message_id
+        );
     }
 
     Ok(StoreDecision::Accepted { message_id })
@@ -436,4 +489,28 @@ fn expires_at_from(
 enum ExpiresAt {
     Expired,
     Valid(Instant),
+}
+
+fn record_peer_connection(
+    config: &RelayConfig,
+    inner: &mut RelayStateInner,
+    peer_id: &str,
+    now: Instant,
+) {
+    let should_log = match inner.peer_last_seen.get(peer_id) {
+        Some(last_seen) => now.duration_since(*last_seen) >= config.peer_log_window,
+        None => true,
+    };
+    inner.peer_last_seen.insert(peer_id.to_string(), now);
+    if should_log {
+        println!("relay: peer connected {}", peer_id);
+    }
+}
+
+fn count_recent_peers(inner: &RelayStateInner, now: Instant, window: Duration) -> usize {
+    inner
+        .peer_last_seen
+        .values()
+        .filter(|last_seen| now.duration_since(**last_seen) <= window)
+        .count()
 }

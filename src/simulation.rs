@@ -17,6 +17,7 @@ pub struct SimulationConfig {
     pub node_ids: Vec<String>,
     pub steps: usize,
     pub friends_per_node: FriendsPerNode,
+    pub clustering: Option<ClusteringConfig>,
     pub post_frequency: PostFrequency,
     pub availability: OnlineAvailability,
     pub message_size_distribution: MessageSizeDistribution,
@@ -29,6 +30,12 @@ pub enum FriendsPerNode {
     Uniform { min: usize, max: usize },
     Poisson { lambda: f64 },
     Zipf { max: usize, exponent: f64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusteringConfig {
+    pub cluster_sizes: Vec<usize>,
+    pub inter_cluster_friend_probability: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +90,8 @@ pub struct RelayConfigToml {
     pub max_messages: usize,
     pub max_bytes: usize,
     pub retry_backoff_seconds: Vec<u64>,
+    pub peer_log_window_seconds: Option<u64>,
+    pub peer_log_interval_seconds: Option<u64>,
 }
 
 impl RelayConfigToml {
@@ -96,6 +105,8 @@ impl RelayConfigToml {
                 .into_iter()
                 .map(Duration::from_secs)
                 .collect(),
+            peer_log_window: Duration::from_secs(self.peer_log_window_seconds.unwrap_or(60)),
+            peer_log_interval: Duration::from_secs(self.peer_log_interval_seconds.unwrap_or(30)),
         }
     }
 }
@@ -711,22 +722,14 @@ pub fn build_friend_graph(
     config: &SimulationConfig,
     rng: &mut impl Rng,
 ) -> HashMap<String, Vec<String>> {
+    if let Some(clustering) = &config.clustering {
+        return build_clustered_friend_graph(config, clustering, rng);
+    }
     let mut graph = HashMap::new();
     let uniform = Uniform::new_inclusive(0usize, config.node_ids.len().saturating_sub(1));
     for node_id in &config.node_ids {
-        let friends_target = match config.friends_per_node {
-            FriendsPerNode::Uniform { min, max } => {
-                rng.gen_range(min..=max.min(config.node_ids.len().saturating_sub(1)))
-            }
-            FriendsPerNode::Poisson { lambda } => {
-                sample_poisson(rng, lambda).min(config.node_ids.len().saturating_sub(1))
-            }
-            FriendsPerNode::Zipf { max, exponent } => sample_zipf(
-                rng,
-                max.min(config.node_ids.len().saturating_sub(1)),
-                exponent,
-            ),
-        };
+        let friends_target =
+            sample_friends_target(config, rng, config.node_ids.len().saturating_sub(1));
 
         let mut friends = HashSet::new();
         while friends.len() < friends_target
@@ -741,6 +744,99 @@ pub fn build_friend_graph(
         graph.insert(node_id.clone(), friends.into_iter().collect());
     }
     graph
+}
+
+fn build_clustered_friend_graph(
+    config: &SimulationConfig,
+    clustering: &ClusteringConfig,
+    rng: &mut impl Rng,
+) -> HashMap<String, Vec<String>> {
+    let mut clusters = Vec::new();
+    let mut start = 0usize;
+    let total = config.node_ids.len();
+    for size in &clustering.cluster_sizes {
+        if start >= total {
+            break;
+        }
+        let end = (start + *size).min(total);
+        clusters.push(config.node_ids[start..end].to_vec());
+        start = end;
+    }
+    if start < total {
+        clusters.push(config.node_ids[start..].to_vec());
+    }
+    if clusters.is_empty() {
+        clusters.push(config.node_ids.clone());
+    }
+
+    let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
+    for cluster in &clusters {
+        for node_id in cluster {
+            let max_friends = cluster.len().saturating_sub(1);
+            let friends_target = sample_friends_target(config, rng, max_friends);
+            let mut friends = HashSet::new();
+            while friends.len() < friends_target && friends.len() < max_friends {
+                let idx = rng.gen_range(0..cluster.len());
+                let candidate = &cluster[idx];
+                if candidate != node_id {
+                    friends.insert(candidate.clone());
+                }
+            }
+            graph.insert(node_id.clone(), friends);
+        }
+    }
+
+    let inter_prob = clustering
+        .inter_cluster_friend_probability
+        .max(0.0)
+        .min(1.0);
+    if inter_prob > 0.0 {
+        let mut cluster_lookup = HashMap::new();
+        for (index, cluster) in clusters.iter().enumerate() {
+            for node_id in cluster {
+                cluster_lookup.insert(node_id, index);
+            }
+        }
+        for node_id in &config.node_ids {
+            let node_cluster = cluster_lookup.get(node_id);
+            for candidate in &config.node_ids {
+                if candidate == node_id {
+                    continue;
+                }
+                let candidate_cluster = cluster_lookup.get(candidate);
+                if node_cluster == candidate_cluster {
+                    continue;
+                }
+                if rng.gen::<f64>() < inter_prob {
+                    graph
+                        .entry(node_id.clone())
+                        .or_insert_with(HashSet::new)
+                        .insert(candidate.clone());
+                }
+            }
+        }
+    }
+
+    graph
+        .into_iter()
+        .map(|(node_id, friends)| (node_id, friends.into_iter().collect()))
+        .collect()
+}
+
+fn sample_friends_target(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+    max_friends: usize,
+) -> usize {
+    match &config.friends_per_node {
+        FriendsPerNode::Uniform { min, max } => {
+            rng.gen_range(*min..=(*max).min(max_friends))
+        }
+        FriendsPerNode::Poisson { lambda } => sample_poisson(rng, *lambda).min(max_friends),
+        FriendsPerNode::Zipf { max, exponent } => {
+            sample_zipf(rng, (*max).min(max_friends), *exponent)
+        }
+    }
 }
 
 pub fn build_online_schedules(
@@ -957,6 +1053,7 @@ fn normalize_bounds(min: usize, max: usize) -> (usize, usize) {
 
 pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>) {
     let state = RelayState::new(config);
+    state.start_peer_log_task();
     let app: Router = app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
