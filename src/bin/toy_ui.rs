@@ -1,24 +1,27 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 
-use tenet_crypto::crypto::{
+use tenet::crypto::{
     decrypt_payload, encrypt_payload, generate_content_key, generate_keypair, unwrap_content_key,
     wrap_content_key, StoredKeypair, WrappedKey,
 };
-use tenet_crypto::protocol::{ContentId, Envelope, Header, Payload, ProtocolVersion};
+use tenet::protocol::{ContentId, Envelope, Header, Payload, ProtocolVersion};
 
 const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_TTL_SECONDS: u64 = 3600;
 const ENVELOPE_CONTENT_TYPE: &str = "application/json;type=tenet.encrypted";
 const HPKE_INFO: &[u8] = b"tenet-hpke";
 const PAYLOAD_AAD: &[u8] = b"tenet-toy-ui";
+const PROMPT: &str = "\x1b[1;34mtenet-debugger>\x1b[0m ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WrappedKeyPayload {
@@ -82,29 +85,44 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     print_help();
 
-    let stdin = io::stdin();
     let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
+    let mut editor = DefaultEditor::new()?;
+    loop {
+        let line = editor.readline(PROMPT);
+        match line {
+            Ok(line) => {
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
+                editor.add_history_entry(input)?;
+
+                if matches!(input, "quit" | "exit") {
+                    println!("Goodbye!");
+                    break;
+                }
+
+                if let Err(error) = handle_command(
+                    input,
+                    &config,
+                    &mut peers,
+                    &peer_directory,
+                    &mut stdout,
+                ) {
+                    eprintln!("error: {error}");
+                }
+
+                stdout.flush()?;
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("(ctrl-c) type 'exit' to quit.");
+            }
+            Err(ReadlineError::Eof) => {
+                println!("Goodbye!");
+                break;
+            }
+            Err(error) => return Err(error.into()),
         }
-
-        if matches!(input, "quit" | "exit") {
-            println!("Goodbye!");
-            break;
-        }
-
-        handle_command(
-            input,
-            &config,
-            &mut peers,
-            &peer_directory,
-            &mut stdout,
-        )?;
-
-        stdout.flush()?;
     }
 
     Ok(())

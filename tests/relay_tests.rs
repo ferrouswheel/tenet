@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-use tenet_crypto::crypto::{
+use tenet::crypto::{
     decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key,
 };
-use tenet_crypto::relay::{app, RelayConfig, RelayState};
+use tenet::relay::{app, RelayConfig, RelayState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Header {
@@ -95,6 +95,8 @@ async fn relay_expires_messages_after_ttl() {
         max_messages: 10,
         max_bytes: 1024 * 1024,
         retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
     })
     .await;
 
@@ -145,6 +147,8 @@ async fn relay_deduplicates_by_message_id() {
         max_messages: 10,
         max_bytes: 1024 * 1024,
         retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
     })
     .await;
 
@@ -196,6 +200,8 @@ async fn node_can_send_and_receive_through_relay() {
         max_messages: 10,
         max_bytes: 1024 * 1024,
         retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
     })
     .await;
 
@@ -256,7 +262,7 @@ async fn node_can_send_and_receive_through_relay() {
     shutdown_tx.send(()).ok();
 
     let fetched = inbox.first().expect("fetched envelope");
-    let wrapped = tenet_crypto::crypto::WrappedKey {
+    let wrapped = tenet::crypto::WrappedKey {
         enc: hex::decode(&fetched.wrapped_key.enc_hex).expect("enc bytes"),
         ciphertext: hex::decode(&fetched.wrapped_key.ciphertext_hex).expect("cipher bytes"),
     };

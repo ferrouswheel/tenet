@@ -1,0 +1,32 @@
+[simulation]
+node_ids = ["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]
+steps = 60
+seed = 42
+
+[simulation.friends_per_node]
+type = "uniform"
+min = 4
+max = 5
+
+[simulation.post_frequency]
+type = "poisson"
+lambda_per_step = 0.6
+
+[simulation.availability]
+type = "bernoulli"
+p_online = 0.9
+
+[simulation.message_size_distribution]
+type = "uniform"
+min = 20
+max = 120
+
+[relay]
+ttl_seconds = 3600
+max_messages = 500
+max_bytes = 1048576
+retry_backoff_seconds = [1, 2, 4]
+peer_log_window_seconds = 30
+peer_log_interval_seconds = 10
+
+# direct_enabled = true

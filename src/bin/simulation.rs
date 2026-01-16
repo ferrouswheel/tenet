@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use tenet_crypto::simulation::{
+use tenet::simulation::{
     run_simulation_scenario, run_simulation_scenario_with_progress, RollingLatencySnapshot,
     SimulationScenarioConfig, SimulationStepUpdate,
 };
@@ -30,11 +30,11 @@ async fn main() -> Result<(), String> {
         } else if path.is_none() {
             path = Some(arg);
         } else {
-            return Err("usage: simulation [--tui] <path-to-scenario.toml>".to_string());
+            return Err("usage: tenet-sim [--tui] <path-to-scenario.toml>".to_string());
         }
     }
     let path =
-        path.ok_or_else(|| "usage: simulation [--tui] <path-to-scenario.toml>".to_string())?;
+        path.ok_or_else(|| "usage: tenet-sim [--tui] <path-to-scenario.toml>".to_string())?;
     let contents = fs::read_to_string(&path).map_err(|err| err.to_string())?;
     let scenario: SimulationScenarioConfig =
         toml::from_str(&contents).map_err(|err| err.to_string())?;
@@ -51,7 +51,7 @@ async fn main() -> Result<(), String> {
 
 async fn run_with_tui(
     scenario: SimulationScenarioConfig,
-) -> Result<tenet_crypto::simulation::SimulationReport, String> {
+) -> Result<tenet::simulation::SimulationReport, String> {
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|err| err.to_string())?;

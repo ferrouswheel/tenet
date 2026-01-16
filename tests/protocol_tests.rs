@@ -1,4 +1,4 @@
-use tenet_crypto::protocol::{
+use tenet::protocol::{
     AttachmentRef, ContentId, Envelope, Header, HeaderError, Payload, ProtocolVersion,
 };
 

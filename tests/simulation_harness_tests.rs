@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use tenet_crypto::relay::RelayConfig;
-use tenet_crypto::simulation::{
+use tenet::relay::RelayConfig;
+use tenet::simulation::{
     build_simulation_inputs, FriendsPerNode, MessageSizeDistribution, OnlineAvailability,
     PlannedSend, PostFrequency, SimMessage, SimulationConfig, SimulationHarness, start_relay,
 };
@@ -14,6 +14,8 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         max_messages: 100,
         max_bytes: 1024 * 1024,
         retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::from_secs(30),
     })
     .await;
 

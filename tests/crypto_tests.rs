@@ -4,7 +4,7 @@ use hpke::Serializable;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
-use tenet_crypto::crypto::{decrypt_payload, encrypt_payload, wrap_content_key, unwrap_content_key};
+use tenet::crypto::{decrypt_payload, encrypt_payload, wrap_content_key, unwrap_content_key};
 
 #[test]
 fn aead_encrypts_and_decrypts_payload() {

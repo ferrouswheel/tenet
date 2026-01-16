@@ -23,14 +23,14 @@ cargo build
 Run the CLI:
 
 ```bash
-cargo run --bin tenet-crypto -- init
-cargo run --bin tenet-crypto -- add-peer <name> <public_key_hex>
+cargo run --bin tenet -- init
+cargo run --bin tenet -- add-peer <name> <public_key_hex>
 ```
 
 Run the relay service (defaults to `0.0.0.0:8080`):
 
 ```bash
-cargo run --bin relay
+cargo run --bin tenet-relay
 ```
 
 You can also configure the relay via environment variables:
@@ -40,13 +40,15 @@ TENET_RELAY_BIND=127.0.0.1:8080 \
 TENET_RELAY_TTL_SECS=3600 \
 TENET_RELAY_MAX_MESSAGES=1000 \
 TENET_RELAY_MAX_BYTES=5242880 \
-  cargo run --bin relay
+TENET_RELAY_PEER_LOG_WINDOW_SECS=60 \
+TENET_RELAY_PEER_LOG_INTERVAL_SECS=30 \
+  cargo run --bin tenet-relay
 ```
 
 Run the toy UI (spawns N peers, defaults to 3):
 
 ```bash
-cargo run --bin toy_ui -- --peers 4 --relay http://127.0.0.1:8080
+cargo run --bin tenet-debugger -- --peers 4 --relay http://127.0.0.1:8080
 ```
 
 Once running, try:
@@ -68,7 +70,14 @@ cargo test
 
 ## Simulation
 
-The simulation harness is implemented as an integration test. Run it directly with:
+Scenario-driven simulation runs are documented in [docs/simulation.md](docs/simulation.md) and
+sample scenarios live in `scenarios/`. Run one with:
+
+```bash
+cargo run --bin tenet-sim -- scenarios/small_dense_6.toml
+```
+
+The simulation harness is also implemented as an integration test. Run it directly with:
 
 ```bash
 cargo test --test simulation_harness_tests
