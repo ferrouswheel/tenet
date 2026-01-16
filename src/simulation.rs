@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_plaintext_payload,
-    decrypt_encrypted_payload, ContentId, Envelope, Payload,
+    decrypt_encrypted_payload, ContentId, Envelope, MessageKind, Payload,
 };
 use crate::relay::{app, RelayConfig, RelayState};
 
@@ -458,6 +458,8 @@ impl SimulationHarness {
             message.recipient.clone(),
             timestamp,
             self.ttl_seconds,
+            MessageKind::Direct,
+            None,
             message.payload.clone(),
         )
         .ok()?;
@@ -498,6 +500,12 @@ impl SimulationHarness {
         message_id: &str,
         recipient_id: &str,
     ) -> Option<SimMessage> {
+        if envelope.header.verify_signature(envelope.version).is_err() {
+            return None;
+        }
+        if envelope.header.message_kind != MessageKind::Direct {
+            return None;
+        }
         let body = match self.encryption {
             MessageEncryption::Plaintext => envelope.payload.body.clone(),
             MessageEncryption::Encrypted => {

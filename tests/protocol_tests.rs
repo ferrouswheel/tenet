@@ -1,5 +1,5 @@
 use tenet::protocol::{
-    AttachmentRef, ContentId, Envelope, Header, HeaderError, Payload, ProtocolVersion,
+    AttachmentRef, ContentId, Envelope, Header, HeaderError, MessageKind, Payload, ProtocolVersion,
 };
 
 #[test]
@@ -21,6 +21,8 @@ fn envelope_roundtrips_via_json() {
         recipient_id: "recipient-id".to_string(),
         timestamp: 1_700_000_000,
         message_id: ContentId::from_bytes(b"message-1"),
+        message_kind: MessageKind::Public,
+        group_id: None,
         ttl_seconds: 3_600,
         payload_size: payload.body.len() as u64,
         signature: None,
@@ -51,11 +53,118 @@ fn header_signature_fails_with_invalid_signature() {
         recipient_id: "recipient-id".to_string(),
         timestamp: 1_700_000_001,
         message_id: ContentId::from_bytes(b"message-2"),
+        message_kind: MessageKind::Direct,
+        group_id: None,
         ttl_seconds: 120,
         payload_size: 42,
         signature: Some("bad-signature".to_string()),
     };
 
-    let err = header.verify_signature(version).expect_err("invalid signature");
+    let err = header
+        .verify_signature(version)
+        .expect_err("invalid signature");
+    assert_eq!(err, HeaderError::InvalidSignature);
+}
+
+#[test]
+fn header_roundtrips_and_validates_message_kinds() {
+    let kinds = vec![
+        (MessageKind::Public, None),
+        (MessageKind::Meta, None),
+        (MessageKind::Direct, None),
+        (MessageKind::FriendGroup, Some("group-42")),
+    ];
+
+    for (kind, group_id) in kinds {
+        let version = ProtocolVersion::V1;
+        let mut header = Header {
+            sender_id: "sender-id".to_string(),
+            recipient_id: "recipient-id".to_string(),
+            timestamp: 1_700_000_100,
+            message_id: ContentId::from_bytes(b"message-kind"),
+            message_kind: kind,
+            group_id: group_id.map(str::to_string),
+            ttl_seconds: 3_600,
+            payload_size: 128,
+            signature: None,
+        };
+        header.signature = Some(
+            header
+                .expected_signature(version)
+                .expect("signature generation"),
+        );
+
+        let json = serde_json::to_string(&header).expect("serialize header");
+        let decoded: Header = serde_json::from_str(&json).expect("deserialize header");
+
+        assert_eq!(decoded, header);
+        decoded
+            .verify_signature(version)
+            .expect("signature validation");
+    }
+}
+
+#[test]
+fn header_rejects_invalid_message_kind_combinations() {
+    let version = ProtocolVersion::V1;
+    let mut header = Header {
+        sender_id: "sender-id".to_string(),
+        recipient_id: "recipient-id".to_string(),
+        timestamp: 1_700_000_200,
+        message_id: ContentId::from_bytes(b"message-invalid"),
+        message_kind: MessageKind::FriendGroup,
+        group_id: None,
+        ttl_seconds: 120,
+        payload_size: 42,
+        signature: None,
+    };
+    header.signature = Some(
+        header
+            .expected_signature(version)
+            .expect("signature generation"),
+    );
+
+    let err = header
+        .verify_signature(version)
+        .expect_err("missing group id");
+    assert!(matches!(err, HeaderError::InvalidMessageKind(_)));
+
+    header.message_kind = MessageKind::Meta;
+    header.group_id = Some("group-1".to_string());
+    header.signature = Some(
+        header
+            .expected_signature(version)
+            .expect("signature generation"),
+    );
+
+    let err = header
+        .verify_signature(version)
+        .expect_err("unexpected group id");
+    assert!(matches!(err, HeaderError::InvalidMessageKind(_)));
+}
+
+#[test]
+fn header_signature_changes_with_message_kind() {
+    let version = ProtocolVersion::V1;
+    let mut header = Header {
+        sender_id: "sender-id".to_string(),
+        recipient_id: "recipient-id".to_string(),
+        timestamp: 1_700_000_300,
+        message_id: ContentId::from_bytes(b"message-signature"),
+        message_kind: MessageKind::Direct,
+        group_id: None,
+        ttl_seconds: 300,
+        payload_size: 64,
+        signature: None,
+    };
+    header.signature = Some(
+        header
+            .expected_signature(version)
+            .expect("signature generation"),
+    );
+
+    header.message_kind = MessageKind::Public;
+
+    let err = header.verify_signature(version).expect_err("kind mismatch");
     assert_eq!(err, HeaderError::InvalidSignature);
 }

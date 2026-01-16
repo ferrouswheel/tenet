@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-use tenet::crypto::{
-    decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key,
-};
+use tenet::crypto::{decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key};
 use tenet::relay::{app, RelayConfig, RelayState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

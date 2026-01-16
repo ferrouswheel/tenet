@@ -6,15 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use serde::{Deserialize, Serialize};
 
 use tenet::crypto::{
     decrypt_payload, encrypt_payload, generate_content_key, generate_keypair, unwrap_content_key,
     wrap_content_key, StoredKeypair, WrappedKey,
 };
-use tenet::protocol::{ContentId, Envelope, Header, Payload, ProtocolVersion};
+use tenet::protocol::{ContentId, Envelope, Header, MessageKind, Payload, ProtocolVersion};
 
 const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_TTL_SECONDS: u64 = 3600;
@@ -102,13 +102,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     break;
                 }
 
-                if let Err(error) = handle_command(
-                    input,
-                    &config,
-                    &mut peers,
-                    &peer_directory,
-                    &mut stdout,
-                ) {
+                if let Err(error) =
+                    handle_command(input, &config, &mut peers, &peer_directory, &mut stdout)
+                {
                     eprintln!("error: {error}");
                 }
 
@@ -131,7 +127,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 fn parse_config() -> Result<ToyUiConfig, Box<dyn Error>> {
     let mut args = env::args().skip(1).peekable();
     let mut peers = None;
-    let mut relay_url = env::var("TENET_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+    let mut relay_url =
+        env::var("TENET_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -219,7 +216,10 @@ fn handle_command(
         }
         "sync" => {
             let target = parts.next();
-            let limit = parts.next().map(|value| value.parse::<usize>()).transpose()?;
+            let limit = parts
+                .next()
+                .map(|value| value.parse::<usize>())
+                .transpose()?;
             sync_peers(config, peers, peer_directory, target, limit)?;
         }
         "feed" => {
@@ -277,7 +277,10 @@ fn send_message(
 
     let (recipient_id, recipient_public_key_hex) = {
         let recipient = find_peer(peers, to)?;
-        (recipient.keypair.id.clone(), recipient.keypair.public_key_hex.clone())
+        (
+            recipient.keypair.id.clone(),
+            recipient.keypair.public_key_hex.clone(),
+        )
     };
 
     let sender = find_peer_mut(peers, from)?;
@@ -292,9 +295,7 @@ fn send_message(
 
     println!(
         "sent message {} -> {} (message_id: {})",
-        sender.name,
-        to,
-        envelope.header.message_id.0
+        sender.name, to, envelope.header.message_id.0
     );
     Ok(())
 }
@@ -342,10 +343,7 @@ fn show_feed(
         writeln!(
             stdout,
             "- [{}] {} ({}) -> {}",
-            message.timestamp,
-            message.from_name,
-            message.from_id,
-            message.body
+            message.timestamp, message.from_name, message.from_id, message.body
         )?;
     }
     Ok(())
@@ -398,15 +396,15 @@ fn build_envelope(
     };
 
     let message_id = ContentId::from_value(&payload)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     let mut header = Header {
         sender_id: sender.keypair.id.clone(),
         recipient_id: recipient_id.to_string(),
         timestamp,
         message_id,
+        message_kind: MessageKind::Direct,
+        group_id: None,
         ttl_seconds: DEFAULT_TTL_SECONDS,
         payload_size: payload.body.len() as u64,
         signature: None,
@@ -486,10 +484,22 @@ fn decrypt_envelope(
     peer_directory: &HashMap<String, (String, String)>,
     envelope: &Envelope,
 ) -> Result<FeedMessage, Box<dyn Error>> {
+    envelope
+        .header
+        .verify_signature(envelope.version)
+        .map_err(|error| format!("invalid header signature: {error:?}"))?;
+    if envelope.header.message_kind != MessageKind::Direct {
+        return Err(format!(
+            "unexpected message kind: {:?}",
+            envelope.header.message_kind
+        )
+        .into());
+    }
     let encrypted_payload: EncryptedPayload = serde_json::from_str(&envelope.payload.body)?;
     let wrapped = WrappedKey {
         enc: URL_SAFE_NO_PAD.decode(encrypted_payload.wrapped_key.enc_b64.as_bytes())?,
-        ciphertext: URL_SAFE_NO_PAD.decode(encrypted_payload.wrapped_key.ciphertext_b64.as_bytes())?,
+        ciphertext: URL_SAFE_NO_PAD
+            .decode(encrypted_payload.wrapped_key.ciphertext_b64.as_bytes())?,
     };
 
     let private_key_bytes = hex::decode(&peer.keypair.private_key_hex)?;

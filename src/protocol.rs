@@ -61,6 +61,16 @@ impl ProtocolVersion {
     }
 }
 
+/// Types of messages supported by the protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    Public,
+    Meta,
+    Direct,
+    FriendGroup,
+}
+
 /// High-level metadata that binds a payload to a sender and recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +79,8 @@ pub struct Header {
     pub recipient_id: String,
     pub timestamp: u64,
     pub message_id: ContentId,
+    pub message_kind: MessageKind,
+    pub group_id: Option<String>,
     pub ttl_seconds: u64,
     pub payload_size: u64,
     pub signature: Option<String>,
@@ -82,6 +94,8 @@ struct CanonicalHeader<'a> {
     recipient_id: &'a str,
     timestamp: u64,
     message_id: &'a ContentId,
+    message_kind: &'a MessageKind,
+    group_id: Option<&'a str>,
     ttl_seconds: u64,
     payload_size: u64,
 }
@@ -92,6 +106,36 @@ pub enum HeaderError {
     InvalidSignature,
     UnsupportedVersion(ProtocolVersion),
     TtlOutOfRange { ttl_seconds: u64 },
+    InvalidMessageKind(String),
+}
+
+#[derive(Debug)]
+pub enum EnvelopeBuildError {
+    Header(HeaderError),
+    Serde(serde_json::Error),
+}
+
+impl std::fmt::Display for EnvelopeBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnvelopeBuildError::Header(error) => write!(f, "header error: {error:?}"),
+            EnvelopeBuildError::Serde(error) => write!(f, "serde error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for EnvelopeBuildError {}
+
+impl From<HeaderError> for EnvelopeBuildError {
+    fn from(error: HeaderError) -> Self {
+        EnvelopeBuildError::Header(error)
+    }
+}
+
+impl From<serde_json::Error> for EnvelopeBuildError {
+    fn from(error: serde_json::Error) -> Self {
+        EnvelopeBuildError::Serde(error)
+    }
 }
 
 impl Header {
@@ -108,6 +152,8 @@ impl Header {
             recipient_id: &self.recipient_id,
             timestamp: self.timestamp,
             message_id: &self.message_id,
+            message_kind: &self.message_kind,
+            group_id: self.group_id.as_deref(),
             ttl_seconds: self.ttl_seconds,
             payload_size: self.payload_size,
         };
@@ -134,6 +180,7 @@ impl Header {
                 ttl_seconds: self.ttl_seconds,
             });
         }
+        self.validate_message_kind()?;
         let signature = self
             .signature
             .as_deref()
@@ -145,6 +192,26 @@ impl Header {
             Ok(())
         } else {
             Err(HeaderError::InvalidSignature)
+        }
+    }
+
+    fn validate_message_kind(&self) -> Result<(), HeaderError> {
+        match self.message_kind {
+            MessageKind::FriendGroup => match self.group_id.as_deref() {
+                Some(id) if !id.trim().is_empty() => Ok(()),
+                _ => Err(HeaderError::InvalidMessageKind(
+                    "friend_group requires a non-empty group_id".to_string(),
+                )),
+            },
+            _ => {
+                if self.group_id.is_some() {
+                    Err(HeaderError::InvalidMessageKind(
+                        "group_id is only valid for friend_group messages".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -192,18 +259,23 @@ pub fn build_envelope_from_payload(
     recipient_id: impl Into<String>,
     timestamp: u64,
     ttl_seconds: u64,
+    message_kind: MessageKind,
+    group_id: Option<String>,
     payload: Payload,
-) -> Result<Envelope, serde_json::Error> {
+) -> Result<Envelope, EnvelopeBuildError> {
     let message_id = ContentId::from_value(&payload)?;
     let mut header = Header {
         sender_id: sender_id.into(),
         recipient_id: recipient_id.into(),
         timestamp,
         message_id,
+        message_kind,
+        group_id,
         ttl_seconds,
         payload_size: payload.body.len() as u64,
         signature: None,
     };
+    header.validate_message_kind()?;
     let signature = header.expected_signature(ProtocolVersion::V1)?;
     header.signature = Some(signature);
     Ok(Envelope {
@@ -219,11 +291,21 @@ pub fn build_plaintext_envelope(
     recipient_id: impl Into<String>,
     timestamp: u64,
     ttl_seconds: u64,
+    message_kind: MessageKind,
+    group_id: Option<String>,
     body: impl Into<String>,
     salt: impl AsRef<[u8]>,
-) -> Result<Envelope, serde_json::Error> {
+) -> Result<Envelope, EnvelopeBuildError> {
     let payload = build_plaintext_payload(body, salt);
-    build_envelope_from_payload(sender_id, recipient_id, timestamp, ttl_seconds, payload)
+    build_envelope_from_payload(
+        sender_id,
+        recipient_id,
+        timestamp,
+        ttl_seconds,
+        message_kind,
+        group_id,
+        payload,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

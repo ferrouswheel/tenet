@@ -1,10 +1,10 @@
 use hpke::kem::X25519HkdfSha256;
 use hpke::Kem as _;
 use hpke::Serializable;
-use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
-use tenet::crypto::{decrypt_payload, encrypt_payload, wrap_content_key, unwrap_content_key};
+use tenet::crypto::{decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key};
 
 #[test]
 fn aead_encrypts_and_decrypts_payload() {
@@ -34,12 +34,8 @@ fn hpke_wraps_and_unwraps_content_key() {
     )
     .expect("wrap content key");
 
-    let unwrapped = unwrap_content_key(
-        &recipient_private.to_bytes(),
-        &wrapped,
-        b"tenet-hpke-test",
-    )
-    .expect("unwrap content key");
+    let unwrapped = unwrap_content_key(&recipient_private.to_bytes(), &wrapped, b"tenet-hpke-test")
+        .expect("unwrap content key");
 
     assert_eq!(unwrapped, content_key);
 }

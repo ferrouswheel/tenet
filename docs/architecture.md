@@ -54,12 +54,24 @@ recipient id, timestamp, and message id).
 * **Feed**: an ordered log of updates per user, truncated by local retention policy.
 * **Attachments**: optional blobs referenced by content hash.
 
+### Message Header
+
+Headers include:
+
+* `sender_id`, `recipient_id`, `timestamp`, `message_id`, `ttl_seconds`, `payload_size`
+* `message_kind`: one of `public`, `meta`, `direct`, or `friend_group`
+* `group_id`: required only when `message_kind` is `friend_group`
+
+Friend-group messages are addressed to a logical group identifier (`group_id`). The payload is
+encrypted with a group-scoped key, and recipients treat the message as part of the named group
+conversation or feed.
+
 ## MVP Feature Scope
 
 * **Identity**: long-term keypairs per user, stable IDs derived from public keys, and a locally stored
   friend/peer list (manual exchange or QR/URL bootstrap).
 * **Envelope encryption**: per-recipient authenticated encryption with a signed metadata header
-  (sender ID, recipient ID, timestamp, message ID, TTL, payload size).
+  (sender ID, recipient ID, timestamp, message ID, message kind, group ID (if any), TTL, payload size).
 * **Relay transport**: store-and-forward relays for NATed/offline peers; relays retain opaque blobs
   with minimal metadata and provide best-effort delivery.
 * **Local store**: append-only per-peer feeds with rolling retention and message ID indexing for
@@ -73,7 +85,8 @@ recipient id, timestamp, and message id).
 1. Sender composes payload and selects recipients.
 2. For each recipient:
    * Encrypt payload with recipient key (or group key if supported).
-   * Construct header: sender ID, recipient ID, timestamp, message ID, TTL, payload size.
+   * Construct header: sender ID, recipient ID, timestamp, message ID, message kind, group ID (if
+     friend-group), TTL, payload size.
    * Sign header.
 3. Write encrypted message to local outbox and feed.
 4. Submit envelope to relay (or direct peer if available).
@@ -87,7 +100,7 @@ recipient id, timestamp, and message id).
 ### 3) Receive
 
 1. Recipient fetches envelopes from relay.
-2. Validate header signature and sender ID.
+2. Validate header signature, message kind, and sender ID.
 3. Check TTL; discard if expired.
 4. Decrypt payload and append to local feed.
 5. Update dedup index with message ID.

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use tenet::crypto::{
     decrypt_payload, derive_user_id_from_public_key, encrypt_payload, generate_content_key,
-    generate_keypair, load_keypair, rotate_keypair, store_keypair, wrap_content_key,
-    KeyRotation, StoredKeypair, WrappedKey,
+    generate_keypair, load_keypair, rotate_keypair, store_keypair, wrap_content_key, KeyRotation,
+    StoredKeypair, WrappedKey,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,7 +396,10 @@ fn rotate_identity() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn decrypt_envelope(identity: &StoredKeypair, envelope: &Envelope) -> Result<Vec<u8>, Box<dyn Error>> {
+fn decrypt_envelope(
+    identity: &StoredKeypair,
+    envelope: &Envelope,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let aad = serde_json::to_vec(&envelope.header)?;
     let wrapped = WrappedKey {
         enc: hex::decode(&envelope.wrapped_key.enc_hex)?,
