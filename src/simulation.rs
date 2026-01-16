@@ -1,16 +1,24 @@
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use rand::distributions::Uniform;
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use rand::{Rng, RngCore, SeedableRng};
+use rand_chacha::{ChaCha20Rng, ChaCha8Rng};
 use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
+use crate::protocol::{
+    build_encrypted_payload, build_envelope_from_payload, build_plaintext_payload,
+    decrypt_encrypted_payload, ContentId, Envelope, Payload,
+};
 use crate::relay::{app, RelayConfig, RelayState};
+
+const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
+const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationConfig {
@@ -21,7 +29,15 @@ pub struct SimulationConfig {
     pub post_frequency: PostFrequency,
     pub availability: OnlineAvailability,
     pub message_size_distribution: MessageSizeDistribution,
+    pub encryption: Option<MessageEncryption>,
     pub seed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageEncryption {
+    Plaintext,
+    Encrypted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +195,7 @@ pub struct SimMessage {
     pub sender: String,
     pub recipient: String,
     pub body: String,
+    pub payload: Payload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,26 +240,8 @@ pub struct SimulationInputs {
     pub nodes: Vec<Node>,
     pub planned_sends: Vec<PlannedSend>,
     pub direct_links: HashSet<(String, String)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Header {
-    sender_id: String,
-    recipient_id: String,
-    timestamp: u64,
-    content_type: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Payload {
-    body: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Envelope {
-    message_id: String,
-    header: Header,
-    payload: Payload,
+    pub keypairs: HashMap<String, StoredKeypair>,
+    pub encryption: MessageEncryption,
 }
 
 pub struct SimulationHarness {
@@ -250,6 +249,9 @@ pub struct SimulationHarness {
     nodes: HashMap<String, Node>,
     direct_links: HashSet<(String, String)>,
     direct_enabled: bool,
+    ttl_seconds: u64,
+    encryption: MessageEncryption,
+    keypairs: HashMap<String, StoredKeypair>,
     metrics: SimulationMetrics,
     metrics_tracker: MetricsTracker,
 }
@@ -260,6 +262,9 @@ impl SimulationHarness {
         nodes: Vec<Node>,
         direct_links: HashSet<(String, String)>,
         direct_enabled: bool,
+        ttl_seconds: u64,
+        encryption: MessageEncryption,
+        keypairs: HashMap<String, StoredKeypair>,
     ) -> Self {
         let planned_messages = 0;
         Self {
@@ -270,6 +275,9 @@ impl SimulationHarness {
                 .collect(),
             direct_links,
             direct_enabled,
+            ttl_seconds,
+            encryption,
+            keypairs,
             metrics: SimulationMetrics {
                 planned_messages,
                 sent_messages: 0,
@@ -329,17 +337,15 @@ impl SimulationHarness {
                     .unwrap_or_default();
                 if let Some(node) = self.nodes.get_mut(&node_id) {
                     for envelope in envelopes {
-                        let message_id = envelope.message_id.clone();
-                        let message = SimMessage {
-                            id: message_id.clone(),
-                            sender: envelope.header.sender_id,
-                            recipient: envelope.header.recipient_id,
-                            body: envelope.payload.body,
-                        };
-                        if node.receive(message) {
-                            self.metrics.inbox_deliveries += 1;
-                            self.metrics_tracker
-                                .record_delivery(&message_id, &node_id, step);
+                        let message_id = envelope.header.message_id.0.clone();
+                        if let Some(message) =
+                            self.decode_envelope(&envelope, &message_id, &node_id)
+                        {
+                            if node.receive(message) {
+                                self.metrics.inbox_deliveries += 1;
+                                self.metrics_tracker
+                                    .record_delivery(&message_id, &node_id, step);
+                            }
                         }
                     }
                 }
@@ -404,22 +410,19 @@ impl SimulationHarness {
                     .unwrap_or_default();
                 if let Some(node) = self.nodes.get_mut(node_id) {
                     for envelope in envelopes {
-                        let message_id = envelope.message_id.clone();
-                        let message = SimMessage {
-                            id: message_id.clone(),
-                            sender: envelope.header.sender_id,
-                            recipient: envelope.header.recipient_id,
-                            body: envelope.payload.body,
-                        };
-                        if node.receive(message) {
-                            self.metrics.inbox_deliveries += 1;
-                            if let Some(latency) =
-                                self.metrics_tracker
-                                    .record_delivery(&message_id, node_id, step)
-                            {
-                                rolling_latency.record(latency);
+                        let message_id = envelope.header.message_id.0.clone();
+                        if let Some(message) = self.decode_envelope(&envelope, &message_id, node_id)
+                        {
+                            if node.receive(message) {
+                                self.metrics.inbox_deliveries += 1;
+                                if let Some(latency) =
+                                    self.metrics_tracker
+                                        .record_delivery(&message_id, node_id, step)
+                                {
+                                    rolling_latency.record(latency);
+                                }
+                                received_messages += 1;
                             }
-                            received_messages += 1;
                         }
                     }
                 }
@@ -459,7 +462,7 @@ impl SimulationHarness {
                 .is_some_and(|node| node.online_at(step));
             if recipient_online {
                 if let Some(node) = self.nodes.get_mut(&message.recipient) {
-                    let direct_delivered = node.receive(message.clone());
+                    let direct_delivered = self.deliver_direct(node, message, &message.recipient);
                     if direct_delivered {
                         direct_latency = self.metrics_tracker.record_delivery(
                             &message.id,
@@ -471,21 +474,71 @@ impl SimulationHarness {
             }
         }
 
-        let envelope = Envelope {
-            message_id: message.id.clone(),
-            header: Header {
-                sender_id: message.sender.clone(),
-                recipient_id: message.recipient.clone(),
-                timestamp: step as u64,
-                content_type: "text/plain".to_string(),
-            },
-            payload: Payload {
-                body: message.body.clone(),
-            },
-        };
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let envelope = build_envelope_from_payload(
+            message.sender.clone(),
+            message.recipient.clone(),
+            timestamp,
+            self.ttl_seconds,
+            message.payload.clone(),
+        )
+        .ok()?;
         let _ = post_envelope(&self.relay_base_url, &envelope).await;
 
         direct_latency
+    }
+
+    fn deliver_direct(&self, node: &mut Node, message: &SimMessage, recipient_id: &str) -> bool {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let envelope = match build_envelope_from_payload(
+            message.sender.clone(),
+            message.recipient.clone(),
+            timestamp,
+            self.ttl_seconds,
+            message.payload.clone(),
+        ) {
+            Ok(envelope) => envelope,
+            Err(_) => return false,
+        };
+        if let Some(decoded) = self.decode_envelope(&envelope, &message.id, recipient_id) {
+            return node.receive(decoded);
+        }
+        false
+    }
+
+    fn decode_envelope(
+        &self,
+        envelope: &Envelope,
+        message_id: &str,
+        recipient_id: &str,
+    ) -> Option<SimMessage> {
+        let body = match self.encryption {
+            MessageEncryption::Plaintext => envelope.payload.body.clone(),
+            MessageEncryption::Encrypted => {
+                let keypair = self.keypairs.get(recipient_id)?;
+                let plaintext = decrypt_encrypted_payload(
+                    &envelope.payload,
+                    &keypair.private_key_hex,
+                    SIMULATION_PAYLOAD_AAD,
+                    SIMULATION_HPKE_INFO,
+                )
+                .ok()?;
+                String::from_utf8(plaintext).ok()?
+            }
+        };
+        Some(SimMessage {
+            id: message_id.to_string(),
+            sender: envelope.header.sender_id.clone(),
+            recipient: envelope.header.recipient_id.clone(),
+            body,
+            payload: envelope.payload.clone(),
+        })
     }
 }
 
@@ -615,6 +668,9 @@ pub async fn run_simulation_scenario(
         inputs.nodes,
         inputs.direct_links,
         scenario.direct_enabled.unwrap_or(true),
+        scenario.relay.ttl_seconds,
+        inputs.encryption,
+        inputs.keypairs,
     );
     let metrics = harness
         .run(scenario.simulation.steps, inputs.planned_sends)
@@ -638,6 +694,9 @@ where
         inputs.nodes,
         inputs.direct_links,
         scenario.direct_enabled.unwrap_or(true),
+        scenario.relay.ttl_seconds,
+        inputs.encryption,
+        inputs.keypairs,
     );
     let metrics = harness
         .run_with_progress(scenario.simulation.steps, inputs.planned_sends, |update| {
@@ -697,9 +756,31 @@ impl RollingLatencyTracker {
 
 pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+    let encryption = config
+        .encryption
+        .clone()
+        .unwrap_or(MessageEncryption::Plaintext);
+    let mut crypto_rng = ChaCha20Rng::seed_from_u64(config.seed ^ 0x5A17_5EED);
     let graph = build_friend_graph(config, &mut rng);
     let schedules = build_online_schedules(config, &mut rng);
-    let planned_sends = build_planned_sends(config, &mut rng, &graph);
+    let mut keypairs = HashMap::new();
+    if matches!(encryption, MessageEncryption::Encrypted) {
+        for node_id in &config.node_ids {
+            keypairs.insert(node_id.clone(), generate_keypair_with_rng(&mut crypto_rng));
+        }
+    }
+    let planned_sends = build_planned_sends(
+        config,
+        &mut rng,
+        &graph,
+        &encryption,
+        &keypairs,
+        if matches!(encryption, MessageEncryption::Encrypted) {
+            Some(&mut crypto_rng as &mut dyn RngCore)
+        } else {
+            None
+        },
+    );
     let mut direct_links = HashSet::new();
     let mut nodes = Vec::new();
     for node_id in &config.node_ids {
@@ -715,6 +796,8 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
         nodes,
         planned_sends,
         direct_links,
+        keypairs,
+        encryption,
     }
 }
 
@@ -829,9 +912,7 @@ fn sample_friends_target(
     max_friends: usize,
 ) -> usize {
     match &config.friends_per_node {
-        FriendsPerNode::Uniform { min, max } => {
-            rng.gen_range(*min..=(*max).min(max_friends))
-        }
+        FriendsPerNode::Uniform { min, max } => rng.gen_range(*min..=(*max).min(max_friends)),
         FriendsPerNode::Poisson { lambda } => sample_poisson(rng, *lambda).min(max_friends),
         FriendsPerNode::Zipf { max, exponent } => {
             sample_zipf(rng, (*max).min(max_friends), *exponent)
@@ -877,6 +958,9 @@ pub fn build_planned_sends(
     config: &SimulationConfig,
     rng: &mut impl Rng,
     graph: &HashMap<String, Vec<String>>,
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    mut crypto_rng: Option<&mut dyn RngCore>,
 ) -> Vec<PlannedSend> {
     let mut planned = Vec::new();
     let mut counter = 0usize;
@@ -897,11 +981,23 @@ pub fn build_planned_sends(
                     for _ in 0..count {
                         let recipient = friends[rng.gen_range(0..friends.len())].clone();
                         let body = generate_message_body(rng, &config.message_size_distribution);
+                        let payload = build_message_payload(
+                            encryption,
+                            keypairs,
+                            &mut crypto_rng,
+                            &body,
+                            &recipient,
+                            node_id,
+                            counter,
+                        );
+                        let message_id =
+                            ContentId::from_value(&payload).expect("serialize simulation payload");
                         let message = SimMessage {
-                            id: format!("msg-{}-{}", node_id, counter),
+                            id: message_id.0.clone(),
                             sender: node_id.clone(),
                             recipient,
                             body,
+                            payload,
                         };
                         counter += 1;
                         planned.push(PlannedSend { step, message });
@@ -921,11 +1017,23 @@ pub fn build_planned_sends(
                     let step = sample_weighted_index(rng, &weights);
                     let recipient = friends[rng.gen_range(0..friends.len())].clone();
                     let body = generate_message_body(rng, &config.message_size_distribution);
+                    let payload = build_message_payload(
+                        encryption,
+                        keypairs,
+                        &mut crypto_rng,
+                        &body,
+                        &recipient,
+                        node_id,
+                        counter,
+                    );
+                    let message_id =
+                        ContentId::from_value(&payload).expect("serialize simulation payload");
                     let message = SimMessage {
-                        id: format!("msg-{}-{}", node_id, counter),
+                        id: message_id.0.clone(),
                         sender: node_id.clone(),
                         recipient,
                         body,
+                        payload,
                     };
                     counter += 1;
                     planned.push(PlannedSend { step, message });
@@ -934,6 +1042,43 @@ pub fn build_planned_sends(
         }
     }
     planned
+}
+
+fn build_message_payload(
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    crypto_rng: &mut Option<&mut dyn RngCore>,
+    body: &str,
+    recipient: &str,
+    sender: &str,
+    counter: usize,
+) -> Payload {
+    match encryption {
+        MessageEncryption::Plaintext => {
+            let salt = format!("{sender}-{counter}");
+            build_plaintext_payload(body.to_string(), salt.as_bytes())
+        }
+        MessageEncryption::Encrypted => {
+            let keypair = keypairs.get(recipient).expect("missing recipient keypair");
+            let rng = crypto_rng.as_deref_mut().expect("missing crypto rng");
+            let mut content_key = [0u8; CONTENT_KEY_SIZE];
+            let mut nonce = [0u8; NONCE_SIZE];
+            let mut sender_seed = [0u8; 32];
+            rng.fill_bytes(&mut content_key);
+            rng.fill_bytes(&mut nonce);
+            rng.fill_bytes(&mut sender_seed);
+            build_encrypted_payload(
+                body.as_bytes(),
+                &keypair.public_key_hex,
+                SIMULATION_PAYLOAD_AAD,
+                SIMULATION_HPKE_INFO,
+                &content_key,
+                &nonce,
+                Some(sender_seed),
+            )
+            .expect("encrypt payload")
+        }
+    }
 }
 
 pub fn sample_poisson(rng: &mut impl Rng, lambda: f64) -> usize {

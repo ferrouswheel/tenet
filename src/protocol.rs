@@ -12,6 +12,10 @@
 //! These types are intentionally small and self-contained so they can be reused
 //! across transport layers and storage backends.
 
+use crate::crypto::{
+    decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key, CryptoError,
+};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -130,7 +134,10 @@ impl Header {
                 ttl_seconds: self.ttl_seconds,
             });
         }
-        let signature = self.signature.as_deref().ok_or(HeaderError::MissingSignature)?;
+        let signature = self
+            .signature
+            .as_deref()
+            .ok_or(HeaderError::MissingSignature)?;
         let expected = self
             .expected_signature(version)
             .map_err(|_| HeaderError::InvalidSignature)?;
@@ -159,6 +166,186 @@ pub struct Payload {
     pub content_type: String,
     pub body: String,
     pub attachments: Vec<AttachmentRef>,
+}
+
+pub const PLAINTEXT_CONTENT_TYPE: &str = "text/plain";
+pub const ENCRYPTED_CONTENT_TYPE: &str = "application/json;type=tenet.encrypted";
+
+/// Build a plaintext payload with a salted content ID to avoid collisions.
+pub fn build_plaintext_payload(body: impl Into<String>, salt: impl AsRef<[u8]>) -> Payload {
+    let body = body.into();
+    let mut bytes = Vec::with_capacity(body.len() + salt.as_ref().len());
+    bytes.extend_from_slice(body.as_bytes());
+    bytes.extend_from_slice(salt.as_ref());
+    let id = ContentId::from_bytes(&bytes);
+    Payload {
+        id,
+        content_type: PLAINTEXT_CONTENT_TYPE.to_string(),
+        body,
+        attachments: Vec::new(),
+    }
+}
+
+/// Build an envelope for an existing payload, adding a signed header.
+pub fn build_envelope_from_payload(
+    sender_id: impl Into<String>,
+    recipient_id: impl Into<String>,
+    timestamp: u64,
+    ttl_seconds: u64,
+    payload: Payload,
+) -> Result<Envelope, serde_json::Error> {
+    let message_id = ContentId::from_value(&payload)?;
+    let mut header = Header {
+        sender_id: sender_id.into(),
+        recipient_id: recipient_id.into(),
+        timestamp,
+        message_id,
+        ttl_seconds,
+        payload_size: payload.body.len() as u64,
+        signature: None,
+    };
+    let signature = header.expected_signature(ProtocolVersion::V1)?;
+    header.signature = Some(signature);
+    Ok(Envelope {
+        version: ProtocolVersion::V1,
+        header,
+        payload,
+    })
+}
+
+/// Build a plaintext envelope using a derived payload and signed header.
+pub fn build_plaintext_envelope(
+    sender_id: impl Into<String>,
+    recipient_id: impl Into<String>,
+    timestamp: u64,
+    ttl_seconds: u64,
+    body: impl Into<String>,
+    salt: impl AsRef<[u8]>,
+) -> Result<Envelope, serde_json::Error> {
+    let payload = build_plaintext_payload(body, salt);
+    build_envelope_from_payload(sender_id, recipient_id, timestamp, ttl_seconds, payload)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrappedKeyPayload {
+    pub enc_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedPayload {
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+    pub wrapped_key: WrappedKeyPayload,
+}
+
+#[derive(Debug)]
+pub enum PayloadCryptoError {
+    Crypto(CryptoError),
+    Serde(serde_json::Error),
+    Hex(hex::FromHexError),
+    Base64(base64::DecodeError),
+    InvalidContentType { expected: String, actual: String },
+}
+
+impl std::fmt::Display for PayloadCryptoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PayloadCryptoError::Crypto(error) => write!(f, "crypto error: {error}"),
+            PayloadCryptoError::Serde(error) => write!(f, "serde error: {error}"),
+            PayloadCryptoError::Hex(error) => write!(f, "hex error: {error}"),
+            PayloadCryptoError::Base64(error) => write!(f, "base64 error: {error}"),
+            PayloadCryptoError::InvalidContentType { expected, actual } => {
+                write!(f, "invalid content type: expected {expected}, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PayloadCryptoError {}
+
+impl From<CryptoError> for PayloadCryptoError {
+    fn from(error: CryptoError) -> Self {
+        PayloadCryptoError::Crypto(error)
+    }
+}
+
+impl From<serde_json::Error> for PayloadCryptoError {
+    fn from(error: serde_json::Error) -> Self {
+        PayloadCryptoError::Serde(error)
+    }
+}
+
+impl From<hex::FromHexError> for PayloadCryptoError {
+    fn from(error: hex::FromHexError) -> Self {
+        PayloadCryptoError::Hex(error)
+    }
+}
+
+impl From<base64::DecodeError> for PayloadCryptoError {
+    fn from(error: base64::DecodeError) -> Self {
+        PayloadCryptoError::Base64(error)
+    }
+}
+
+pub fn build_encrypted_payload(
+    plaintext: impl AsRef<[u8]>,
+    recipient_public_key_hex: &str,
+    aad: &[u8],
+    hpke_info: &[u8],
+    content_key: &[u8],
+    nonce: &[u8],
+    sender_seed: Option<[u8; 32]>,
+) -> Result<Payload, PayloadCryptoError> {
+    let (nonce_bytes, ciphertext) =
+        encrypt_payload(content_key, plaintext.as_ref(), aad, Some(nonce))?;
+    let recipient_public_key_bytes = hex::decode(recipient_public_key_hex)?;
+    let wrapped = wrap_content_key(
+        &recipient_public_key_bytes,
+        content_key,
+        hpke_info,
+        sender_seed,
+    )?;
+    let encrypted_payload = EncryptedPayload {
+        nonce_b64: URL_SAFE_NO_PAD.encode(&nonce_bytes),
+        ciphertext_b64: URL_SAFE_NO_PAD.encode(&ciphertext),
+        wrapped_key: WrappedKeyPayload {
+            enc_b64: URL_SAFE_NO_PAD.encode(&wrapped.enc),
+            ciphertext_b64: URL_SAFE_NO_PAD.encode(&wrapped.ciphertext),
+        },
+    };
+    let payload_body = serde_json::to_string(&encrypted_payload)?;
+    let payload_id = ContentId::from_bytes(payload_body.as_bytes());
+    Ok(Payload {
+        id: payload_id,
+        content_type: ENCRYPTED_CONTENT_TYPE.to_string(),
+        body: payload_body,
+        attachments: Vec::new(),
+    })
+}
+
+pub fn decrypt_encrypted_payload(
+    payload: &Payload,
+    recipient_private_key_hex: &str,
+    aad: &[u8],
+    hpke_info: &[u8],
+) -> Result<Vec<u8>, PayloadCryptoError> {
+    if payload.content_type != ENCRYPTED_CONTENT_TYPE {
+        return Err(PayloadCryptoError::InvalidContentType {
+            expected: ENCRYPTED_CONTENT_TYPE.to_string(),
+            actual: payload.content_type.clone(),
+        });
+    }
+    let encrypted: EncryptedPayload = serde_json::from_str(&payload.body)?;
+    let wrapped = crate::crypto::WrappedKey {
+        enc: URL_SAFE_NO_PAD.decode(encrypted.wrapped_key.enc_b64.as_bytes())?,
+        ciphertext: URL_SAFE_NO_PAD.decode(encrypted.wrapped_key.ciphertext_b64.as_bytes())?,
+    };
+    let recipient_private_key_bytes = hex::decode(recipient_private_key_hex)?;
+    let content_key = unwrap_content_key(&recipient_private_key_bytes, &wrapped, hpke_info)?;
+    let nonce = URL_SAFE_NO_PAD.decode(encrypted.nonce_b64.as_bytes())?;
+    let ciphertext = URL_SAFE_NO_PAD.decode(encrypted.ciphertext_b64.as_bytes())?;
+    Ok(decrypt_payload(&content_key, &nonce, &ciphertext, aad)?)
 }
 
 /// Envelope binding a header to an encrypted payload.
