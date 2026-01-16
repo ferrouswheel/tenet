@@ -104,9 +104,32 @@ pub struct SimulationMetrics {
     pub inbox_deliveries: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SenderRecipient {
+    pub sender: String,
+    pub recipient: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencyHistogram {
+    pub counts: HashMap<usize, usize>,
+    pub min: Option<usize>,
+    pub max: Option<usize>,
+    pub average: Option<f64>,
+    pub samples: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulationMetricsReport {
+    pub per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
+    pub first_delivery_latency: LatencyHistogram,
+    pub all_recipients_delivery_latency: LatencyHistogram,
+}
+
 #[derive(Debug, Clone)]
 pub struct SimulationReport {
     pub metrics: SimulationMetrics,
+    pub report: SimulationMetricsReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +210,7 @@ pub struct SimulationHarness {
     direct_links: HashSet<(String, String)>,
     direct_enabled: bool,
     metrics: SimulationMetrics,
+    metrics_tracker: MetricsTracker,
 }
 
 impl SimulationHarness {
@@ -211,11 +235,16 @@ impl SimulationHarness {
                 direct_deliveries: 0,
                 inbox_deliveries: 0,
             },
+            metrics_tracker: MetricsTracker::default(),
         }
     }
 
     pub fn metrics(&self) -> SimulationMetrics {
         self.metrics.clone()
+    }
+
+    pub fn metrics_report(&self) -> SimulationMetricsReport {
+        self.metrics_tracker.report()
     }
 
     pub async fn run(&mut self, steps: usize, plan: Vec<PlannedSend>) -> SimulationMetrics {
@@ -237,6 +266,7 @@ impl SimulationHarness {
                         .is_some_and(|node| node.online_at(step))
                     {
                         self.metrics.sent_messages += 1;
+                        self.metrics_tracker.record_send(message, step);
                         let delivered_direct = self.route_message(step, message).await;
                         if delivered_direct {
                             self.metrics.direct_deliveries += 1;
@@ -266,6 +296,8 @@ impl SimulationHarness {
                         };
                         if node.receive(message) {
                             self.metrics.inbox_deliveries += 1;
+                            self.metrics_tracker
+                                .record_delivery(&envelope.message_id, &node_id, step);
                         }
                     }
                 }
@@ -286,8 +318,8 @@ impl SimulationHarness {
         let mut direct_delivered = false;
         if self.direct_enabled
             && self
-                .direct_links
-                .contains(&(message.sender.clone(), message.recipient.clone()))
+            .direct_links
+            .contains(&(message.sender.clone(), message.recipient.clone()))
         {
             let recipient_online = self
                 .nodes
@@ -296,6 +328,13 @@ impl SimulationHarness {
             if recipient_online {
                 if let Some(node) = self.nodes.get_mut(&message.recipient) {
                     direct_delivered = node.receive(message.clone());
+                    if direct_delivered {
+                        self.metrics_tracker.record_delivery(
+                            &message.id,
+                            &message.recipient,
+                            step,
+                        );
+                    }
                 }
             }
         }
@@ -318,6 +357,113 @@ impl SimulationHarness {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MessageTracking {
+    send_step: usize,
+    sender: String,
+    recipients: Vec<String>,
+    delivered_recipients: HashSet<String>,
+    first_delivery_recorded: bool,
+    all_delivery_recorded: bool,
+}
+
+#[derive(Debug, Default)]
+struct LatencyStats {
+    counts: HashMap<usize, usize>,
+    total: usize,
+    samples: usize,
+    min: Option<usize>,
+    max: Option<usize>,
+}
+
+impl LatencyStats {
+    fn record(&mut self, latency: usize) {
+        *self.counts.entry(latency).or_insert(0) += 1;
+        self.total = self.total.saturating_add(latency);
+        self.samples = self.samples.saturating_add(1);
+        self.min = Some(self.min.map_or(latency, |min| min.min(latency)));
+        self.max = Some(self.max.map_or(latency, |max| max.max(latency)));
+    }
+
+    fn report(&self) -> LatencyHistogram {
+        let average = if self.samples > 0 {
+            Some(self.total as f64 / self.samples as f64)
+        } else {
+            None
+        };
+        LatencyHistogram {
+            counts: self.counts.clone(),
+            min: self.min,
+            max: self.max,
+            average,
+            samples: self.samples,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricsTracker {
+    per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
+    first_delivery_latency: LatencyStats,
+    all_recipients_delivery_latency: LatencyStats,
+    messages: HashMap<String, MessageTracking>,
+}
+
+impl MetricsTracker {
+    fn record_send(&mut self, message: &SimMessage, step: usize) {
+        let key = SenderRecipient {
+            sender: message.sender.clone(),
+            recipient: message.recipient.clone(),
+        };
+        *self.per_sender_recipient_counts.entry(key).or_insert(0) += 1;
+        self.messages.entry(message.id.clone()).or_insert_with(|| {
+            MessageTracking {
+                send_step: step,
+                sender: message.sender.clone(),
+                recipients: vec![message.recipient.clone()],
+                delivered_recipients: HashSet::new(),
+                first_delivery_recorded: false,
+                all_delivery_recorded: false,
+            }
+        });
+    }
+
+    fn record_delivery(&mut self, message_id: &str, recipient_id: &str, step: usize) {
+        let Some(tracking) = self.messages.get_mut(message_id) else {
+            return;
+        };
+        if !tracking
+            .recipients
+            .iter()
+            .any(|recipient| recipient == recipient_id)
+        {
+            return;
+        }
+        if !tracking.delivered_recipients.insert(recipient_id.to_string()) {
+            return;
+        }
+        let latency = step.saturating_sub(tracking.send_step);
+        if !tracking.first_delivery_recorded {
+            self.first_delivery_latency.record(latency);
+            tracking.first_delivery_recorded = true;
+        }
+        if tracking.delivered_recipients.len() == tracking.recipients.len()
+            && !tracking.all_delivery_recorded
+        {
+            self.all_recipients_delivery_latency.record(latency);
+            tracking.all_delivery_recorded = true;
+        }
+    }
+
+    fn report(&self) -> SimulationMetricsReport {
+        SimulationMetricsReport {
+            per_sender_recipient_counts: self.per_sender_recipient_counts.clone(),
+            first_delivery_latency: self.first_delivery_latency.report(),
+            all_recipients_delivery_latency: self.all_recipients_delivery_latency.report(),
+        }
+    }
+}
+
 pub async fn run_simulation_scenario(
     scenario: SimulationScenarioConfig,
 ) -> Result<SimulationReport, String> {
@@ -332,8 +478,9 @@ pub async fn run_simulation_scenario(
     let metrics = harness
         .run(scenario.simulation.steps, inputs.planned_sends)
         .await;
+    let report = harness.metrics_report();
     shutdown_tx.send(()).ok();
-    Ok(SimulationReport { metrics })
+    Ok(SimulationReport { metrics, report })
 }
 
 pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
