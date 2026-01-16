@@ -23,6 +23,7 @@ pub struct RelayConfig {
     pub retry_backoff: Vec<Duration>,
     pub peer_log_window: Duration,
     pub peer_log_interval: Duration,
+    pub log_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -113,10 +114,13 @@ impl RelayState {
                     let inner = state.inner.lock().await;
                     count_recent_peers(&inner, now, state.config.peer_log_window)
                 };
-                println!(
-                    "relay: {} peers connected in last {}s",
-                    count,
-                    state.config.peer_log_window.as_secs()
+                log_message(
+                    &state.config,
+                    format!(
+                        "relay: {} peers connected in last {}s",
+                        count,
+                        state.config.peer_log_window.as_secs()
+                    ),
                 );
             }
         });
@@ -433,14 +437,20 @@ fn store_envelope_locked(
     }
 
     if let Some(sender_id) = sender_id {
-        println!(
-            "relay: message sent {} -> {} (message_id: {})",
-            sender_id, recipient_id, message_id
+        log_message(
+            config,
+            format!(
+                "relay: message sent {} -> {} (message_id: {})",
+                sender_id, recipient_id, message_id
+            ),
         );
     } else {
-        println!(
-            "relay: message sent -> {} (message_id: {})",
-            recipient_id, message_id
+        log_message(
+            config,
+            format!(
+                "relay: message sent -> {} (message_id: {})",
+                recipient_id, message_id
+            ),
         );
     }
 
@@ -503,7 +513,15 @@ fn record_peer_connection(
     };
     inner.peer_last_seen.insert(peer_id.to_string(), now);
     if should_log {
-        println!("relay: peer connected {}", peer_id);
+        log_message(config, format!("relay: peer connected {}", peer_id));
+    }
+}
+
+fn log_message(config: &RelayConfig, message: String) {
+    if let Some(log_sink) = &config.log_sink {
+        log_sink(message);
+    } else {
+        println!("{message}");
     }
 }
 
