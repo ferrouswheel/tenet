@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use tenet_crypto::relay::RelayConfig;
 use tenet_crypto::simulation::{
-    build_simulation_inputs, FriendsPerNode, OnlineAvailability, PlannedSend, PostFrequency,
-    SimMessage, SimulationConfig, SimulationHarness, start_relay,
+    build_simulation_inputs, FriendsPerNode, MessageSizeDistribution, OnlineAvailability,
+    PlannedSend, PostFrequency, SimMessage, SimulationConfig, SimulationHarness, start_relay,
 };
 
 #[tokio::test]
@@ -30,6 +30,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
             total_posts: 3,
         },
         availability: OnlineAvailability::Bernoulli { p_online: 1.0 },
+        message_size_distribution: MessageSizeDistribution::Uniform { min: 8, max: 32 },
         seed: 42,
     };
 

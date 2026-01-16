@@ -5,6 +5,7 @@ use axum::Router;
 use rand::distributions::Uniform;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -17,6 +18,7 @@ pub struct SimulationConfig {
     pub friends_per_node: FriendsPerNode,
     pub post_frequency: PostFrequency,
     pub availability: OnlineAvailability,
+    pub message_size_distribution: MessageSizeDistribution,
     pub seed: u64,
 }
 
@@ -43,6 +45,24 @@ pub enum OnlineAvailability {
         p_online_given_online: f64,
         p_online_given_offline: f64,
         start_online_prob: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageSizeDistribution {
+    Uniform { min: usize, max: usize },
+    Normal {
+        mean: f64,
+        std_dev: f64,
+        min: usize,
+        max: usize,
+    },
+    LogNormal {
+        mean: f64,
+        std_dev: f64,
+        min: usize,
+        max: usize,
     },
 }
 
@@ -428,11 +448,12 @@ pub fn build_planned_sends(
                     let count = sample_poisson(rng, *lambda_per_step);
                     for _ in 0..count {
                         let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                        let body = generate_message_body(rng, &config.message_size_distribution);
                         let message = SimMessage {
                             id: format!("msg-{}-{}", node_id, counter),
                             sender: node_id.clone(),
                             recipient,
-                            body: "hello from poisson".to_string(),
+                            body,
                         };
                         counter += 1;
                         planned.push(PlannedSend { step, message });
@@ -451,11 +472,12 @@ pub fn build_planned_sends(
                 for _ in 0..*total_posts {
                     let step = sample_weighted_index(rng, &weights);
                     let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                    let body = generate_message_body(rng, &config.message_size_distribution);
                     let message = SimMessage {
                         id: format!("msg-{}-{}", node_id, counter),
                         sender: node_id.clone(),
                         recipient,
-                        body: "hello from weighted schedule".to_string(),
+                        body,
                     };
                     counter += 1;
                     planned.push(PlannedSend { step, message });
@@ -508,6 +530,80 @@ pub fn sample_weighted_index(rng: &mut impl Rng, weights: &[f64]) -> usize {
         target -= *weight;
     }
     weights.len().saturating_sub(1)
+}
+
+pub fn generate_message_body(
+    rng: &mut impl Rng,
+    distribution: &MessageSizeDistribution,
+) -> String {
+    const LOREM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    let target_size = sample_message_size(rng, distribution);
+    if target_size == 0 {
+        return String::new();
+    }
+    let mut body = String::with_capacity(target_size);
+    while body.len() < target_size {
+        body.push_str(LOREM);
+    }
+    body.truncate(target_size);
+    body
+}
+
+pub fn sample_message_size(rng: &mut impl Rng, distribution: &MessageSizeDistribution) -> usize {
+    match distribution {
+        MessageSizeDistribution::Uniform { min, max } => {
+            let (min, max) = normalize_bounds(*min, *max);
+            rng.gen_range(min..=max)
+        }
+        MessageSizeDistribution::Normal {
+            mean,
+            std_dev,
+            min,
+            max,
+        } => {
+            let (min, max) = normalize_bounds(*min, *max);
+            if *std_dev <= 0.0 {
+                return min;
+            }
+            let normal = Normal::new(*mean, *std_dev)
+                .or_else(|_| Normal::new(0.0, 1.0))
+                .expect("default normal distribution");
+            let sample = normal.sample(rng);
+            clamp_sample(sample, min, max)
+        }
+        MessageSizeDistribution::LogNormal {
+            mean,
+            std_dev,
+            min,
+            max,
+        } => {
+            let (min, max) = normalize_bounds(*min, *max);
+            if *std_dev <= 0.0 {
+                return min;
+            }
+            let log_normal = LogNormal::new(*mean, *std_dev)
+                .or_else(|_| LogNormal::new(0.0, 1.0))
+                .expect("default log-normal distribution");
+            let sample = log_normal.sample(rng);
+            clamp_sample(sample, min, max)
+        }
+    }
+}
+
+fn clamp_sample(sample: f64, min: usize, max: usize) -> usize {
+    if !sample.is_finite() {
+        return min;
+    }
+    let clamped = sample.max(min as f64).min(max as f64);
+    clamped.round() as usize
+}
+
+fn normalize_bounds(min: usize, max: usize) -> (usize, usize) {
+    if min <= max {
+        (min, max)
+    } else {
+        (max, min)
+    }
 }
 
 pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>) {
