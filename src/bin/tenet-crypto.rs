@@ -5,24 +5,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-use hpke::kem::X25519HkdfSha256;
-use hpke::{Kem as _, Serializable};
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use tenet_crypto::crypto::{
-    decrypt_payload, encrypt_payload, generate_content_key, wrap_content_key, WrappedKey,
+    decrypt_payload, derive_user_id_from_public_key, encrypt_payload, generate_content_key,
+    generate_keypair, load_keypair, rotate_keypair, store_keypair, wrap_content_key,
+    KeyRotation, StoredKeypair, WrappedKey,
 };
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Identity {
-    id: String,
-    public_key_hex: String,
-    private_key_hex: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Peer {
@@ -88,6 +77,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "add-peer" => add_peer(&command_args),
         "send" => send_message(&command_args),
         "sync" => sync_messages(&command_args),
+        "export-key" => export_key(&command_args),
+        "import-key" => import_key(&command_args),
+        "rotate-key" => rotate_identity(),
         _ => {
             print_usage();
             Ok(())
@@ -97,12 +89,15 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_usage() {
     println!(
-        "tenet-cli commands:\n\
+        "tenet-crypto commands:\n\
          \n\
          init\n\
          add-peer <name> <public_key_hex>\n\
          send <peer_name> <message> [--relay <url>]\n\
          sync [--relay <url>]\n\
+         export-key [--public|--private]\n\
+         import-key <public_key_hex> <private_key_hex>\n\
+         rotate-key\n\
          \n\
          Environment:\n\
          TENET_HOME defaults to .tenet\n\
@@ -150,27 +145,14 @@ fn init_identity() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let mut rng = OsRng;
-    let (private_key, public_key) = X25519HkdfSha256::gen_keypair(&mut rng);
-    let public_key_bytes = public_key.to_bytes();
-    let private_key_bytes = private_key.to_bytes();
-    let id = content_id_from_bytes(&public_key_bytes);
-
-    let identity = Identity {
-        id,
-        public_key_hex: hex::encode(public_key_bytes),
-        private_key_hex: hex::encode(private_key_bytes),
-    };
-
-    let json = serde_json::to_string_pretty(&identity)?;
-    fs::write(&identity_file, json)?;
+    let identity = generate_keypair();
+    store_keypair(&identity_file, &identity)?;
     println!("identity created: {}", identity.id);
     Ok(())
 }
 
-fn load_identity() -> Result<Identity, Box<dyn Error>> {
-    let data = fs::read_to_string(identity_path())?;
-    Ok(serde_json::from_str(&data)?)
+fn load_identity() -> Result<StoredKeypair, Box<dyn Error>> {
+    Ok(load_keypair(&identity_path())?)
 }
 
 fn load_peers() -> Result<Vec<Peer>, Box<dyn Error>> {
@@ -198,7 +180,7 @@ fn add_peer(args: &[String]) -> Result<(), Box<dyn Error>> {
     let name = args[0].clone();
     let public_key_hex = args[1].clone();
     let public_key_bytes = hex::decode(&public_key_hex)?;
-    let id = content_id_from_bytes(&public_key_bytes);
+    let id = derive_user_id_from_public_key(&public_key_bytes);
 
     let mut peers = load_peers()?;
     if let Some(existing) = peers.iter_mut().find(|peer| peer.name == name) {
@@ -358,7 +340,63 @@ fn sync_messages(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn decrypt_envelope(identity: &Identity, envelope: &Envelope) -> Result<Vec<u8>, Box<dyn Error>> {
+fn export_key(args: &[String]) -> Result<(), Box<dyn Error>> {
+    if args.len() > 1 {
+        return Err("export-key accepts at most one flag".into());
+    }
+
+    let identity = load_identity()?;
+    match args.first().map(String::as_str) {
+        None => println!("{}", serde_json::to_string_pretty(&identity)?),
+        Some("--public") => println!("{}", identity.public_key_hex),
+        Some("--private") => println!("{}", identity.private_key_hex),
+        Some(flag) => return Err(format!("unknown flag: {}", flag).into()),
+    }
+
+    Ok(())
+}
+
+fn import_key(args: &[String]) -> Result<(), Box<dyn Error>> {
+    if args.len() < 2 {
+        return Err("import-key requires <public_key_hex> <private_key_hex>".into());
+    }
+
+    ensure_dir(&data_dir())?;
+
+    let public_key_hex = args[0].clone();
+    let private_key_hex = args[1].clone();
+    let public_key_bytes = hex::decode(&public_key_hex)?;
+    let private_key_bytes = hex::decode(&private_key_hex)?;
+
+    validate_key_len(&public_key_bytes, "public")?;
+    validate_key_len(&private_key_bytes, "private")?;
+
+    let id = derive_user_id_from_public_key(&public_key_bytes);
+    let identity = StoredKeypair {
+        id,
+        public_key_hex,
+        private_key_hex,
+    };
+
+    store_keypair(&identity_path(), &identity)?;
+    println!("identity imported: {}", identity.id);
+    Ok(())
+}
+
+fn rotate_identity() -> Result<(), Box<dyn Error>> {
+    ensure_dir(&data_dir())?;
+    let KeyRotation {
+        previous_id,
+        new_id,
+    } = rotate_keypair(&identity_path())?;
+    println!(
+        "identity rotated from {} to {} (share the new public key with peers)",
+        previous_id, new_id
+    );
+    Ok(())
+}
+
+fn decrypt_envelope(identity: &StoredKeypair, envelope: &Envelope) -> Result<Vec<u8>, Box<dyn Error>> {
     let aad = serde_json::to_vec(&envelope.header)?;
     let wrapped = WrappedKey {
         enc: hex::decode(&envelope.wrapped_key.enc_hex)?,
@@ -366,7 +404,8 @@ fn decrypt_envelope(identity: &Identity, envelope: &Envelope) -> Result<Vec<u8>,
     };
 
     let recipient_private_key = hex::decode(&identity.private_key_hex)?;
-    let content_key = tenet_crypto::crypto::unwrap_content_key(&recipient_private_key, &wrapped, b"tenet-cli")?;
+    let content_key =
+        tenet_crypto::crypto::unwrap_content_key(&recipient_private_key, &wrapped, b"tenet-cli")?;
 
     let nonce = hex::decode(&envelope.payload.nonce_hex)?;
     let ciphertext = hex::decode(&envelope.payload.ciphertext_hex)?;
@@ -384,19 +423,21 @@ fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Box<dy
     Ok(())
 }
 
-fn content_id_from_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    URL_SAFE_NO_PAD.encode(digest)
-}
-
 fn build_message_id(header: &Header, payload: &EncryptedPayload) -> Result<String, Box<dyn Error>> {
     let mut bytes = serde_json::to_vec(header)?;
     bytes.extend_from_slice(payload.nonce_hex.as_bytes());
     bytes.extend_from_slice(payload.ciphertext_hex.as_bytes());
-    Ok(content_id_from_bytes(&bytes))
+    Ok(derive_user_id_from_public_key(&bytes))
 }
 
 fn current_timestamp() -> Result<u64, Box<dyn Error>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok(now.as_secs())
+}
+
+fn validate_key_len(bytes: &[u8], label: &str) -> Result<(), Box<dyn Error>> {
+    if bytes.len() != 32 {
+        return Err(format!("{label} key must be 32 bytes").into());
+    }
+    Ok(())
 }

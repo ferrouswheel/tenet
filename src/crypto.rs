@@ -1,12 +1,18 @@
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hpke::aead::ChaCha20Poly1305 as HpkeChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
-use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
-use rand::{RngCore, SeedableRng};
+use hpke::{Deserializable, Kem as _, OpModeR, OpModeS, Serializable};
+use rand::{rngs::OsRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 pub const CONTENT_KEY_SIZE: usize = 32;
 pub const NONCE_SIZE: usize = 12;
@@ -48,10 +54,107 @@ impl From<chacha20poly1305::aead::Error> for CryptoError {
     }
 }
 
+#[derive(Debug)]
+pub enum KeyStoreError {
+    Io(std::io::Error),
+    Serde(serde_json::Error),
+    Hex(hex::FromHexError),
+}
+
+impl fmt::Display for KeyStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyStoreError::Io(error) => write!(f, "io error: {error}"),
+            KeyStoreError::Serde(error) => write!(f, "serde error: {error}"),
+            KeyStoreError::Hex(error) => write!(f, "hex error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyStoreError {}
+
+impl From<std::io::Error> for KeyStoreError {
+    fn from(error: std::io::Error) -> Self {
+        KeyStoreError::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for KeyStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        KeyStoreError::Serde(error)
+    }
+}
+
+impl From<hex::FromHexError> for KeyStoreError {
+    fn from(error: hex::FromHexError) -> Self {
+        KeyStoreError::Hex(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredKeypair {
+    pub id: String,
+    pub public_key_hex: String,
+    pub private_key_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRotation {
+    pub previous_id: String,
+    pub new_id: String,
+}
+
 pub fn generate_content_key() -> [u8; CONTENT_KEY_SIZE] {
     let mut key = [0u8; CONTENT_KEY_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut key);
     key
+}
+
+pub fn derive_user_id_from_public_key(public_key_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(public_key_bytes);
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+pub fn generate_keypair() -> StoredKeypair {
+    let mut rng = OsRng;
+    let (private_key, public_key) = X25519HkdfSha256::gen_keypair(&mut rng);
+    let public_key_bytes = public_key.to_bytes();
+    let private_key_bytes = private_key.to_bytes();
+    let id = derive_user_id_from_public_key(&public_key_bytes);
+
+    StoredKeypair {
+        id,
+        public_key_hex: hex::encode(public_key_bytes),
+        private_key_hex: hex::encode(private_key_bytes),
+    }
+}
+
+pub fn load_keypair(path: &Path) -> Result<StoredKeypair, KeyStoreError> {
+    let data = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&data)?)
+}
+
+pub fn store_keypair(path: &Path, keypair: &StoredKeypair) -> Result<(), KeyStoreError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(keypair)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+/// Rotate the keypair stored at the given path.
+///
+/// Because user IDs are derived from public keys, rotation changes the user ID.
+/// Callers should share the new public key and ID with peers to maintain continuity.
+pub fn rotate_keypair(path: &Path) -> Result<KeyRotation, KeyStoreError> {
+    let existing = load_keypair(path)?;
+    let new_keypair = generate_keypair();
+    store_keypair(path, &new_keypair)?;
+    Ok(KeyRotation {
+        previous_id: existing.id,
+        new_id: new_keypair.id,
+    })
 }
 
 pub fn encrypt_payload(
@@ -166,7 +269,6 @@ pub fn unwrap_content_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hpke::Kem as _;
 
     #[test]
     fn generates_content_key() {
@@ -235,5 +337,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(unwrapped, content_key);
+    }
+
+    #[test]
+    fn derives_stable_user_id_from_public_key() {
+        let key_bytes = [1u8, 2, 3];
+        let id = derive_user_id_from_public_key(&key_bytes);
+        assert_eq!(id, "A5BYxvLAy0ksUzsKTRTvd8wPeKvMztUofYShogEc-4E");
+        assert_eq!(id, derive_user_id_from_public_key(&key_bytes));
+    }
+
+    #[test]
+    fn stores_and_loads_keypairs_round_trip() {
+        let keypair = generate_keypair();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "tenet-keypair-test-{}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("identity.json");
+
+        store_keypair(&path, &keypair).unwrap();
+        let loaded = load_keypair(&path).unwrap();
+
+        assert_eq!(loaded, keypair);
     }
 }
