@@ -16,9 +16,8 @@ use crate::protocol::{
 };
 use crate::relay::{app, RelayConfig, RelayControl, RelayState};
 
-
 pub use crate::client::SimulationClient;
-use crate::client::{Client, ClientContext};
+use crate::client::{Client, ClientContext, ClientLogEvent, ClientLogSink, ClientMetrics};
 
 pub const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
 pub const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
@@ -375,6 +374,7 @@ pub struct SimulationAggregateMetrics {
     pub stored_unforwarded_by_peer: CountSummary,
     pub stored_forwarded_by_peer: CountSummary,
     pub message_size_by_kind: HashMap<MessageKind, SizeSummary>,
+    pub client_metrics: HashMap<String, ClientMetrics>,
 }
 
 impl SimulationAggregateMetrics {
@@ -385,6 +385,7 @@ impl SimulationAggregateMetrics {
             stored_unforwarded_by_peer: CountSummary::empty(),
             stored_forwarded_by_peer: CountSummary::empty(),
             message_size_by_kind: HashMap::new(),
+            client_metrics: HashMap::new(),
         }
     }
 }
@@ -459,6 +460,7 @@ pub struct SimulationHarness {
     metrics_tracker: MetricsTracker,
     timing: SimulationTimingConfig,
     log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+    client_log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     relay_control: Option<RelayControl>,
 }
 
@@ -484,11 +486,23 @@ impl SimulationHarness {
                 .or_default()
                 .push(recipient.clone());
         }
+        let client_log_sink = log_sink.as_ref().map(|log_sink| {
+            let log_sink = std::sync::Arc::clone(log_sink);
+            std::sync::Arc::new(move |event: ClientLogEvent| {
+                log_sink(format!(
+                    "[sim step={}] {} {}",
+                    event.step, event.client_id, event.message
+                ));
+            }) as std::sync::Arc<dyn ClientLogSink>
+        });
         Self {
             relay_base_url,
             clients: clients
                 .into_iter()
-                .map(|client| (client.id().to_string(), Box::new(client) as Box<dyn Client>))
+                .map(|mut client| {
+                    client.set_log_sink(client_log_sink.clone());
+                    (client.id().to_string(), Box::new(client) as Box<dyn Client>)
+                })
                 .collect(),
             direct_links,
             neighbors,
@@ -514,6 +528,7 @@ impl SimulationHarness {
             ),
             timing,
             log_sink,
+            client_log_sink,
             relay_control,
         }
     }
@@ -545,12 +560,14 @@ impl SimulationHarness {
         let sent_messages_by_kind = self.metrics_tracker.sent_message_summary_by_kind(&peer_ids);
         let stored_forwarded_by_peer = self.metrics_tracker.stored_forwarded_summary(&peer_ids);
         let message_size_by_kind = self.metrics_tracker.message_size_summary_by_kind();
+        let client_metrics = self.collect_client_metrics();
         SimulationAggregateMetrics {
             peer_feed_messages,
             sent_messages_by_kind,
             stored_unforwarded_by_peer,
             stored_forwarded_by_peer,
             message_size_by_kind,
+            client_metrics,
         }
     }
 
@@ -574,6 +591,13 @@ impl SimulationHarness {
         }
     }
 
+    fn collect_client_metrics(&self) -> HashMap<String, ClientMetrics> {
+        self.clients
+            .iter()
+            .map(|(id, client)| (id.clone(), client.metrics()))
+            .collect()
+    }
+
     fn apply_control_command(
         &mut self,
         step: usize,
@@ -582,10 +606,12 @@ impl SimulationHarness {
     ) {
         match command {
             SimulationControlCommand::AddPeer { client, keypair } => {
+                let mut client = client;
                 let client_id = client.id().to_string();
                 if self.clients.contains_key(&client_id) {
                     return;
                 }
+                client.set_log_sink(self.client_log_sink.clone());
                 self.clients
                     .insert(client_id.clone(), Box::new(client) as Box<dyn Client>);
                 self.keypairs.insert(client_id.clone(), keypair);
@@ -697,7 +723,6 @@ impl SimulationHarness {
                             pending_forwarded_messages: &mut *pending_forwarded_messages,
                             metrics: &mut *metrics,
                             metrics_tracker: &mut *metrics_tracker,
-                            log_sink: &log_sink,
                         };
                         let outcome = client.enqueue_sends(
                             step,
@@ -727,7 +752,6 @@ impl SimulationHarness {
                         pending_forwarded_messages: &mut *pending_forwarded_messages,
                         metrics: &mut *metrics,
                         metrics_tracker: &mut *metrics_tracker,
-                        log_sink: &log_sink,
                     };
                     let _ = client.handle_direct_delivery(step, message, &mut context, None);
                 }
@@ -769,7 +793,6 @@ impl SimulationHarness {
                     pending_forwarded_messages: &mut *pending_forwarded_messages,
                     metrics: &mut *metrics,
                     metrics_tracker: &mut *metrics_tracker,
-                    log_sink: &log_sink,
                 };
                 forward_envelopes.extend(client.forward_store_forwards(
                     step,
@@ -798,7 +821,6 @@ impl SimulationHarness {
                         pending_forwarded_messages: &mut *pending_forwarded_messages,
                         metrics: &mut *metrics,
                         metrics_tracker: &mut *metrics_tracker,
-                        log_sink: &log_sink,
                     };
                     client.handle_inbox(step, envelopes, &mut context, None);
                 }
@@ -819,7 +841,6 @@ impl SimulationHarness {
                         pending_forwarded_messages: &mut *pending_forwarded_messages,
                         metrics: &mut *metrics,
                         metrics_tracker: &mut *metrics_tracker,
-                        log_sink: &log_sink,
                     };
                     online_envelopes.extend(client.announce_online(step, &mut context));
                 }
@@ -842,7 +863,6 @@ impl SimulationHarness {
                     pending_forwarded_messages: &mut *pending_forwarded_messages,
                     metrics: &mut *metrics,
                     metrics_tracker: &mut *metrics_tracker,
-                    log_sink: &log_sink,
                 };
                 let outcome =
                     client.process_pending_online_broadcasts(step, &online_set, &mut context);
@@ -872,7 +892,6 @@ impl SimulationHarness {
                         pending_forwarded_messages: &mut *pending_forwarded_messages,
                         metrics: &mut *metrics,
                         metrics_tracker: &mut *metrics_tracker,
-                        log_sink: &log_sink,
                     };
                     client.handle_inbox(step, envelopes, &mut context, None);
                 }
@@ -1016,7 +1035,6 @@ impl SimulationHarness {
                                 pending_forwarded_messages: &mut *pending_forwarded_messages,
                                 metrics: &mut *metrics,
                                 metrics_tracker: &mut *metrics_tracker,
-                                log_sink: &log_sink,
                             };
                             let outcome = client.enqueue_sends(
                                 step,
@@ -1046,7 +1064,6 @@ impl SimulationHarness {
                             pending_forwarded_messages: &mut *pending_forwarded_messages,
                             metrics: &mut *metrics,
                             metrics_tracker: &mut *metrics_tracker,
-                            log_sink: &log_sink,
                         };
                         if client
                             .handle_direct_delivery(
@@ -1097,7 +1114,6 @@ impl SimulationHarness {
                         pending_forwarded_messages: &mut *pending_forwarded_messages,
                         metrics: &mut *metrics,
                         metrics_tracker: &mut *metrics_tracker,
-                        log_sink: &log_sink,
                     };
                     forward_envelopes.extend(client.forward_store_forwards(
                         step,
@@ -1126,7 +1142,6 @@ impl SimulationHarness {
                             pending_forwarded_messages: &mut *pending_forwarded_messages,
                             metrics: &mut *metrics,
                             metrics_tracker: &mut *metrics_tracker,
-                            log_sink: &log_sink,
                         };
                         let newly_received = client.handle_inbox(
                             step,
@@ -1153,7 +1168,6 @@ impl SimulationHarness {
                             pending_forwarded_messages: &mut *pending_forwarded_messages,
                             metrics: &mut *metrics,
                             metrics_tracker: &mut *metrics_tracker,
-                            log_sink: &log_sink,
                         };
                         online_envelopes.extend(client.announce_online(step, &mut context));
                     }
@@ -1176,7 +1190,6 @@ impl SimulationHarness {
                         pending_forwarded_messages: &mut *pending_forwarded_messages,
                         metrics: &mut *metrics,
                         metrics_tracker: &mut *metrics_tracker,
-                        log_sink: &log_sink,
                     };
                     let outcome =
                         client.process_pending_online_broadcasts(step, &online_set, &mut context);
@@ -1207,7 +1220,6 @@ impl SimulationHarness {
                             pending_forwarded_messages: &mut *pending_forwarded_messages,
                             metrics: &mut *metrics,
                             metrics_tracker: &mut *metrics_tracker,
-                            log_sink: &log_sink,
                         };
                         let newly_received = client.handle_inbox(
                             step,
@@ -1724,7 +1736,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             .get(node_id)
             .cloned()
             .unwrap_or_default();
-        clients.push(SimulationClient::new(node_id, schedule));
+        clients.push(SimulationClient::new(node_id, schedule, None));
     }
     SimulationInputs {
         clients,

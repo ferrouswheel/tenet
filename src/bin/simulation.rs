@@ -638,7 +638,7 @@ fn handle_key_event(
                     trimmed.to_string()
                 };
                 let schedule = vec![true; total_steps];
-                let client = tenet::simulation::SimulationClient::new(&node_id, schedule);
+                let client = tenet::simulation::SimulationClient::new(&node_id, schedule, None);
                 let keypair = generate_keypair();
                 let _ = control_tx.send(SimulationControlCommand::AddPeer { client, keypair });
                 *input_mode = InputMode::Normal;
