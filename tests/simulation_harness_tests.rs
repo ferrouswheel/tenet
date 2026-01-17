@@ -22,8 +22,9 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+    let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let config = SimulationConfig {
         node_ids: vec![
@@ -61,6 +62,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         inputs.keypairs,
         inputs.timing,
         inputs.cohort_online_rates,
+        None,
         None,
     );
 
@@ -113,8 +115,9 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+    let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let nodes = vec![
         tenet::simulation::Node::new("node-a", vec![false, true]),
@@ -139,6 +142,7 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
         },
         HashMap::new(),
         None,
+        None,
     );
 
     harness.run(2, Vec::new()).await;
@@ -161,8 +165,9 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+    let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let nodes = vec![
         tenet::simulation::Node::new("node-a", vec![false, true, true]),
@@ -186,6 +191,7 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
             base_real_time_per_step: Duration::ZERO,
         },
         HashMap::new(),
+        None,
         None,
     );
 
@@ -224,8 +230,9 @@ async fn simulation_harness_applies_dynamic_updates() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let (base_url, shutdown_tx) = start_relay(relay_config.clone()).await;
+    let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let nodes = vec![
         Node::new("node-a", vec![true; 4]),
@@ -249,6 +256,7 @@ async fn simulation_harness_applies_dynamic_updates() {
             base_real_time_per_step: Duration::ZERO,
         },
         HashMap::new(),
+        None,
         None,
     );
 

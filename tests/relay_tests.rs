@@ -96,6 +96,7 @@ async fn relay_expires_messages_after_ttl() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
     .await;
 
@@ -149,6 +150,7 @@ async fn relay_deduplicates_by_message_id() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
     .await;
 
@@ -203,6 +205,7 @@ async fn node_can_send_and_receive_through_relay() {
         peer_log_window: Duration::from_secs(60),
         peer_log_interval: Duration::from_secs(30),
         log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
     .await;
 

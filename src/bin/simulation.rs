@@ -104,7 +104,8 @@ async fn run_with_tui(
     let scenario_for_task = scenario.clone();
     let total_steps = scenario_for_task.simulation.effective_steps();
     let sim_handle = tokio::spawn(async move {
-        let (base_url, shutdown_tx) = tenet::simulation::start_relay(relay_config).await;
+        let (base_url, shutdown_tx, relay_control) =
+            tenet::simulation::start_relay(relay_config).await;
         let mut inputs = tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
         inputs.timing.base_real_time_per_step = Duration::from_millis(REAL_TIME_STEP_DELAY_MS);
         let mut harness = tenet::simulation::SimulationHarness::new(
@@ -118,6 +119,7 @@ async fn run_with_tui(
             inputs.timing,
             inputs.cohort_online_rates,
             Some(simulation_log_sink),
+            Some(relay_control),
         );
         let metrics = harness
             .run_with_progress_and_controls(

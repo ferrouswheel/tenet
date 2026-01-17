@@ -16,7 +16,7 @@ use crate::protocol::{
     build_plaintext_payload, decrypt_encrypted_payload, ContentId, Envelope, MessageKind,
     MetaMessage, Payload,
 };
-use crate::relay::{app, RelayConfig, RelayState};
+use crate::relay::{app, RelayConfig, RelayControl, RelayState};
 
 const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
 const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
@@ -222,6 +222,7 @@ impl RelayConfigToml {
             peer_log_window: Duration::from_secs(self.peer_log_window_seconds.unwrap_or(60)),
             peer_log_interval: Duration::from_secs(self.peer_log_interval_seconds.unwrap_or(30)),
             log_sink: None,
+            pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -495,6 +496,7 @@ pub struct SimulationHarness {
     metrics_tracker: MetricsTracker,
     timing: SimulationTimingConfig,
     log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+    relay_control: Option<RelayControl>,
 }
 
 impl SimulationHarness {
@@ -509,6 +511,7 @@ impl SimulationHarness {
         timing: SimulationTimingConfig,
         cohort_online_rates: HashMap<String, f64>,
         log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+        relay_control: Option<RelayControl>,
     ) -> Self {
         let planned_messages = 0;
         let mut neighbors: HashMap<String, Vec<String>> = HashMap::new();
@@ -555,6 +558,7 @@ impl SimulationHarness {
             ),
             timing,
             log_sink,
+            relay_control,
         }
     }
 
@@ -711,11 +715,14 @@ impl SimulationHarness {
             return;
         };
         let neighbors = neighbors.clone();
+        if neighbors.is_empty() {
+            return;
+        }
+        self.log_action(
+            step + 1,
+            format!("{node_id} announced online to {}", neighbors.join(", ")),
+        );
         for neighbor in neighbors {
-            self.log_action(
-                step + 1,
-                format!("{node_id} announced online to {neighbor}"),
-            );
             let meta = MetaMessage::Online {
                 peer_id: node_id.to_string(),
                 timestamp: step as u64,
@@ -1131,6 +1138,9 @@ impl SimulationHarness {
                         paused: should_pause,
                     } => {
                         paused = should_pause;
+                        if let Some(relay_control) = &self.relay_control {
+                            relay_control.set_paused(paused);
+                        }
                         if paused {
                             self.log_action(step + 1, "simulation paused".to_string());
                         } else {
@@ -1796,7 +1806,8 @@ pub async fn run_simulation_scenario(
     scenario: SimulationScenarioConfig,
 ) -> Result<SimulationReport, String> {
     let relay_config = scenario.relay.clone();
-    let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
+    let (base_url, shutdown_tx, _relay_control) =
+        start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
     let steps = scenario.simulation.effective_steps();
     let mut harness = SimulationHarness::new(
@@ -1809,6 +1820,7 @@ pub async fn run_simulation_scenario(
         inputs.keypairs,
         inputs.timing,
         inputs.cohort_online_rates,
+        None,
         None,
     );
     let metrics = harness.run(steps, inputs.planned_sends).await;
@@ -1825,7 +1837,8 @@ where
     F: FnMut(SimulationStepUpdate),
 {
     let relay_config = scenario.relay.clone();
-    let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
+    let (base_url, shutdown_tx, _relay_control) =
+        start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
     let steps = scenario.simulation.effective_steps();
     let mut harness = SimulationHarness::new(
@@ -1838,6 +1851,7 @@ where
         inputs.keypairs,
         inputs.timing,
         inputs.cohort_online_rates,
+        None,
         None,
     );
     let metrics = harness
@@ -2500,7 +2514,8 @@ fn normalize_bounds(min: usize, max: usize) -> (usize, usize) {
     }
 }
 
-pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>) {
+pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>, RelayControl) {
+    let relay_control = RelayControl::new(config.pause_flag.clone());
     let state = RelayState::new(config);
     state.start_peer_log_task();
     let app: Router = app(state);
@@ -2517,7 +2532,7 @@ pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>) {
         let _ = server.await;
     });
 
-    (format!("http://{}", addr), shutdown_tx)
+    (format!("http://{}", addr), shutdown_tx, relay_control)
 }
 
 async fn post_envelope(base_url: &str, envelope: &Envelope) -> Result<(), String> {
