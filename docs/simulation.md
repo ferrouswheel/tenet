@@ -30,6 +30,7 @@ once B comes online.
 [simulation]
 node_ids = ["node-a", "node-b", "node-c"]
 steps = 20
+duration_seconds = 6000
 seed = 7
 
 [simulation.simulated_time]
@@ -85,7 +86,10 @@ The full scenario is available as `scenarios/store_and_forward_3.toml`.
 ## `[simulation]` fields
 
 - `node_ids` (array of strings): IDs to use for simulated peers.
-- `steps` (integer): number of simulation steps.
+- `steps` (integer): number of simulation steps when `duration_seconds` is not provided.
+- `duration_seconds` (integer, optional): total simulated duration in seconds. When provided, the
+  simulation derives `steps` from `duration_seconds / simulated_time.seconds_per_step` (rounded up)
+  and uses that value for schedules and planned sends.
 - `seed` (integer): RNG seed.
 - `simulated_time` (optional): simulated-time settings (see below).
 - `friends_per_node`: friend graph distribution (see below).

@@ -41,6 +41,12 @@ enum InputMode {
     AddFriend { buffer: String },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InputAction {
+    None,
+    Quit,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
@@ -76,8 +82,7 @@ async fn run_with_tui(
 ) -> Result<tenet::simulation::SimulationReport, String> {
     const RELAY_LOG_LIMIT: usize = 200;
     const REAL_TIME_STEP_DELAY_MS: u64 = 100;
-    const SPEED_UP_FACTOR: f64 = 1.25;
-    const SLOW_DOWN_FACTOR: f64 = 0.8;
+    const SPEED_STEP: f64 = 0.10;
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|err| err.to_string())?;
@@ -89,10 +94,15 @@ async fn run_with_tui(
     let (log_tx, mut log_rx) = mpsc::unbounded_channel();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let mut relay_config = scenario.relay.clone().into_relay_config();
+    let relay_log_tx = log_tx.clone();
     relay_config.log_sink = Some(Arc::new(move |line: String| {
-        let _ = log_tx.send(line);
+        let _ = relay_log_tx.send(line);
     }));
+    let simulation_log_sink = Arc::new(move |line: String| {
+        let _ = log_tx.send(line);
+    });
     let scenario_for_task = scenario.clone();
+    let total_steps = scenario_for_task.simulation.effective_steps();
     let sim_handle = tokio::spawn(async move {
         let (base_url, shutdown_tx) = tenet::simulation::start_relay(relay_config).await;
         let mut inputs = tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
@@ -107,10 +117,11 @@ async fn run_with_tui(
             inputs.keypairs,
             inputs.timing,
             inputs.cohort_online_rates,
+            Some(simulation_log_sink),
         );
         let metrics = harness
             .run_with_progress_and_controls(
-                scenario_for_task.simulation.steps,
+                total_steps,
                 inputs.planned_sends,
                 control_rx,
                 |update| {
@@ -146,9 +157,11 @@ async fn run_with_tui(
     let mut relay_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
     let mut input_mode = InputMode::Normal;
     let mut status_message =
-        "Simulation running. Press a to add peers, f to add friends, +/- to adjust speed."
+        "Simulation running. Press a to add peers, f to add friends, +/- to adjust speed, space to pause, q to quit."
             .to_string();
     let mut auto_peer_index = 1usize;
+    let mut quit_requested = false;
+    let mut paused = false;
 
     loop {
         tokio::select! {
@@ -188,16 +201,21 @@ async fn run_with_tui(
             }
             input_event = input_rx.recv() => {
                 if let Some(Event::Key(key)) = input_event {
-                    handle_key_event(
+                    let action = handle_key_event(
                         key.code,
                         &mut input_mode,
                         &mut status_message,
                         &control_tx,
                         &mut auto_peer_index,
-                        scenario.simulation.steps,
-                        SPEED_UP_FACTOR,
-                        SLOW_DOWN_FACTOR,
+                        total_steps,
+                        SPEED_STEP,
+                        &mut paused,
                     );
+                    if action == InputAction::Quit {
+                        let _ = control_tx.send(SimulationControlCommand::Stop);
+                        quit_requested = true;
+                        break;
+                    }
                     if let Some(update) = &last_update {
                         render(
                             &mut terminal,
@@ -212,9 +230,20 @@ async fn run_with_tui(
         }
     }
 
+    if quit_requested {
+        input_shutdown.store(true, Ordering::SeqCst);
+        let _ = input_handle.await;
+        disable_raw_mode().map_err(|err| err.to_string())?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|err| err.to_string())?;
+        terminal.show_cursor().map_err(|err| err.to_string())?;
+        return sim_handle
+            .await
+            .map_err(|err| format!("simulation task failed: {err}"))?;
+    }
+
     let completion_update = last_update.unwrap_or_else(|| SimulationStepUpdate {
-        step: scenario.simulation.steps,
-        total_steps: scenario.simulation.steps,
+        step: total_steps,
+        total_steps,
         online_nodes: 0,
         total_peers: scenario.simulation.node_ids.len(),
         speed_factor: scenario.simulation.simulated_time.default_speed_factor,
@@ -439,9 +468,12 @@ fn handle_key_event(
     control_tx: &mpsc::UnboundedSender<SimulationControlCommand>,
     auto_peer_index: &mut usize,
     total_steps: usize,
-    speed_up_factor: f64,
-    slow_down_factor: f64,
-) {
+    speed_step: f64,
+    paused: &mut bool,
+) -> InputAction {
+    if key == KeyCode::Char('q') {
+        return InputAction::Quit;
+    }
     match input_mode {
         InputMode::Normal => match key {
             KeyCode::Char('a') => {
@@ -459,16 +491,23 @@ fn handle_key_event(
                     "Add friends: enter two ids separated by space or comma.".to_string();
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
-                let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor {
-                    multiplier: speed_up_factor,
-                });
-                *status_message = format!("Speeding up (x{speed_up_factor:.2}).");
+                let _ = control_tx
+                    .send(SimulationControlCommand::AdjustSpeedFactor { delta: speed_step });
+                *status_message = format!("Speed increased (+{speed_step:.2}).");
             }
             KeyCode::Char('-') => {
-                let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor {
-                    multiplier: slow_down_factor,
-                });
-                *status_message = format!("Slowing down (x{slow_down_factor:.2}).");
+                let _ = control_tx
+                    .send(SimulationControlCommand::AdjustSpeedFactor { delta: -speed_step });
+                *status_message = format!("Speed decreased (-{speed_step:.2}).");
+            }
+            KeyCode::Char(' ') => {
+                *paused = !*paused;
+                let _ = control_tx.send(SimulationControlCommand::SetPaused { paused: *paused });
+                if *paused {
+                    *status_message = "Simulation paused. Press space to resume.".to_string();
+                } else {
+                    *status_message = "Simulation resumed.".to_string();
+                }
             }
             _ => {}
         },
@@ -520,7 +559,7 @@ fn handle_key_event(
                 if peers.len() < 2 {
                     *status_message =
                         "Add friends needs two ids separated by space or comma.".to_string();
-                    return;
+                    return InputAction::None;
                 }
                 let peer_a = peers[0].to_string();
                 let peer_b = peers[1].to_string();
@@ -538,4 +577,5 @@ fn handle_key_event(
             _ => {}
         },
     }
+    InputAction::None
 }

@@ -32,6 +32,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
             "node-c".to_string(),
         ],
         steps: 6,
+        duration_seconds: None,
         simulated_time: SimulatedTimeConfig {
             seconds_per_step: 60,
             default_speed_factor: 1.0,
@@ -60,6 +61,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         inputs.keypairs,
         inputs.timing,
         inputs.cohort_online_rates,
+        None,
     );
 
     let mut planned = inputs.planned_sends;
@@ -136,6 +138,7 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
             base_real_time_per_step: Duration::ZERO,
         },
         HashMap::new(),
+        None,
     );
 
     harness.run(2, Vec::new()).await;
@@ -183,6 +186,7 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
             base_real_time_per_step: Duration::ZERO,
         },
         HashMap::new(),
+        None,
     );
 
     let payload = build_plaintext_payload("missed", b"missed-message");
@@ -245,6 +249,7 @@ async fn simulation_harness_applies_dynamic_updates() {
             base_real_time_per_step: Duration::ZERO,
         },
         HashMap::new(),
+        None,
     );
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -257,7 +262,7 @@ async fn simulation_harness_applies_dynamic_updates() {
         peer_a: "node-a".to_string(),
         peer_b: "node-c".to_string(),
     });
-    let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor { multiplier: 1.5 });
+    let _ = control_tx.send(SimulationControlCommand::AdjustSpeedFactor { delta: 0.5 });
     drop(control_tx);
 
     let mut last_update = None;
