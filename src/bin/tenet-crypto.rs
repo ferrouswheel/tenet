@@ -3,14 +3,13 @@ use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
 use tenet::crypto::{
-    decrypt_payload, derive_user_id_from_public_key, encrypt_payload, generate_content_key,
-    generate_keypair, load_keypair, rotate_keypair, store_keypair, wrap_content_key, KeyRotation,
-    StoredKeypair, WrappedKey,
+    derive_user_id_from_public_key, generate_keypair, load_keypair, rotate_keypair, store_keypair,
+    KeyRotation, StoredKeypair,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,34 +17,6 @@ struct Peer {
     name: String,
     id: String,
     public_key_hex: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Header {
-    sender_id: String,
-    recipient_id: String,
-    timestamp: u64,
-    content_type: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct WrappedKeyData {
-    enc_hex: String,
-    ciphertext_hex: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct EncryptedPayload {
-    nonce_hex: String,
-    ciphertext_hex: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Envelope {
-    message_id: String,
-    header: Header,
-    wrapped_key: WrappedKeyData,
-    payload: EncryptedPayload,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,6 +74,22 @@ fn print_usage() {
          TENET_HOME defaults to .tenet\n\
          TENET_RELAY_URL provides a relay URL default for send/sync"
     );
+}
+
+const DEFAULT_TTL_SECONDS: u64 = 3600;
+const CLI_HPKE_INFO: &[u8] = b"tenet-cli";
+const CLI_PAYLOAD_AAD: &[u8] = b"tenet-cli";
+
+fn build_relay_client(identity: StoredKeypair, relay_url: &str) -> RelayClient {
+    let config = ClientConfig::new(
+        relay_url.to_string(),
+        DEFAULT_TTL_SECONDS,
+        ClientEncryption::Encrypted {
+            hpke_info: CLI_HPKE_INFO.to_vec(),
+            payload_aad: CLI_PAYLOAD_AAD.to_vec(),
+        },
+    );
+    RelayClient::new(identity, config)
 }
 
 fn data_dir() -> PathBuf {
@@ -239,53 +226,14 @@ fn send_message(args: &[String]) -> Result<(), Box<dyn Error>> {
         .find(|peer| peer.name == peer_name)
         .ok_or("peer not found")?;
 
-    let timestamp = current_timestamp()?;
-    let header = Header {
-        sender_id: identity.id.clone(),
-        recipient_id: peer.id.clone(),
-        timestamp,
-        content_type: "text/plain".to_string(),
-    };
-    let aad = serde_json::to_vec(&header)?;
-
-    let content_key = generate_content_key();
-    let (nonce, ciphertext) = encrypt_payload(&content_key, message.as_bytes(), &aad, None)?;
-    let wrapped = wrap_content_key(
-        &hex::decode(&peer.public_key_hex)?,
-        &content_key,
-        b"tenet-cli",
-        None,
-    )?;
-
-    let payload = EncryptedPayload {
-        nonce_hex: hex::encode(nonce),
-        ciphertext_hex: hex::encode(ciphertext),
-    };
-
-    let message_id = build_message_id(&header, &payload)?;
-
-    let envelope = Envelope {
-        message_id,
-        header,
-        wrapped_key: WrappedKeyData {
-            enc_hex: hex::encode(wrapped.enc),
-            ciphertext_hex: hex::encode(wrapped.ciphertext),
-        },
-        payload,
-    };
-
-    let body = serde_json::to_string(&envelope)?;
+    let client = build_relay_client(identity, &relay_url);
+    let envelope = client.send_message(&peer.id, &peer.public_key_hex, &message)?;
     append_json_line(outbox_path(), &envelope)?;
 
-    let response = ureq::post(&format!("{}/envelopes", relay_url))
-        .set("Content-Type", "application/json")
-        .send_string(&body)?;
-
-    if response.status() >= 400 {
-        return Err(format!("relay returned status {}", response.status()).into());
-    }
-
-    println!("sent message {} to {}", envelope.message_id, peer.name);
+    println!(
+        "sent message {} to {}",
+        envelope.header.message_id.0, peer.name
+    );
     Ok(())
 }
 
@@ -308,29 +256,24 @@ fn sync_messages(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let relay_url = relay_url.ok_or("relay URL required (use --relay or TENET_RELAY_URL)")?;
     let identity = load_identity()?;
-    let response = ureq::get(&format!("{}/inbox/{}", relay_url, identity.id)).call()?;
-    let body = response.into_string()?;
-    if body.trim().is_empty() {
+    let mut client = build_relay_client(identity, &relay_url);
+    let outcome = client.sync_inbox(None)?;
+    if outcome.fetched == 0 {
         println!("no envelopes available");
         return Ok(());
     }
 
-    let envelopes: Vec<Envelope> = serde_json::from_str(&body)?;
+    for error in &outcome.errors {
+        eprintln!("failed to decrypt envelope: {error}");
+    }
+
     let mut received = 0;
-
-    for envelope in envelopes {
-        if envelope.header.recipient_id != identity.id {
-            continue;
-        }
-
-        let plaintext = decrypt_envelope(&identity, &envelope)?;
-        let message = String::from_utf8_lossy(&plaintext);
-        println!("from {}: {}", envelope.header.sender_id, message);
-
+    for message in outcome.messages {
+        println!("from {}: {}", message.sender_id, message.body);
         let record = ReceivedMessage {
-            sender_id: envelope.header.sender_id.clone(),
-            timestamp: envelope.header.timestamp,
-            message: message.to_string(),
+            sender_id: message.sender_id,
+            timestamp: message.timestamp,
+            message: message.body,
         };
         append_json_line(inbox_path(), &record)?;
         received += 1;
@@ -396,25 +339,6 @@ fn rotate_identity() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn decrypt_envelope(
-    identity: &StoredKeypair,
-    envelope: &Envelope,
-) -> Result<Vec<u8>, Box<dyn Error>> {
-    let aad = serde_json::to_vec(&envelope.header)?;
-    let wrapped = WrappedKey {
-        enc: hex::decode(&envelope.wrapped_key.enc_hex)?,
-        ciphertext: hex::decode(&envelope.wrapped_key.ciphertext_hex)?,
-    };
-
-    let recipient_private_key = hex::decode(&identity.private_key_hex)?;
-    let content_key =
-        tenet::crypto::unwrap_content_key(&recipient_private_key, &wrapped, b"tenet-cli")?;
-
-    let nonce = hex::decode(&envelope.payload.nonce_hex)?;
-    let ciphertext = hex::decode(&envelope.payload.ciphertext_hex)?;
-    Ok(decrypt_payload(&content_key, &nonce, &ciphertext, &aad)?)
-}
-
 fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Box<dyn Error>> {
     ensure_dir(&data_dir())?;
     let mut file = fs::OpenOptions::new()
@@ -424,18 +348,6 @@ fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Box<dy
     let json = serde_json::to_string(value)?;
     writeln!(file, "{}", json)?;
     Ok(())
-}
-
-fn build_message_id(header: &Header, payload: &EncryptedPayload) -> Result<String, Box<dyn Error>> {
-    let mut bytes = serde_json::to_vec(header)?;
-    bytes.extend_from_slice(payload.nonce_hex.as_bytes());
-    bytes.extend_from_slice(payload.ciphertext_hex.as_bytes());
-    Ok(derive_user_id_from_public_key(&bytes))
-}
-
-fn current_timestamp() -> Result<u64, Box<dyn Error>> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    Ok(now.as_secs())
 }
 
 fn validate_key_len(bytes: &[u8], label: &str) -> Result<(), Box<dyn Error>> {
