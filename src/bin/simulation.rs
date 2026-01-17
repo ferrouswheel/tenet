@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,10 +20,19 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use tenet::crypto::generate_keypair;
+use tenet::protocol::MessageKind;
 use tenet::simulation::{
-    run_simulation_scenario, RollingLatencySnapshot, SimulationControlCommand,
-    SimulationScenarioConfig, SimulationStepUpdate,
+    run_simulation_scenario, CountSummary, RollingLatencySnapshot, SimulationAggregateMetrics,
+    SimulationControlCommand, SimulationScenarioConfig, SimulationStepUpdate, SizeSummary,
 };
+
+const MESSAGE_KIND_ORDER: [MessageKind; 5] = [
+    MessageKind::Public,
+    MessageKind::Meta,
+    MessageKind::Direct,
+    MessageKind::FriendGroup,
+    MessageKind::StoreForPeer,
+];
 
 #[derive(Debug)]
 enum InputMode {
@@ -113,14 +123,22 @@ async fn run_with_tui(
         Ok(tenet::simulation::SimulationReport { metrics, report })
     });
 
-    let input_handle = tokio::task::spawn_blocking(move || loop {
-        match event::read() {
-            Ok(event) => {
-                if input_tx.send(event).is_err() {
-                    break;
-                }
+    let input_shutdown = Arc::new(AtomicBool::new(false));
+    let input_shutdown_task = input_shutdown.clone();
+    let input_handle = tokio::task::spawn_blocking(move || {
+        while !input_shutdown_task.load(Ordering::SeqCst) {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => match event::read() {
+                    Ok(event) => {
+                        if input_tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     });
 
@@ -209,6 +227,7 @@ async fn run_with_tui(
             samples: 0,
             window: 0,
         },
+        aggregate_metrics: tenet::simulation::SimulationAggregateMetrics::empty(),
     });
     render(
         &mut terminal,
@@ -220,7 +239,8 @@ async fn run_with_tui(
     wait_for_quit(&mut input_rx)
         .await
         .map_err(|err| err.to_string())?;
-    input_handle.abort();
+    input_shutdown.store(true, Ordering::SeqCst);
+    let _ = input_handle.await;
 
     disable_raw_mode().map_err(|err| err.to_string())?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|err| err.to_string())?;
@@ -246,6 +266,7 @@ fn render(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(8),
+                    Constraint::Length(10),
                     Constraint::Min(8),
                     Constraint::Length(3),
                 ])
@@ -288,10 +309,19 @@ fn render(
                 .block(Block::default().borders(Borders::ALL).title("Step Metrics"));
             frame.render_widget(metrics_block, chunks[1]);
 
+            let aggregate_lines =
+                aggregate_metrics_lines(&update.aggregate_metrics, chunks[2].height);
+            let aggregate_block = Paragraph::new(aggregate_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Aggregate Metrics"),
+            );
+            frame.render_widget(aggregate_block, chunks[2]);
+
             let relay_lines = relay_logs
                 .iter()
                 .rev()
-                .take(chunks[2].height.saturating_sub(2) as usize)
+                .take(chunks[3].height.saturating_sub(2) as usize)
                 .cloned()
                 .collect::<Vec<_>>();
             let relay_lines = relay_lines
@@ -301,11 +331,11 @@ fn render(
                 .collect::<Vec<_>>();
             let relay_block = Paragraph::new(relay_lines)
                 .block(Block::default().borders(Borders::ALL).title("Relay Logs"));
-            frame.render_widget(relay_block, chunks[2]);
+            frame.render_widget(relay_block, chunks[3]);
 
             let hint = Paragraph::new(status)
                 .block(Block::default().borders(Borders::ALL).title("Status"));
-            frame.render_widget(hint, chunks[3]);
+            frame.render_widget(hint, chunks[4]);
         })
         .map(|_| ())
 }
@@ -332,6 +362,74 @@ fn format_latency(snapshot: &RollingLatencySnapshot) -> String {
         "min {} / avg {:.2} / max {} ({} samples)",
         min, avg, max, snapshot.samples
     )
+}
+
+fn aggregate_metrics_lines(metrics: &SimulationAggregateMetrics, height: u16) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(Span::raw(format!(
+            "Feed messages: {}",
+            format_count_summary(&metrics.peer_feed_messages)
+        ))),
+        Line::from(Span::raw(format!(
+            "Stored unforwarded: {}",
+            format_count_summary(&metrics.stored_unforwarded_by_peer)
+        ))),
+        Line::from(Span::raw(format!(
+            "Stored forwarded: {}",
+            format_count_summary(&metrics.stored_forwarded_by_peer)
+        ))),
+    ];
+
+    for kind in MESSAGE_KIND_ORDER.iter() {
+        let sent_summary = metrics.sent_messages_by_kind.get(kind);
+        let size_summary = metrics.message_size_by_kind.get(kind);
+        let sent = sent_summary
+            .map(format_count_summary)
+            .unwrap_or_else(|| "no samples".to_string());
+        let size = size_summary
+            .map(format_size_summary)
+            .unwrap_or_else(|| "no samples".to_string());
+        lines.push(Line::from(Span::raw(format!(
+            "{}: sent {} | size {}",
+            message_kind_label(kind),
+            sent,
+            size
+        ))));
+    }
+
+    let max_lines = height.saturating_sub(2) as usize;
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+    }
+    lines
+}
+
+fn format_count_summary(summary: &CountSummary) -> String {
+    let Some(average) = summary.average else {
+        return "no samples".to_string();
+    };
+    let min = summary.min.unwrap_or(0);
+    let max = summary.max.unwrap_or(0);
+    format!("min {min} / avg {average:.2} / max {max}")
+}
+
+fn format_size_summary(summary: &SizeSummary) -> String {
+    let Some(average) = summary.average else {
+        return "no samples".to_string();
+    };
+    let min = summary.min.unwrap_or(0);
+    let max = summary.max.unwrap_or(0);
+    format!("min {min} / avg {average:.2} / max {max}")
+}
+
+fn message_kind_label(kind: &MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Public => "public",
+        MessageKind::Meta => "meta",
+        MessageKind::Direct => "direct",
+        MessageKind::FriendGroup => "friend_group",
+        MessageKind::StoreForPeer => "store_for_peer",
+    }
 }
 
 fn handle_key_event(

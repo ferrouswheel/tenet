@@ -22,6 +22,13 @@ const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
 const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
 const SIMULATION_ACK_WINDOW_STEPS: usize = 10;
 const SIMULATION_HOURS_PER_DAY: usize = 24;
+const MESSAGE_KIND_SUMMARIES: [MessageKind; 5] = [
+    MessageKind::Public,
+    MessageKind::Meta,
+    MessageKind::Direct,
+    MessageKind::FriendGroup,
+    MessageKind::StoreForPeer,
+];
 
 fn default_seconds_per_step() -> u64 {
     60
@@ -254,6 +261,7 @@ pub struct SimulationMetricsReport {
     pub store_forwards_stored: usize,
     pub store_forwards_forwarded: usize,
     pub store_forwards_delivered: usize,
+    pub aggregate_metrics: SimulationAggregateMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +289,81 @@ pub struct SimulationStepUpdate {
     pub sent_messages: usize,
     pub received_messages: usize,
     pub rolling_latency: RollingLatencySnapshot,
+    pub aggregate_metrics: SimulationAggregateMetrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CountSummary {
+    pub min: Option<usize>,
+    pub max: Option<usize>,
+    pub average: Option<f64>,
+}
+
+impl CountSummary {
+    fn empty() -> Self {
+        Self {
+            min: None,
+            max: None,
+            average: None,
+        }
+    }
+
+    fn from_counts<I: IntoIterator<Item = usize>>(counts: I) -> Self {
+        let mut min: Option<usize> = None;
+        let mut max: Option<usize> = None;
+        let mut total = 0usize;
+        let mut samples = 0usize;
+        for count in counts {
+            min = Some(min.map_or(count, |current| current.min(count)));
+            max = Some(max.map_or(count, |current| current.max(count)));
+            total = total.saturating_add(count);
+            samples = samples.saturating_add(1);
+        }
+        let average = if samples > 0 {
+            Some(total as f64 / samples as f64)
+        } else {
+            None
+        };
+        Self { min, max, average }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SizeSummary {
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+    pub average: Option<f64>,
+}
+
+impl SizeSummary {
+    fn empty() -> Self {
+        Self {
+            min: None,
+            max: None,
+            average: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulationAggregateMetrics {
+    pub peer_feed_messages: CountSummary,
+    pub sent_messages_by_kind: HashMap<MessageKind, CountSummary>,
+    pub stored_unforwarded_by_peer: CountSummary,
+    pub stored_forwarded_by_peer: CountSummary,
+    pub message_size_by_kind: HashMap<MessageKind, SizeSummary>,
+}
+
+impl SimulationAggregateMetrics {
+    pub fn empty() -> Self {
+        Self {
+            peer_feed_messages: CountSummary::empty(),
+            sent_messages_by_kind: HashMap::new(),
+            stored_unforwarded_by_peer: CountSummary::empty(),
+            stored_forwarded_by_peer: CountSummary::empty(),
+            message_size_by_kind: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,7 +545,35 @@ impl SimulationHarness {
     }
 
     pub fn metrics_report(&self) -> SimulationMetricsReport {
-        self.metrics_tracker.report()
+        let aggregate_metrics = self.aggregate_metrics();
+        self.metrics_tracker.report(aggregate_metrics)
+    }
+
+    fn aggregate_metrics(&self) -> SimulationAggregateMetrics {
+        let peer_ids: Vec<String> = self.nodes.keys().cloned().collect();
+        let peer_feed_messages = CountSummary::from_counts(peer_ids.iter().map(|peer_id| {
+            self.nodes
+                .get(peer_id)
+                .map(|node| node.inbox.len())
+                .unwrap_or(0)
+        }));
+        let stored_unforwarded_by_peer =
+            CountSummary::from_counts(peer_ids.iter().map(|peer_id| {
+                self.stored_forwards
+                    .get(peer_id)
+                    .map(|stored| stored.len())
+                    .unwrap_or(0)
+            }));
+        let sent_messages_by_kind = self.metrics_tracker.sent_message_summary_by_kind(&peer_ids);
+        let stored_forwarded_by_peer = self.metrics_tracker.stored_forwarded_summary(&peer_ids);
+        let message_size_by_kind = self.metrics_tracker.message_size_summary_by_kind();
+        SimulationAggregateMetrics {
+            peer_feed_messages,
+            sent_messages_by_kind,
+            stored_unforwarded_by_peer,
+            stored_forwarded_by_peer,
+            message_size_by_kind,
+        }
     }
 
     pub fn total_nodes(&self) -> usize {
@@ -715,7 +826,8 @@ impl SimulationHarness {
                         self.pending_forwarded_messages.insert(message_id);
                         self.metrics.store_forwards_forwarded =
                             self.metrics.store_forwards_forwarded.saturating_add(1);
-                        self.metrics_tracker.record_store_forward_forwarded();
+                        self.metrics_tracker
+                            .record_store_forward_forwarded(&storage_peer_id);
                         forwarded = forwarded.saturating_add(1);
                     } else {
                         remaining.push(entry);
@@ -749,7 +861,6 @@ impl SimulationHarness {
                         .is_some_and(|node| node.online_at(step))
                     {
                         self.metrics.sent_messages += 1;
-                        self.metrics_tracker.record_send(message, step);
                         let delivered_direct = self.route_message(step, message).await;
                         if delivered_direct.is_some() {
                             self.metrics.direct_deliveries += 1;
@@ -893,7 +1004,6 @@ impl SimulationHarness {
                     {
                         sent_messages += 1;
                         self.metrics.sent_messages += 1;
-                        self.metrics_tracker.record_send(message, step);
                         if let Some(latency) = self.route_message(step, message).await {
                             self.metrics.direct_deliveries += 1;
                             received_messages += 1;
@@ -1000,6 +1110,7 @@ impl SimulationHarness {
                 sent_messages,
                 received_messages,
                 rolling_latency: rolling_latency.snapshot(),
+                aggregate_metrics: self.aggregate_metrics(),
             };
             on_step(update);
             let delay = self.timing.real_time_per_step();
@@ -1071,12 +1182,15 @@ impl SimulationHarness {
                     timestamp,
                     &envelope,
                 ) {
+                    self.metrics_tracker
+                        .record_send(message, step, &store_envelope);
                     let _ = post_envelope(&self.relay_base_url, &store_envelope).await;
                     return direct_latency;
                 }
             }
         }
 
+        self.metrics_tracker.record_send(message, step, &envelope);
         let _ = post_envelope(&self.relay_base_url, &envelope).await;
 
         direct_latency
@@ -1248,6 +1362,36 @@ impl LatencyStats {
     }
 }
 
+#[derive(Debug, Default)]
+struct SizeStats {
+    total: u64,
+    samples: usize,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+impl SizeStats {
+    fn record(&mut self, size: u64) {
+        self.total = self.total.saturating_add(size);
+        self.samples = self.samples.saturating_add(1);
+        self.min = Some(self.min.map_or(size, |current| current.min(size)));
+        self.max = Some(self.max.map_or(size, |current| current.max(size)));
+    }
+
+    fn report(&self) -> SizeSummary {
+        let average = if self.samples > 0 {
+            Some(self.total as f64 / self.samples as f64)
+        } else {
+            None
+        };
+        SizeSummary {
+            min: self.min,
+            max: self.max,
+            average,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MetricsTracker {
     per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
@@ -1256,6 +1400,9 @@ struct MetricsTracker {
     first_delivery_latency_seconds: LatencyStats,
     all_recipients_delivery_latency_seconds: LatencyStats,
     messages: HashMap<String, MessageTracking>,
+    per_peer_sent_by_kind: HashMap<String, HashMap<MessageKind, usize>>,
+    per_peer_store_forwarded: HashMap<String, usize>,
+    message_sizes_by_kind: HashMap<MessageKind, SizeStats>,
     cohort_online_rates: HashMap<String, f64>,
     simulated_seconds_per_step: f64,
     online_broadcasts_sent: usize,
@@ -1276,6 +1423,9 @@ impl MetricsTracker {
             first_delivery_latency_seconds: LatencyStats::default(),
             all_recipients_delivery_latency_seconds: LatencyStats::default(),
             messages: HashMap::new(),
+            per_peer_sent_by_kind: HashMap::new(),
+            per_peer_store_forwarded: HashMap::new(),
+            message_sizes_by_kind: HashMap::new(),
             cohort_online_rates,
             simulated_seconds_per_step: simulated_seconds_per_step.max(0.0),
             online_broadcasts_sent: 0,
@@ -1292,7 +1442,7 @@ impl MetricsTracker {
         self.simulated_seconds_per_step = simulated_seconds_per_step.max(0.0);
     }
 
-    fn record_send(&mut self, message: &SimMessage, step: usize) {
+    fn record_send(&mut self, message: &SimMessage, step: usize, envelope: &Envelope) {
         let key = SenderRecipient {
             sender: message.sender.clone(),
             recipient: message.recipient.clone(),
@@ -1308,6 +1458,16 @@ impl MetricsTracker {
                 first_delivery_recorded: false,
                 all_delivery_recorded: false,
             });
+        let sender_entry = self
+            .per_peer_sent_by_kind
+            .entry(message.sender.clone())
+            .or_default();
+        let kind = envelope.header.message_kind.clone();
+        *sender_entry.entry(kind.clone()).or_insert(0) += 1;
+        self.message_sizes_by_kind
+            .entry(kind)
+            .or_default()
+            .record(envelope.header.payload_size);
     }
 
     fn record_delivery(
@@ -1373,15 +1533,62 @@ impl MetricsTracker {
         self.store_forwards_stored = self.store_forwards_stored.saturating_add(1);
     }
 
-    fn record_store_forward_forwarded(&mut self) {
+    fn record_store_forward_forwarded(&mut self, storage_peer_id: &str) {
         self.store_forwards_forwarded = self.store_forwards_forwarded.saturating_add(1);
+        *self
+            .per_peer_store_forwarded
+            .entry(storage_peer_id.to_string())
+            .or_insert(0) += 1;
     }
 
     fn record_store_forward_delivery(&mut self) {
         self.store_forwards_delivered = self.store_forwards_delivered.saturating_add(1);
     }
 
-    fn report(&self) -> SimulationMetricsReport {
+    fn sent_message_summary_by_kind(
+        &self,
+        peer_ids: &[String],
+    ) -> HashMap<MessageKind, CountSummary> {
+        let mut summaries = HashMap::new();
+        for kind in MESSAGE_KIND_SUMMARIES.iter().cloned() {
+            let kind_for_counts = kind.clone();
+            let counts = peer_ids.iter().map(|peer_id| {
+                self.per_peer_sent_by_kind
+                    .get(peer_id)
+                    .and_then(|counts| counts.get(&kind_for_counts))
+                    .copied()
+                    .unwrap_or(0)
+            });
+            summaries.insert(kind, CountSummary::from_counts(counts));
+        }
+        summaries
+    }
+
+    fn stored_forwarded_summary(&self, peer_ids: &[String]) -> CountSummary {
+        CountSummary::from_counts(peer_ids.iter().map(|peer_id| {
+            self.per_peer_store_forwarded
+                .get(peer_id)
+                .copied()
+                .unwrap_or(0)
+        }))
+    }
+
+    fn message_size_summary_by_kind(&self) -> HashMap<MessageKind, SizeSummary> {
+        MESSAGE_KIND_SUMMARIES
+            .iter()
+            .cloned()
+            .map(|kind| {
+                let summary = self
+                    .message_sizes_by_kind
+                    .get(&kind)
+                    .map(SizeStats::report)
+                    .unwrap_or_else(SizeSummary::empty);
+                (kind, summary)
+            })
+            .collect()
+    }
+
+    fn report(&self, aggregate_metrics: SimulationAggregateMetrics) -> SimulationMetricsReport {
         SimulationMetricsReport {
             per_sender_recipient_counts: self.per_sender_recipient_counts.clone(),
             first_delivery_latency: self.first_delivery_latency.report(),
@@ -1398,6 +1605,7 @@ impl MetricsTracker {
             store_forwards_stored: self.store_forwards_stored,
             store_forwards_forwarded: self.store_forwards_forwarded,
             store_forwards_delivered: self.store_forwards_delivered,
+            aggregate_metrics,
         }
     }
 }
