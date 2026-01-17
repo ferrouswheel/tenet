@@ -328,6 +328,147 @@ impl RelayClient {
     }
 }
 
+impl Client for RelayClient {
+    fn id(&self) -> &str {
+        &self.keypair.id
+    }
+
+    fn is_online(&self, _step: usize) -> bool {
+        self.online
+    }
+
+    fn inbox(&self) -> Vec<SimMessage> {
+        Vec::new()
+    }
+
+    fn stored_forward_count(&self) -> usize {
+        0
+    }
+
+    fn metrics(&self) -> ClientMetrics {
+        ClientMetrics::default()
+    }
+
+    fn receive_message(&mut self, message: SimMessage) -> bool {
+        if self.seen.insert(message.id.clone()) {
+            self.feed.push(ClientMessage {
+                message_id: message.id,
+                sender_id: message.sender,
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                body: message.body,
+            });
+            return true;
+        }
+        false
+    }
+
+    fn enqueue_sends(
+        &mut self,
+        _step: usize,
+        messages: &[SimMessage],
+        _online_set: &HashSet<String>,
+        context: &mut ClientContext<'_>,
+    ) -> ClientSendOutcome {
+        if !self.online {
+            return ClientSendOutcome {
+                envelopes: Vec::new(),
+                direct_deliveries: Vec::new(),
+            };
+        }
+
+        let mut envelopes = Vec::new();
+        for message in messages {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let Ok(envelope) = build_envelope_from_payload(
+                message.sender.clone(),
+                message.recipient.clone(),
+                None,
+                None,
+                timestamp,
+                context.ttl_seconds,
+                MessageKind::Direct,
+                None,
+                message.payload.clone(),
+            ) else {
+                continue;
+            };
+            if self.post_envelope(&envelope).is_ok() {
+                envelopes.push(envelope);
+            }
+        }
+
+        ClientSendOutcome {
+            envelopes,
+            direct_deliveries: Vec::new(),
+        }
+    }
+
+    fn handle_inbox(
+        &mut self,
+        _step: usize,
+        envelopes: Vec<Envelope>,
+        _context: &mut ClientContext<'_>,
+        _rolling_latency: Option<&mut RollingLatencyTracker>,
+    ) -> usize {
+        let mut received = 0usize;
+        for envelope in envelopes {
+            if self.seen.contains(&envelope.header.message_id.0) {
+                continue;
+            }
+            match self.decode_envelope(&envelope) {
+                Ok(message) => {
+                    self.seen.insert(envelope.header.message_id.0.clone());
+                    self.feed.push(message);
+                    received = received.saturating_add(1);
+                }
+                Err(_) => continue,
+            }
+        }
+        received
+    }
+
+    fn announce_online(&mut self, _step: usize, _context: &mut ClientContext<'_>) -> Vec<Envelope> {
+        Vec::new()
+    }
+
+    fn process_pending_online_broadcasts(
+        &mut self,
+        _step: usize,
+        _online_set: &HashSet<String>,
+        _context: &mut ClientContext<'_>,
+    ) -> ClientBroadcastOutcome {
+        ClientBroadcastOutcome {
+            envelopes: Vec::new(),
+            delivered_missed: 0,
+        }
+    }
+
+    fn forward_store_forwards(
+        &mut self,
+        _step: usize,
+        _online_set: &HashSet<String>,
+        _context: &mut ClientContext<'_>,
+    ) -> Vec<Envelope> {
+        Vec::new()
+    }
+
+    fn handle_direct_delivery(
+        &mut self,
+        _step: usize,
+        _message: SimMessage,
+        _context: &mut ClientContext<'_>,
+        _rolling_latency: Option<&mut RollingLatencyTracker>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClientMetrics {
     pub messages_sent: usize,
