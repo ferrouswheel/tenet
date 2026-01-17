@@ -252,6 +252,13 @@ pub struct SenderRecipient {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SenderRecipientCount {
+    pub sender: String,
+    pub recipient: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LatencyHistogram {
     pub counts: HashMap<usize, usize>,
     pub min: Option<usize>,
@@ -262,7 +269,7 @@ pub struct LatencyHistogram {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SimulationMetricsReport {
-    pub per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
+    pub per_sender_recipient_counts: Vec<SenderRecipientCount>,
     pub first_delivery_latency: LatencyHistogram,
     pub all_recipients_delivery_latency: LatencyHistogram,
     pub first_delivery_latency_seconds: LatencyHistogram,
@@ -1781,8 +1788,22 @@ impl MetricsTracker {
     }
 
     fn report(&self, aggregate_metrics: SimulationAggregateMetrics) -> SimulationMetricsReport {
+        let mut per_sender_recipient_counts: Vec<SenderRecipientCount> = self
+            .per_sender_recipient_counts
+            .iter()
+            .map(|(key, count)| SenderRecipientCount {
+                sender: key.sender.clone(),
+                recipient: key.recipient.clone(),
+                count: *count,
+            })
+            .collect();
+        per_sender_recipient_counts.sort_by(|left, right| {
+            left.sender
+                .cmp(&right.sender)
+                .then_with(|| left.recipient.cmp(&right.recipient))
+        });
         SimulationMetricsReport {
-            per_sender_recipient_counts: self.per_sender_recipient_counts.clone(),
+            per_sender_recipient_counts,
             first_delivery_latency: self.first_delivery_latency.report(),
             all_recipients_delivery_latency: self.all_recipients_delivery_latency.report(),
             first_delivery_latency_seconds: self.first_delivery_latency_seconds.report(),
