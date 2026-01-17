@@ -1,5 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -24,6 +27,7 @@ pub struct RelayConfig {
     pub peer_log_window: Duration,
     pub peer_log_interval: Duration,
     pub log_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub pause_flag: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -36,6 +40,21 @@ struct RelayStateInner {
     queues: HashMap<String, VecDeque<StoredEnvelope>>,
     dedup: HashMap<String, Instant>,
     peer_last_seen: HashMap<String, Instant>,
+}
+
+#[derive(Clone)]
+pub struct RelayControl {
+    pause_flag: Arc<AtomicBool>,
+}
+
+impl RelayControl {
+    pub fn new(pause_flag: Arc<AtomicBool>) -> Self {
+        Self { pause_flag }
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.pause_flag.store(paused, Ordering::SeqCst);
+    }
 }
 
 struct StoredEnvelope {
@@ -524,6 +543,9 @@ fn record_peer_connection(
 }
 
 fn log_message(config: &RelayConfig, message: String) {
+    if config.pause_flag.load(Ordering::SeqCst) {
+        return;
+    }
     if let Some(log_sink) = &config.log_sink {
         log_sink(message);
     } else {
