@@ -441,7 +441,9 @@ fn store_envelope_locked(
             config,
             format!(
                 "relay: message sent {} -> {} (message_id: {})",
-                sender_id, recipient_id, message_id
+                format_peer_id(&sender_id),
+                format_peer_id(&recipient_id),
+                format_message_id(&message_id)
             ),
         );
     } else {
@@ -449,7 +451,8 @@ fn store_envelope_locked(
             config,
             format!(
                 "relay: message sent -> {} (message_id: {})",
-                recipient_id, message_id
+                format_peer_id(&recipient_id),
+                format_message_id(&message_id)
             ),
         );
     }
@@ -513,7 +516,10 @@ fn record_peer_connection(
     };
     inner.peer_last_seen.insert(peer_id.to_string(), now);
     if should_log {
-        log_message(config, format!("relay: peer connected {}", peer_id));
+        log_message(
+            config,
+            format!("relay: peer connected {}", format_peer_id(peer_id)),
+        );
     }
 }
 
@@ -523,6 +529,20 @@ fn log_message(config: &RelayConfig, message: String) {
     } else {
         println!("{message}");
     }
+}
+
+const LOG_ID_TRUNCATE_LEN: usize = 7;
+
+fn format_peer_id(peer_id: &str) -> String {
+    format!("p-{}", truncate_id(peer_id))
+}
+
+fn format_message_id(message_id: &str) -> String {
+    format!("m-{}", truncate_id(message_id))
+}
+
+fn truncate_id(id: &str) -> String {
+    id.chars().take(LOG_ID_TRUNCATE_LEN).collect()
 }
 
 fn count_recent_peers(inner: &RelayStateInner, now: Instant, window: Duration) -> usize {
