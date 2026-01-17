@@ -19,11 +19,11 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use tenet::crypto::generate_keypair;
 use tenet::protocol::MessageKind;
 use tenet::simulation::{
     run_simulation_scenario, CountSummary, RollingLatencySnapshot, SimulationAggregateMetrics,
-    SimulationControlCommand, SimulationScenarioConfig, SimulationStepUpdate, SizeSummary,
+    SimulationControlCommand, SimulationHarness, SimulationScenarioConfig, SimulationStepUpdate,
+    SizeSummary,
 };
 
 const MESSAGE_KIND_ORDER: [MessageKind; 5] = [
@@ -638,8 +638,7 @@ fn handle_key_event(
                     trimmed.to_string()
                 };
                 let schedule = vec![true; total_steps];
-                let client = tenet::simulation::SimulationClient::new(&node_id, schedule, None);
-                let keypair = generate_keypair();
+                let (client, keypair) = SimulationHarness::build_peer(&node_id, schedule);
                 let _ = control_tx.send(SimulationControlCommand::AddPeer { client, keypair });
                 *input_mode = InputMode::Normal;
                 *status_message = format!("Added peer request queued for {node_id}.");

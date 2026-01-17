@@ -10,7 +10,9 @@ use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
+use crate::crypto::{
+    generate_keypair, generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE,
+};
 use crate::protocol::{
     build_encrypted_payload, build_plaintext_payload, ContentId, Envelope, MessageKind, Payload,
 };
@@ -465,6 +467,14 @@ pub struct SimulationHarness {
 }
 
 impl SimulationHarness {
+    pub fn build_client(node_id: &str, schedule: Vec<bool>) -> SimulationClient {
+        SimulationClient::new(node_id, schedule, None)
+    }
+
+    pub fn build_peer(node_id: &str, schedule: Vec<bool>) -> (SimulationClient, StoredKeypair) {
+        (Self::build_client(node_id, schedule), generate_keypair())
+    }
+
     pub fn new(
         relay_base_url: String,
         clients: Vec<SimulationClient>,
@@ -1736,7 +1746,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             .get(node_id)
             .cloned()
             .unwrap_or_default();
-        clients.push(SimulationClient::new(node_id, schedule, None));
+        clients.push(SimulationHarness::build_client(node_id, schedule));
     }
     SimulationInputs {
         clients,

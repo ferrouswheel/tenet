@@ -1,19 +1,332 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
+use crate::crypto::{generate_content_key, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
-    decrypt_encrypted_payload, Envelope, MessageKind, MetaMessage,
+    build_plaintext_envelope, decrypt_encrypted_payload, Envelope, EnvelopeBuildError, MessageKind,
+    MetaMessage, PayloadCryptoError,
 };
 
 use crate::simulation::{
     HistoricalMessage, MessageEncryption, MetricsTracker, RollingLatencyTracker, SimMessage,
     SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
+
+#[derive(Debug, Clone)]
+pub enum ClientEncryption {
+    Plaintext,
+    Encrypted {
+        hpke_info: Vec<u8>,
+        payload_aad: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    relay_url: String,
+    ttl_seconds: u64,
+    encryption: ClientEncryption,
+}
+
+impl ClientConfig {
+    pub fn new(
+        relay_url: impl Into<String>,
+        ttl_seconds: u64,
+        encryption: ClientEncryption,
+    ) -> Self {
+        Self {
+            relay_url: relay_url.into(),
+            ttl_seconds,
+            encryption,
+        }
+    }
+
+    pub fn relay_url(&self) -> &str {
+        &self.relay_url
+    }
+
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds
+    }
+
+    pub fn encryption(&self) -> &ClientEncryption {
+        &self.encryption
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientMessage {
+    pub message_id: String,
+    pub sender_id: String,
+    pub timestamp: u64,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncOutcome {
+    pub messages: Vec<ClientMessage>,
+    pub errors: Vec<String>,
+    pub fetched: usize,
+}
+
+#[derive(Debug)]
+pub enum ClientError {
+    Http(String),
+    Crypto(PayloadCryptoError),
+    Envelope(EnvelopeBuildError),
+    Protocol(String),
+    Time(String),
+    Offline,
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::Http(error) => write!(f, "http error: {error}"),
+            ClientError::Crypto(error) => write!(f, "crypto error: {error}"),
+            ClientError::Envelope(error) => write!(f, "envelope error: {error}"),
+            ClientError::Protocol(error) => write!(f, "protocol error: {error}"),
+            ClientError::Time(error) => write!(f, "time error: {error}"),
+            ClientError::Offline => write!(f, "client is offline"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+impl From<PayloadCryptoError> for ClientError {
+    fn from(error: PayloadCryptoError) -> Self {
+        ClientError::Crypto(error)
+    }
+}
+
+impl From<EnvelopeBuildError> for ClientError {
+    fn from(error: EnvelopeBuildError) -> Self {
+        ClientError::Envelope(error)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayClient {
+    keypair: StoredKeypair,
+    config: ClientConfig,
+    online: bool,
+    feed: Vec<ClientMessage>,
+    seen: HashSet<String>,
+}
+
+impl RelayClient {
+    pub fn new(keypair: StoredKeypair, config: ClientConfig) -> Self {
+        Self {
+            keypair,
+            config,
+            online: true,
+            feed: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.keypair.id
+    }
+
+    pub fn public_key_hex(&self) -> &str {
+        &self.keypair.public_key_hex
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.online
+    }
+
+    pub fn set_online(&mut self, online: bool) {
+        self.online = online;
+    }
+
+    pub fn feed(&self) -> &[ClientMessage] {
+        &self.feed
+    }
+
+    pub fn send_message(
+        &self,
+        recipient_id: &str,
+        recipient_public_key_hex: &str,
+        message: &str,
+    ) -> Result<Envelope, ClientError> {
+        if !self.online {
+            return Err(ClientError::Offline);
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| ClientError::Time(err.to_string()))?
+            .as_secs();
+
+        let envelope = match self.config.encryption() {
+            ClientEncryption::Plaintext => {
+                let mut salt = [0u8; 16];
+                OsRng.fill_bytes(&mut salt);
+                build_plaintext_envelope(
+                    self.id(),
+                    recipient_id,
+                    None,
+                    None,
+                    timestamp,
+                    self.config.ttl_seconds(),
+                    MessageKind::Direct,
+                    None,
+                    message,
+                    &salt,
+                )?
+            }
+            ClientEncryption::Encrypted {
+                hpke_info,
+                payload_aad,
+            } => {
+                let content_key = generate_content_key();
+                let mut nonce = [0u8; NONCE_SIZE];
+                OsRng.fill_bytes(&mut nonce);
+                let payload = build_encrypted_payload(
+                    message.as_bytes(),
+                    recipient_public_key_hex,
+                    payload_aad,
+                    hpke_info,
+                    &content_key,
+                    &nonce,
+                    None,
+                )?;
+                build_envelope_from_payload(
+                    self.id(),
+                    recipient_id,
+                    None,
+                    None,
+                    timestamp,
+                    self.config.ttl_seconds(),
+                    MessageKind::Direct,
+                    None,
+                    payload,
+                )?
+            }
+        };
+
+        self.post_envelope(&envelope)?;
+        Ok(envelope)
+    }
+
+    pub fn sync_inbox(&mut self, limit: Option<usize>) -> Result<SyncOutcome, ClientError> {
+        if !self.online {
+            return Err(ClientError::Offline);
+        }
+        let envelopes = self.fetch_inbox(limit)?;
+        let fetched = envelopes.len();
+        if fetched == 0 {
+            return Ok(SyncOutcome {
+                messages: Vec::new(),
+                errors: Vec::new(),
+                fetched: 0,
+            });
+        }
+
+        let mut messages = Vec::new();
+        let mut errors = Vec::new();
+        for envelope in envelopes {
+            if self.seen.contains(&envelope.header.message_id.0) {
+                continue;
+            }
+            let result = self.decode_envelope(&envelope);
+            match result {
+                Ok(message) => {
+                    self.seen.insert(envelope.header.message_id.0.clone());
+                    self.feed.push(message.clone());
+                    messages.push(message);
+                }
+                Err(error) => {
+                    errors.push(error);
+                }
+            }
+        }
+
+        Ok(SyncOutcome {
+            messages,
+            errors,
+            fetched,
+        })
+    }
+
+    fn decode_envelope(&self, envelope: &Envelope) -> Result<ClientMessage, String> {
+        envelope
+            .header
+            .verify_signature(envelope.version)
+            .map_err(|error| format!("invalid header signature: {error:?}"))?;
+        if envelope.header.message_kind != MessageKind::Direct {
+            return Err(format!(
+                "unexpected message kind: {:?}",
+                envelope.header.message_kind
+            ));
+        }
+
+        let body = match self.config.encryption() {
+            ClientEncryption::Plaintext => envelope.payload.body.clone(),
+            ClientEncryption::Encrypted {
+                hpke_info,
+                payload_aad,
+            } => {
+                let plaintext = decrypt_encrypted_payload(
+                    &envelope.payload,
+                    &self.keypair.private_key_hex,
+                    payload_aad,
+                    hpke_info,
+                )
+                .map_err(|error| format!("{error}"))?;
+                String::from_utf8(plaintext).map_err(|error| format!("utf-8 error: {error}"))?
+            }
+        };
+
+        Ok(ClientMessage {
+            message_id: envelope.header.message_id.0.clone(),
+            sender_id: envelope.header.sender_id.clone(),
+            timestamp: envelope.header.timestamp,
+            body,
+        })
+    }
+
+    fn post_envelope(&self, envelope: &Envelope) -> Result<(), ClientError> {
+        let url = format!(
+            "{}/envelopes",
+            self.config.relay_url().trim_end_matches('/')
+        );
+        let response = ureq::post(&url).send_json(
+            serde_json::to_value(envelope)
+                .map_err(|error| ClientError::Protocol(format!("serialize envelope: {error}")))?,
+        );
+
+        match response {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(code, _)) => {
+                Err(ClientError::Http(format!("relay error: {code}")))
+            }
+            Err(err) => Err(ClientError::Http(err.to_string())),
+        }
+    }
+
+    fn fetch_inbox(&self, limit: Option<usize>) -> Result<Vec<Envelope>, ClientError> {
+        let base = self.config.relay_url().trim_end_matches('/');
+        let url = if let Some(limit) = limit {
+            format!("{base}/inbox/{}?limit={limit}", self.id())
+        } else {
+            format!("{base}/inbox/{}", self.id())
+        };
+        let response = ureq::get(&url)
+            .call()
+            .map_err(|error| ClientError::Http(error.to_string()))?;
+        response
+            .into_json()
+            .map_err(|error| ClientError::Protocol(format!("deserialize inbox: {error}")))
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClientMetrics {
