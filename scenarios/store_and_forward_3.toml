@@ -1,5 +1,5 @@
 [simulation]
-node_ids = ["node-a", "node-b", "node-c"]
+node_ids = ["peer-a", "peer-b", "peer-c"]
 steps = 20
 seed = 7
 
