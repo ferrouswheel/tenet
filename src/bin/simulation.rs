@@ -110,7 +110,7 @@ async fn run_with_tui(
         inputs.timing.base_real_time_per_step = Duration::from_millis(REAL_TIME_STEP_DELAY_MS);
         let mut harness = tenet::simulation::SimulationHarness::new(
             base_url,
-            inputs.nodes,
+            inputs.clients,
             inputs.direct_links,
             scenario_for_task.direct_enabled.unwrap_or(true),
             scenario_for_task.relay.ttl_seconds,
@@ -638,9 +638,9 @@ fn handle_key_event(
                     trimmed.to_string()
                 };
                 let schedule = vec![true; total_steps];
-                let node = tenet::simulation::Node::new(&node_id, schedule);
+                let client = tenet::simulation::SimulationClient::new(&node_id, schedule);
                 let keypair = generate_keypair();
-                let _ = control_tx.send(SimulationControlCommand::AddPeer { node, keypair });
+                let _ = control_tx.send(SimulationControlCommand::AddPeer { client, keypair });
                 *input_mode = InputMode::Normal;
                 *status_message = format!("Added peer request queued for {node_id}.");
             }

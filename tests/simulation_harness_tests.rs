@@ -6,9 +6,9 @@ use tenet::protocol::{build_plaintext_payload, ContentId};
 use tenet::relay::RelayConfig;
 use tenet::simulation::{
     build_simulation_inputs, start_relay, FriendsPerNode, MessageEncryption,
-    MessageSizeDistribution, Node, OnlineAvailability, PlannedSend, PostFrequency, SimMessage,
-    SimulatedTimeConfig, SimulationConfig, SimulationControlCommand, SimulationHarness,
-    SimulationTimingConfig,
+    MessageSizeDistribution, OnlineAvailability, PlannedSend, PostFrequency, SimMessage,
+    SimulatedTimeConfig, SimulationClient, SimulationConfig, SimulationControlCommand,
+    SimulationHarness, SimulationTimingConfig,
 };
 use tokio::sync::mpsc;
 
@@ -54,7 +54,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
     let inputs = build_simulation_inputs(&config);
     let mut harness = SimulationHarness::new(
         base_url,
-        inputs.nodes,
+        inputs.clients,
         inputs.direct_links,
         true,
         relay_config.ttl.as_secs(),
@@ -119,9 +119,9 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
     };
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
-    let nodes = vec![
-        tenet::simulation::Node::new("node-a", vec![false, true]),
-        tenet::simulation::Node::new("node-b", vec![true, true]),
+    let clients = vec![
+        tenet::simulation::SimulationClient::new("node-a", vec![false, true]),
+        tenet::simulation::SimulationClient::new("node-b", vec![true, true]),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -129,7 +129,7 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
 
     let mut harness = SimulationHarness::new(
         base_url,
-        nodes,
+        clients,
         direct_links,
         true,
         relay_config.ttl.as_secs(),
@@ -169,9 +169,9 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
     };
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
-    let nodes = vec![
-        tenet::simulation::Node::new("node-a", vec![false, true, true]),
-        tenet::simulation::Node::new("node-b", vec![true, true, true]),
+    let clients = vec![
+        tenet::simulation::SimulationClient::new("node-a", vec![false, true, true]),
+        tenet::simulation::SimulationClient::new("node-b", vec![true, true, true]),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -179,7 +179,7 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
 
     let mut harness = SimulationHarness::new(
         base_url,
-        nodes,
+        clients,
         direct_links,
         true,
         relay_config.ttl.as_secs(),
@@ -234,9 +234,9 @@ async fn simulation_harness_applies_dynamic_updates() {
     };
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
-    let nodes = vec![
-        Node::new("node-a", vec![true; 4]),
-        Node::new("node-b", vec![true; 4]),
+    let clients = vec![
+        SimulationClient::new("node-a", vec![true; 4]),
+        SimulationClient::new("node-b", vec![true; 4]),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -244,7 +244,7 @@ async fn simulation_harness_applies_dynamic_updates() {
 
     let mut harness = SimulationHarness::new(
         base_url,
-        nodes,
+        clients,
         direct_links,
         true,
         relay_config.ttl.as_secs(),
@@ -261,9 +261,9 @@ async fn simulation_harness_applies_dynamic_updates() {
     );
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let node_c = Node::new("node-c", vec![true; 4]);
+    let node_c = SimulationClient::new("node-c", vec![true; 4]);
     let _ = control_tx.send(SimulationControlCommand::AddPeer {
-        node: node_c,
+        client: node_c,
         keypair: generate_keypair(),
     });
     let _ = control_tx.send(SimulationControlCommand::AddFriendship {
