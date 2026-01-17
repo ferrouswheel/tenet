@@ -510,7 +510,9 @@ impl SimulationHarness {
             clients: clients
                 .into_iter()
                 .map(|mut client| {
-                    client.set_log_sink(client_log_sink.clone());
+                    if let Some(log_sink) = client_log_sink.clone() {
+                        client.set_log_sink(Some(log_sink));
+                    }
                     (client.id().to_string(), Box::new(client) as Box<dyn Client>)
                 })
                 .collect(),
@@ -621,7 +623,9 @@ impl SimulationHarness {
                 if self.clients.contains_key(&client_id) {
                     return;
                 }
-                client.set_log_sink(self.client_log_sink.clone());
+                if let Some(log_sink) = self.client_log_sink.clone() {
+                    client.set_log_sink(Some(log_sink));
+                }
                 self.clients
                     .insert(client_id.clone(), Box::new(client) as Box<dyn Client>);
                 self.keypairs.insert(client_id.clone(), keypair);
