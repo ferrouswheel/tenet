@@ -257,6 +257,35 @@ The relay logging fields are optional; when omitted they default to a 60-second 
 30-second summary interval. Relay TTLs are meant to be short-lived; the sample default is 3600s,
 and values must stay within protocol bounds (1s minimum, 7 days maximum).
 
+## Simulation metrics
+
+The simulation reports a `SimulationMetrics` struct with counters that track how messages move
+through the system. Each field increments in specific parts of the simulation loop:
+
+- `planned_messages`: set to the number of planned sends (`plan.len()`) at the start of a run, so
+  it reflects how many messages the scenario intended to send.
+- `sent_messages`: incremented when a planned message is actually sent (the sender is online at the
+  scheduled step) and the simulator posts the envelope to the relay (and optionally attempts direct
+  delivery).
+- `direct_deliveries`: incremented when `route_message` succeeds in delivering a message directly
+  to an online recipient during the same step.
+- `inbox_deliveries`: incremented when a node pulls its relay inbox and accepts a direct message
+  envelope (newly online or already online inbox polling).
+- `store_forwards_stored`: incremented when a storage peer receives a `StoreForPeer` envelope and
+  queues the inner message for later forwarding.
+- `store_forwards_forwarded`: incremented when a storage peer is online, the intended recipient is
+  online, and the stored message is forwarded back to the relay.
+- `store_forwards_delivered`: incremented when a forwarded store-and-forward message is delivered
+  to the recipient (tracked via the pending forwarded message set).
+
+Common relationships to expect:
+
+- `planned_messages` is greater than or equal to `sent_messages` because offline senders skip
+  sending at their scheduled step.
+- Store-and-forward counters typically decrease in order (`store_forwards_stored` ≥
+  `store_forwards_forwarded` ≥ `store_forwards_delivered`) since forwarding and delivery depend on
+  online peers and successful inbox delivery.
+
 ## Manual TUI test
 
 ### TUI key bindings
