@@ -6,8 +6,8 @@ use tenet::relay::RelayConfig;
 use tenet::simulation::{
     build_simulation_inputs, start_relay, FriendsPerNode, MessageEncryption,
     MessageSizeDistribution, OnlineAvailability, PlannedSend, PostFrequency, SimMessage,
-    SimulatedTimeConfig, SimulationConfig, SimulationControlCommand, SimulationHarness,
-    SimulationTimingConfig,
+    SimulatedTimeConfig, SimulationClient, SimulationConfig, SimulationControlCommand,
+    SimulationHarness, SimulationTimingConfig,
 };
 use tokio::sync::mpsc;
 
@@ -119,8 +119,8 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let clients = vec![
-        SimulationHarness::build_client("node-a", vec![false, true]),
-        SimulationHarness::build_client("node-b", vec![true, true]),
+        SimulationClient::new("node-a", vec![false, true], None),
+        SimulationClient::new("node-b", vec![true, true], None),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -169,8 +169,8 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let clients = vec![
-        SimulationHarness::build_client("node-a", vec![false, true, true]),
-        SimulationHarness::build_client("node-b", vec![true, true, true]),
+        SimulationClient::new("node-a", vec![false, true, true], None),
+        SimulationClient::new("node-b", vec![true, true, true], None),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -234,8 +234,8 @@ async fn simulation_harness_applies_dynamic_updates() {
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let clients = vec![
-        SimulationHarness::build_client("node-a", vec![true; 4]),
-        SimulationHarness::build_client("node-b", vec![true; 4]),
+        SimulationClient::new("node-a", vec![true; 4], None),
+        SimulationClient::new("node-b", vec![true; 4], None),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
