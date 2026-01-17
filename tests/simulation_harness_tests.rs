@@ -120,8 +120,8 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let clients = vec![
-        tenet::simulation::SimulationClient::new("node-a", vec![false, true]),
-        tenet::simulation::SimulationClient::new("node-b", vec![true, true]),
+        tenet::simulation::SimulationClient::new("node-a", vec![false, true], None),
+        tenet::simulation::SimulationClient::new("node-b", vec![true, true], None),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -170,8 +170,8 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let clients = vec![
-        tenet::simulation::SimulationClient::new("node-a", vec![false, true, true]),
-        tenet::simulation::SimulationClient::new("node-b", vec![true, true, true]),
+        tenet::simulation::SimulationClient::new("node-a", vec![false, true, true], None),
+        tenet::simulation::SimulationClient::new("node-b", vec![true, true, true], None),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -235,8 +235,8 @@ async fn simulation_harness_applies_dynamic_updates() {
     let (base_url, shutdown_tx, _relay_control) = start_relay(relay_config.clone()).await;
 
     let clients = vec![
-        SimulationClient::new("node-a", vec![true; 4]),
-        SimulationClient::new("node-b", vec![true; 4]),
+        SimulationClient::new("node-a", vec![true; 4], None),
+        SimulationClient::new("node-b", vec![true; 4], None),
     ];
     let mut direct_links = HashSet::new();
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
@@ -261,7 +261,7 @@ async fn simulation_harness_applies_dynamic_updates() {
     );
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let node_c = SimulationClient::new("node-c", vec![true; 4]);
+    let node_c = SimulationClient::new("node-c", vec![true; 4], None);
     let _ = control_tx.send(SimulationControlCommand::AddPeer {
         client: node_c,
         keypair: generate_keypair(),

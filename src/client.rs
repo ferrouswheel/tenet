@@ -15,6 +15,37 @@ use crate::simulation::{
     SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ClientMetrics {
+    pub messages_sent: usize,
+    pub direct_deliveries: usize,
+    pub inbox_deliveries: usize,
+    pub missed_deliveries: usize,
+    pub store_forwards_stored: usize,
+    pub store_forwards_forwarded: usize,
+    pub store_forwards_delivered: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientLogEvent {
+    pub step: usize,
+    pub client_id: String,
+    pub message: String,
+}
+
+pub trait ClientLogSink: Send + Sync {
+    fn log(&self, event: ClientLogEvent);
+}
+
+impl<F> ClientLogSink for F
+where
+    F: Fn(ClientLogEvent) + Send + Sync,
+{
+    fn log(&self, event: ClientLogEvent) {
+        self(event);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoreForPayload {
     envelope: Envelope,
@@ -46,15 +77,6 @@ pub(crate) struct ClientContext<'a> {
     pub pending_forwarded_messages: &'a mut HashSet<String>,
     pub metrics: &'a mut SimulationMetrics,
     pub metrics_tracker: &'a mut MetricsTracker,
-    pub log_sink: &'a Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
-}
-
-impl<'a> ClientContext<'a> {
-    fn log_action(&self, step: usize, message: impl Into<String>) {
-        if let Some(log_sink) = &self.log_sink {
-            log_sink(format!("[sim step={step}] {}", message.into()));
-        }
-    }
 }
 
 pub(crate) struct ClientSendOutcome {
@@ -72,6 +94,7 @@ pub(crate) trait Client: Send {
     fn is_online(&self, step: usize) -> bool;
     fn inbox(&self) -> Vec<SimMessage>;
     fn stored_forward_count(&self) -> usize;
+    fn metrics(&self) -> ClientMetrics;
     fn receive_message(&mut self, message: SimMessage) -> bool;
 
     fn enqueue_sends(
@@ -115,7 +138,7 @@ pub(crate) trait Client: Send {
     ) -> Option<usize>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SimulationClient {
     id: String,
     schedule: Vec<bool>,
@@ -124,10 +147,32 @@ pub struct SimulationClient {
     last_seen_by_peer: HashMap<String, u64>,
     pending_online_broadcasts: Vec<PendingOnlineBroadcast>,
     stored_forwards: Vec<StoredForPeerMessage>,
+    metrics: ClientMetrics,
+    log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
+}
+
+impl std::fmt::Debug for SimulationClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulationClient")
+            .field("id", &self.id)
+            .field("schedule", &self.schedule)
+            .field("inbox", &self.inbox)
+            .field("seen", &self.seen)
+            .field("last_seen_by_peer", &self.last_seen_by_peer)
+            .field("pending_online_broadcasts", &self.pending_online_broadcasts)
+            .field("stored_forwards", &self.stored_forwards)
+            .field("metrics", &self.metrics)
+            .field("has_log_sink", &self.log_sink.is_some())
+            .finish()
+    }
 }
 
 impl SimulationClient {
-    pub fn new(id: &str, schedule: Vec<bool>) -> Self {
+    pub fn new(
+        id: &str,
+        schedule: Vec<bool>,
+        log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             schedule,
@@ -136,6 +181,22 @@ impl SimulationClient {
             last_seen_by_peer: HashMap::new(),
             pending_online_broadcasts: Vec::new(),
             stored_forwards: Vec::new(),
+            metrics: ClientMetrics::default(),
+            log_sink,
+        }
+    }
+
+    pub fn set_log_sink(&mut self, log_sink: Option<std::sync::Arc<dyn ClientLogSink>>) {
+        self.log_sink = log_sink;
+    }
+
+    fn log_action(&self, step: usize, message: impl Into<String>) {
+        if let Some(log_sink) = &self.log_sink {
+            log_sink.log(ClientLogEvent {
+                step,
+                client_id: self.id.clone(),
+                message: message.into(),
+            });
         }
     }
 
@@ -187,6 +248,8 @@ impl SimulationClient {
             context.metrics.store_forwards_delivered =
                 context.metrics.store_forwards_delivered.saturating_add(1);
             context.metrics_tracker.record_store_forward_delivery();
+            self.metrics.store_forwards_delivered =
+                self.metrics.store_forwards_delivered.saturating_add(1);
         }
         let latency = context
             .metrics_tracker
@@ -209,18 +272,21 @@ impl SimulationClient {
             DeliveryKind::Direct => {
                 context.metrics.direct_deliveries =
                     context.metrics.direct_deliveries.saturating_add(1);
+                self.metrics.direct_deliveries = self.metrics.direct_deliveries.saturating_add(1);
             }
             DeliveryKind::Inbox => {
                 context.metrics.inbox_deliveries =
                     context.metrics.inbox_deliveries.saturating_add(1);
+                self.metrics.inbox_deliveries = self.metrics.inbox_deliveries.saturating_add(1);
             }
             DeliveryKind::Missed => {
                 context.metrics_tracker.record_missed_message_delivery();
+                self.metrics.missed_deliveries = self.metrics.missed_deliveries.saturating_add(1);
             }
         }
         let latency = self.record_delivery_metrics(&message, step, context);
         if matches!(delivery_kind, DeliveryKind::Missed) {
-            context.log_action(
+            self.log_action(
                 step + 1,
                 format!("{} received missed message {}", self.id, message.id),
             );
@@ -395,7 +461,8 @@ impl SimulationClient {
         context.metrics.store_forwards_stored =
             context.metrics.store_forwards_stored.saturating_add(1);
         context.metrics_tracker.record_store_forward_stored();
-        context.log_action(
+        self.metrics.store_forwards_stored = self.metrics.store_forwards_stored.saturating_add(1);
+        self.log_action(
             step + 1,
             format!("{} stored a store-forward message", self.id),
         );
@@ -440,7 +507,7 @@ impl SimulationClient {
             envelopes.push(envelope);
         }
         context.metrics_tracker.record_missed_message_request();
-        context.log_action(
+        self.log_action(
             step + 1,
             format!("{requester} requested missed messages from {responder}"),
         );
@@ -462,7 +529,7 @@ impl SimulationClient {
             }
         }
         if delivered > 0 {
-            context.log_action(
+            self.log_action(
                 step + 1,
                 format!("{responder} delivered {delivered} missed messages to {requester}"),
             );
@@ -508,6 +575,10 @@ impl Client for SimulationClient {
         self.stored_forwards.len()
     }
 
+    fn metrics(&self) -> ClientMetrics {
+        self.metrics.clone()
+    }
+
     fn receive_message(&mut self, message: SimMessage) -> bool {
         if self.seen.insert(message.id.clone()) {
             self.inbox.push(message);
@@ -545,6 +616,7 @@ impl Client for SimulationClient {
                 Err(_) => continue,
             };
             self.record_message_send(message, step, &envelope, context);
+            self.metrics.messages_sent = self.metrics.messages_sent.saturating_add(1);
             let recipient_online = online_set.contains(&message.recipient);
             if context.direct_enabled
                 && context
@@ -627,7 +699,7 @@ impl Client for SimulationClient {
         if neighbors.is_empty() {
             return Vec::new();
         }
-        context.log_action(
+        self.log_action(
             step + 1,
             format!("{} announced online to {}", self.id, neighbors.join(", ")),
         );
@@ -682,7 +754,7 @@ impl Client for SimulationClient {
                     envelopes.push(envelope);
                 }
                 context.metrics_tracker.record_ack();
-                context.log_action(
+                self.log_action(
                     step + 1,
                     format!(
                         "{} acknowledged {} online",
@@ -719,6 +791,8 @@ impl Client for SimulationClient {
         }
         let mut forwarded = Vec::new();
         let mut remaining = Vec::new();
+        let log_sink = self.log_sink.clone();
+        let client_id = self.id.clone();
         for entry in self.stored_forwards.drain(..) {
             if online_set.contains(&entry.store_for_id) {
                 let message_id = entry.envelope.header.message_id.0.clone();
@@ -728,13 +802,18 @@ impl Client for SimulationClient {
                 context
                     .metrics_tracker
                     .record_store_forward_forwarded(&self.id);
-                context.log_action(
-                    step + 1,
-                    format!(
-                        "{} forwarded stored message to {}",
-                        self.id, entry.store_for_id
-                    ),
-                );
+                self.metrics.store_forwards_forwarded =
+                    self.metrics.store_forwards_forwarded.saturating_add(1);
+                if let Some(log_sink) = &log_sink {
+                    log_sink.log(ClientLogEvent {
+                        step: step + 1,
+                        client_id: client_id.clone(),
+                        message: format!(
+                            "{} forwarded stored message to {}",
+                            client_id, entry.store_for_id
+                        ),
+                    });
+                }
                 forwarded.push(entry.envelope);
             } else {
                 remaining.push(entry);
