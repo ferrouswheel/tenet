@@ -608,14 +608,15 @@ impl SimulationHarness {
             .set_simulated_seconds_per_step(self.timing.simulated_seconds_per_step());
     }
 
-    fn log_action(&self, message: impl Into<String>) {
+    fn log_action(&self, step: usize, message: impl Into<String>) {
         if let Some(log_sink) = &self.log_sink {
-            log_sink(format!("[sim] {}", message.into()));
+            log_sink(format!("[sim step={step}] {}", message.into()));
         }
     }
 
     fn apply_control_command(
         &mut self,
+        step: usize,
         command: SimulationControlCommand,
         previous_online: &mut HashMap<String, bool>,
     ) {
@@ -631,7 +632,7 @@ impl SimulationHarness {
                     .insert(node_id.clone(), HashMap::new());
                 self.neighbors.entry(node_id.clone()).or_default();
                 previous_online.entry(node_id.clone()).or_insert(false);
-                self.log_action(format!("peer {node_id} added"));
+                self.log_action(step, format!("{node_id} added"));
             }
             SimulationControlCommand::AddFriendship { peer_a, peer_b } => {
                 if !(self.nodes.contains_key(&peer_a) && self.nodes.contains_key(&peer_b)) {
@@ -649,22 +650,25 @@ impl SimulationHarness {
                         .or_default()
                         .push(peer_a.clone());
                 }
-                self.log_action(format!("friendship added between {peer_a} and {peer_b}"));
+                self.log_action(
+                    step,
+                    format!("friendship added between {peer_a} and {peer_b}"),
+                );
             }
             SimulationControlCommand::AdjustSpeedFactor { delta } => {
                 let next = self.timing.speed_factor + delta;
                 self.set_speed_factor(next);
-                self.log_action(format!(
-                    "speed factor adjusted to {:.2}",
-                    self.timing.speed_factor
-                ));
+                self.log_action(
+                    step,
+                    format!("speed factor adjusted to {:.2}", self.timing.speed_factor),
+                );
             }
             SimulationControlCommand::SetSpeedFactor { speed_factor } => {
                 self.set_speed_factor(speed_factor);
-                self.log_action(format!(
-                    "speed factor set to {:.2}",
-                    self.timing.speed_factor
-                ));
+                self.log_action(
+                    step,
+                    format!("speed factor set to {:.2}", self.timing.speed_factor),
+                );
             }
             SimulationControlCommand::SetPaused { .. } | SimulationControlCommand::Stop => {}
         }
@@ -708,9 +712,10 @@ impl SimulationHarness {
         };
         let neighbors = neighbors.clone();
         for neighbor in neighbors {
-            self.log_action(format!(
-                "peer {node_id} announced online to {neighbor} at step {step}"
-            ));
+            self.log_action(
+                step + 1,
+                format!("{node_id} announced online to {neighbor}"),
+            );
             let meta = MetaMessage::Online {
                 peer_id: node_id.to_string(),
                 timestamp: step as u64,
@@ -747,10 +752,13 @@ impl SimulationHarness {
                 self.send_meta_message(&pending.recipient_id, &pending.sender_id, step, &ack)
                     .await;
                 self.metrics_tracker.record_ack();
-                self.log_action(format!(
-                    "peer {} acknowledged {} online at step {}",
-                    pending.recipient_id, pending.sender_id, step
-                ));
+                self.log_action(
+                    step + 1,
+                    format!(
+                        "{} acknowledged {} online",
+                        pending.recipient_id, pending.sender_id
+                    ),
+                );
                 delivered = delivered.saturating_add(
                     self.handle_message_request(&pending.sender_id, &pending.recipient_id, step)
                         .await,
@@ -777,9 +785,10 @@ impl SimulationHarness {
         self.send_meta_message(requester, responder, step, &request)
             .await;
         self.metrics_tracker.record_missed_message_request();
-        self.log_action(format!(
-            "peer {requester} requested missed messages from {responder} at step {step}"
-        ));
+        self.log_action(
+            step + 1,
+            format!("{requester} requested missed messages from {responder}"),
+        );
         let Some(history) = self
             .message_history
             .get(&(responder.to_string(), requester.to_string()))
@@ -798,9 +807,10 @@ impl SimulationHarness {
             }
         }
         if delivered > 0 {
-            self.log_action(format!(
-                "peer {responder} delivered {delivered} missed messages to {requester} at step {step}"
-            ));
+            self.log_action(
+                step + 1,
+                format!("{responder} delivered {delivered} missed messages to {requester}"),
+            );
         }
         delivered
     }
@@ -850,10 +860,10 @@ impl SimulationHarness {
         if node.receive(message.clone()) {
             self.metrics_tracker.record_missed_message_delivery();
             self.record_delivery_metrics(&message, recipient_id, step);
-            self.log_action(format!(
-                "peer {recipient_id} received missed message {} at step {step}",
-                message.id
-            ));
+            self.log_action(
+                step + 1,
+                format!("{recipient_id} received missed message {}", message.id),
+            );
             return true;
         }
         false
@@ -877,16 +887,22 @@ impl SimulationHarness {
         latency
     }
 
-    fn store_forward_message(&mut self, storage_peer_id: &str, message: StoredForPeerMessage) {
+    fn store_forward_message(
+        &mut self,
+        storage_peer_id: &str,
+        step: usize,
+        message: StoredForPeerMessage,
+    ) {
         self.stored_forwards
             .entry(storage_peer_id.to_string())
             .or_default()
             .push(message);
         self.metrics.store_forwards_stored = self.metrics.store_forwards_stored.saturating_add(1);
         self.metrics_tracker.record_store_forward_stored();
-        self.log_action(format!(
-            "peer {storage_peer_id} stored a store-forward message"
-        ));
+        self.log_action(
+            step + 1,
+            format!("{storage_peer_id} stored a store-forward message"),
+        );
     }
 
     fn select_storage_peer(&self, sender: &str, recipient: &str) -> Option<String> {
@@ -904,7 +920,7 @@ impl SimulationHarness {
             .find(|candidate| candidate != sender && candidate != recipient)
     }
 
-    async fn forward_store_forwards(&mut self, online_set: &HashSet<String>) -> usize {
+    async fn forward_store_forwards(&mut self, step: usize, online_set: &HashSet<String>) -> usize {
         let mut forwarded = 0usize;
         let mut log_entries = Vec::new();
         let storage_peers: Vec<String> = self.stored_forwards.keys().cloned().collect();
@@ -924,7 +940,7 @@ impl SimulationHarness {
                         self.metrics_tracker
                             .record_store_forward_forwarded(&storage_peer_id);
                         log_entries.push(format!(
-                            "peer {storage_peer_id} forwarded stored message to {}",
+                            "{storage_peer_id} forwarded stored message to {}",
                             entry.store_for_id
                         ));
                         forwarded = forwarded.saturating_add(1);
@@ -936,7 +952,7 @@ impl SimulationHarness {
             }
         }
         for entry in log_entries {
-            self.log_action(entry);
+            self.log_action(step + 1, entry);
         }
         forwarded
     }
@@ -990,13 +1006,13 @@ impl SimulationHarness {
                 .collect();
 
             for node_id in &newly_online {
-                self.log_action(format!("peer {node_id} came online at step {step}"));
+                self.log_action(step + 1, format!("{node_id} came online"));
             }
             for node_id in &offline {
-                self.log_action(format!("peer {node_id} went offline at step {step}"));
+                self.log_action(step + 1, format!("{node_id} went offline"));
             }
 
-            let _ = self.forward_store_forwards(&online_set).await;
+            let _ = self.forward_store_forwards(step, &online_set).await;
 
             for node_id in &newly_online {
                 let envelopes = fetch_inbox(&self.relay_base_url, node_id)
@@ -1013,7 +1029,7 @@ impl SimulationHarness {
                             }
                         }
                         Some(IncomingEnvelopeAction::StoredForPeer(message)) => {
-                            self.store_forward_message(node_id, message);
+                            self.store_forward_message(node_id, step, message);
                         }
                         None => {}
                     }
@@ -1046,7 +1062,7 @@ impl SimulationHarness {
                             }
                         }
                         Some(IncomingEnvelopeAction::StoredForPeer(message)) => {
-                            self.store_forward_message(node_id, message);
+                            self.store_forward_message(node_id, step, message);
                         }
                         None => {}
                     }
@@ -1116,15 +1132,15 @@ impl SimulationHarness {
                     } => {
                         paused = should_pause;
                         if paused {
-                            self.log_action("simulation paused".to_string());
+                            self.log_action(step + 1, "simulation paused".to_string());
                         } else {
-                            self.log_action("simulation resumed".to_string());
+                            self.log_action(step + 1, "simulation resumed".to_string());
                         }
                     }
                     SimulationControlCommand::Stop => {
                         stop_requested = true;
                     }
-                    other => self.apply_control_command(other, &mut previous_online),
+                    other => self.apply_control_command(step + 1, other, &mut previous_online),
                 }
             }
             if stop_requested {
@@ -1173,13 +1189,13 @@ impl SimulationHarness {
                 .collect();
 
             for node_id in &newly_online {
-                self.log_action(format!("peer {node_id} came online at step {step}"));
+                self.log_action(step + 1, format!("{node_id} came online"));
             }
             for node_id in &offline {
-                self.log_action(format!("peer {node_id} went offline at step {step}"));
+                self.log_action(step + 1, format!("{node_id} went offline"));
             }
 
-            let _ = self.forward_store_forwards(&online_set).await;
+            let _ = self.forward_store_forwards(step, &online_set).await;
 
             for node_id in &newly_online {
                 let envelopes = fetch_inbox(&self.relay_base_url, node_id)
@@ -1201,7 +1217,7 @@ impl SimulationHarness {
                             }
                         }
                         Some(IncomingEnvelopeAction::StoredForPeer(message)) => {
-                            self.store_forward_message(node_id, message);
+                            self.store_forward_message(node_id, step, message);
                         }
                         None => {}
                     }
@@ -1240,7 +1256,7 @@ impl SimulationHarness {
                             }
                         }
                         Some(IncomingEnvelopeAction::StoredForPeer(message)) => {
-                            self.store_forward_message(node_id, message);
+                            self.store_forward_message(node_id, step, message);
                         }
                         None => {}
                     }

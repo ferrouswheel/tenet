@@ -91,15 +91,15 @@ async fn run_with_tui(
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+    let (relay_log_tx, mut relay_log_rx) = mpsc::unbounded_channel();
+    let (sim_log_tx, mut sim_log_rx) = mpsc::unbounded_channel();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let mut relay_config = scenario.relay.clone().into_relay_config();
-    let relay_log_tx = log_tx.clone();
     relay_config.log_sink = Some(Arc::new(move |line: String| {
         let _ = relay_log_tx.send(line);
     }));
     let simulation_log_sink = Arc::new(move |line: String| {
-        let _ = log_tx.send(line);
+        let _ = sim_log_tx.send(line);
     });
     let scenario_for_task = scenario.clone();
     let total_steps = scenario_for_task.simulation.effective_steps();
@@ -155,13 +155,13 @@ async fn run_with_tui(
 
     let mut last_update: Option<SimulationStepUpdate> = None;
     let mut relay_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
+    let mut sim_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
     let mut input_mode = InputMode::Normal;
-    let mut status_message =
-        "Simulation running. Press a to add peers, f to add friends, +/- to adjust speed, space to pause, q to quit."
-            .to_string();
+    let mut status_message = "Simulation running.".to_string();
     let mut auto_peer_index = 1usize;
     let mut quit_requested = false;
     let mut paused = false;
+    let base_seconds_per_step = scenario.simulation.simulated_time.seconds_per_step as f64;
 
     loop {
         tokio::select! {
@@ -172,16 +172,41 @@ async fn run_with_tui(
                         render(
                             &mut terminal,
                             &update,
+                            sim_logs.make_contiguous(),
                             relay_logs.make_contiguous(),
                             &status_message,
+                            paused,
+                            base_seconds_per_step,
                         )
                         .map_err(|err| err.to_string())?;
                     }
                     None => break,
                 }
             }
-            log_line = log_rx.recv() => {
-                if let Some(line) = log_line {
+            sim_log_line = sim_log_rx.recv() => {
+                if let Some(line) = sim_log_line {
+                    if sim_logs.len() == RELAY_LOG_LIMIT {
+                        sim_logs.pop_front();
+                    }
+                    sim_logs.push_back(line);
+                    if let Some(update) = &last_update {
+                        render(
+                            &mut terminal,
+                            update,
+                            sim_logs.make_contiguous(),
+                            relay_logs.make_contiguous(),
+                            &status_message,
+                            paused,
+                            base_seconds_per_step,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                } else if rx.is_closed() {
+                    break;
+                }
+            }
+            relay_log_line = relay_log_rx.recv() => {
+                if let Some(line) = relay_log_line {
                     if relay_logs.len() == RELAY_LOG_LIMIT {
                         relay_logs.pop_front();
                     }
@@ -190,8 +215,11 @@ async fn run_with_tui(
                         render(
                             &mut terminal,
                             update,
+                            sim_logs.make_contiguous(),
                             relay_logs.make_contiguous(),
                             &status_message,
+                            paused,
+                            base_seconds_per_step,
                         )
                         .map_err(|err| err.to_string())?;
                     }
@@ -220,8 +248,11 @@ async fn run_with_tui(
                         render(
                             &mut terminal,
                             update,
+                            sim_logs.make_contiguous(),
                             relay_logs.make_contiguous(),
                             &status_message,
+                            paused,
+                            base_seconds_per_step,
                         )
                         .map_err(|err| err.to_string())?;
                     }
@@ -261,8 +292,11 @@ async fn run_with_tui(
     render(
         &mut terminal,
         &completion_update,
+        sim_logs.make_contiguous(),
         relay_logs.make_contiguous(),
         "Simulation complete. Press q to exit.",
+        paused,
+        base_seconds_per_step,
     )
     .map_err(|err| err.to_string())?;
     wait_for_quit(&mut input_rx)
@@ -283,8 +317,11 @@ async fn run_with_tui(
 fn render(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     update: &SimulationStepUpdate,
+    sim_logs: &[String],
     relay_logs: &[String],
     status: &str,
+    paused: bool,
+    base_seconds_per_step: f64,
 ) -> io::Result<()> {
     terminal
         .draw(|frame| {
@@ -294,13 +331,17 @@ fn render(
                 .margin(1)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Length(8),
+                    Constraint::Length(9),
                     Constraint::Length(10),
                     Constraint::Min(8),
-                    Constraint::Length(3),
+                    Constraint::Length(4),
+                    Constraint::Length(4),
                 ])
                 .split(size);
 
+            let sim_seconds_per_step = base_seconds_per_step * update.speed_factor.max(0.0);
+            let current_sim_seconds = update.step as f64 * sim_seconds_per_step;
+            let total_sim_seconds = update.total_steps as f64 * sim_seconds_per_step;
             let progress = update.step as f64 / update.total_steps.max(1) as f64;
             let progress_gauge = Gauge::default()
                 .block(
@@ -310,15 +351,25 @@ fn render(
                 )
                 .gauge_style(Style::default().fg(Color::Cyan))
                 .ratio(progress)
-                .label(format!("Step {}/{}", update.step, update.total_steps));
+                .label(format!(
+                    "Step {}/{} | Time {} / {}",
+                    update.step,
+                    update.total_steps,
+                    format_duration(current_sim_seconds),
+                    format_duration(total_sim_seconds)
+                ));
             frame.render_widget(progress_gauge, chunks[0]);
 
             let metrics_lines = vec![
                 Line::from(Span::raw(format!("Total peers: {}", update.total_peers))),
-                Line::from(Span::raw(format!("Online nodes: {}", update.online_nodes))),
+                Line::from(Span::raw(format!("Online peers: {}", update.online_nodes))),
                 Line::from(Span::raw(format!(
                     "Speed factor: {:.2}x",
                     update.speed_factor
+                ))),
+                Line::from(Span::raw(format!(
+                    "Sim time per step: {:.1}s",
+                    sim_seconds_per_step
                 ))),
                 Line::from(Span::raw(format!(
                     "Messages sent (step): {}",
@@ -347,10 +398,33 @@ fn render(
             );
             frame.render_widget(aggregate_block, chunks[2]);
 
+            let log_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[3]);
+
+            let sim_lines = sim_logs
+                .iter()
+                .rev()
+                .take(log_chunks[0].height.saturating_sub(2) as usize)
+                .cloned()
+                .collect::<Vec<_>>();
+            let sim_lines = sim_lines
+                .into_iter()
+                .rev()
+                .map(Line::from)
+                .collect::<Vec<_>>();
+            let sim_block = Paragraph::new(sim_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Simulation Logs"),
+            );
+            frame.render_widget(sim_block, log_chunks[0]);
+
             let relay_lines = relay_logs
                 .iter()
                 .rev()
-                .take(chunks[3].height.saturating_sub(2) as usize)
+                .take(log_chunks[1].height.saturating_sub(2) as usize)
                 .cloned()
                 .collect::<Vec<_>>();
             let relay_lines = relay_lines
@@ -360,11 +434,31 @@ fn render(
                 .collect::<Vec<_>>();
             let relay_block = Paragraph::new(relay_lines)
                 .block(Block::default().borders(Borders::ALL).title("Relay Logs"));
-            frame.render_widget(relay_block, chunks[3]);
+            frame.render_widget(relay_block, log_chunks[1]);
 
-            let hint = Paragraph::new(status)
+            let status_lines = vec![
+                Line::from(Span::raw(format!(
+                    "State: {}",
+                    if paused { "Paused" } else { "Running" }
+                ))),
+                Line::from(Span::raw(format!(
+                    "Online: {}/{}",
+                    update.online_nodes, update.total_peers
+                ))),
+                Line::from(Span::raw(format!("Last: {status}"))),
+            ];
+            let hint = Paragraph::new(status_lines)
                 .block(Block::default().borders(Borders::ALL).title("Status"));
             frame.render_widget(hint, chunks[4]);
+
+            let command_lines = vec![
+                Line::from(Span::raw("a: add peer | f: add friends")),
+                Line::from(Span::raw("+/-: adjust speed | space: pause/resume")),
+                Line::from(Span::raw("q: quit")),
+            ];
+            let command_block = Paragraph::new(command_lines)
+                .block(Block::default().borders(Borders::ALL).title("Commands"));
+            frame.render_widget(command_block, chunks[5]);
         })
         .map(|_| ())
 }
@@ -378,6 +472,18 @@ async fn wait_for_quit(input_rx: &mut mpsc::UnboundedReceiver<Event>) -> io::Res
         }
     }
     Ok(())
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total_seconds = seconds.max(0.0).round() as u64;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let secs = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes:02}:{secs:02}")
+    }
 }
 
 fn format_latency(snapshot: &RollingLatencySnapshot) -> String {
