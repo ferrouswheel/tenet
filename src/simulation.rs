@@ -49,6 +49,8 @@ fn default_simulated_time() -> SimulatedTimeConfig {
 pub struct SimulationConfig {
     pub node_ids: Vec<String>,
     pub steps: usize,
+    #[serde(default)]
+    pub duration_seconds: Option<u64>,
     #[serde(default = "default_simulated_time")]
     pub simulated_time: SimulatedTimeConfig,
     pub friends_per_node: FriendsPerNode,
@@ -61,6 +63,17 @@ pub struct SimulationConfig {
     pub message_size_distribution: MessageSizeDistribution,
     pub encryption: Option<MessageEncryption>,
     pub seed: u64,
+}
+
+impl SimulationConfig {
+    pub fn effective_steps(&self) -> usize {
+        if let Some(duration_seconds) = self.duration_seconds {
+            let seconds_per_step = self.simulated_time.seconds_per_step.max(1) as f64;
+            let steps = (duration_seconds as f64 / seconds_per_step).ceil() as usize;
+            return steps.max(1);
+        }
+        self.steps.max(1)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,8 +465,10 @@ pub struct SimulationInputs {
 pub enum SimulationControlCommand {
     AddPeer { node: Node, keypair: StoredKeypair },
     AddFriendship { peer_a: String, peer_b: String },
-    AdjustSpeedFactor { multiplier: f64 },
+    AdjustSpeedFactor { delta: f64 },
     SetSpeedFactor { speed_factor: f64 },
+    SetPaused { paused: bool },
+    Stop,
 }
 
 enum IncomingEnvelopeAction {
@@ -479,6 +494,7 @@ pub struct SimulationHarness {
     metrics: SimulationMetrics,
     metrics_tracker: MetricsTracker,
     timing: SimulationTimingConfig,
+    log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl SimulationHarness {
@@ -492,6 +508,7 @@ impl SimulationHarness {
         keypairs: HashMap<String, StoredKeypair>,
         timing: SimulationTimingConfig,
         cohort_online_rates: HashMap<String, f64>,
+        log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Self {
         let planned_messages = 0;
         let mut neighbors: HashMap<String, Vec<String>> = HashMap::new();
@@ -537,6 +554,7 @@ impl SimulationHarness {
                 cohort_online_rates,
             ),
             timing,
+            log_sink,
         }
     }
 
@@ -590,6 +608,12 @@ impl SimulationHarness {
             .set_simulated_seconds_per_step(self.timing.simulated_seconds_per_step());
     }
 
+    fn log_action(&self, message: impl Into<String>) {
+        if let Some(log_sink) = &self.log_sink {
+            log_sink(format!("[sim] {}", message.into()));
+        }
+    }
+
     fn apply_control_command(
         &mut self,
         command: SimulationControlCommand,
@@ -606,7 +630,8 @@ impl SimulationHarness {
                 self.last_seen_by_peer
                     .insert(node_id.clone(), HashMap::new());
                 self.neighbors.entry(node_id.clone()).or_default();
-                previous_online.entry(node_id).or_insert(false);
+                previous_online.entry(node_id.clone()).or_insert(false);
+                self.log_action(format!("peer {node_id} added"));
             }
             SimulationControlCommand::AddFriendship { peer_a, peer_b } => {
                 if !(self.nodes.contains_key(&peer_a) && self.nodes.contains_key(&peer_b)) {
@@ -619,18 +644,29 @@ impl SimulationHarness {
                         .push(peer_b.clone());
                 }
                 if self.direct_links.insert((peer_b.clone(), peer_a.clone())) {
-                    self.neighbors.entry(peer_b).or_default().push(peer_a);
+                    self.neighbors
+                        .entry(peer_b.clone())
+                        .or_default()
+                        .push(peer_a.clone());
                 }
+                self.log_action(format!("friendship added between {peer_a} and {peer_b}"));
             }
-            SimulationControlCommand::AdjustSpeedFactor { multiplier } => {
-                if multiplier > 0.0 {
-                    let next = self.timing.speed_factor * multiplier;
-                    self.set_speed_factor(next);
-                }
+            SimulationControlCommand::AdjustSpeedFactor { delta } => {
+                let next = self.timing.speed_factor + delta;
+                self.set_speed_factor(next);
+                self.log_action(format!(
+                    "speed factor adjusted to {:.2}",
+                    self.timing.speed_factor
+                ));
             }
             SimulationControlCommand::SetSpeedFactor { speed_factor } => {
                 self.set_speed_factor(speed_factor);
+                self.log_action(format!(
+                    "speed factor set to {:.2}",
+                    self.timing.speed_factor
+                ));
             }
+            SimulationControlCommand::SetPaused { .. } | SimulationControlCommand::Stop => {}
         }
     }
 
@@ -672,6 +708,9 @@ impl SimulationHarness {
         };
         let neighbors = neighbors.clone();
         for neighbor in neighbors {
+            self.log_action(format!(
+                "peer {node_id} announced online to {neighbor} at step {step}"
+            ));
             let meta = MetaMessage::Online {
                 peer_id: node_id.to_string(),
                 timestamp: step as u64,
@@ -708,6 +747,10 @@ impl SimulationHarness {
                 self.send_meta_message(&pending.recipient_id, &pending.sender_id, step, &ack)
                     .await;
                 self.metrics_tracker.record_ack();
+                self.log_action(format!(
+                    "peer {} acknowledged {} online at step {}",
+                    pending.recipient_id, pending.sender_id, step
+                ));
                 delivered = delivered.saturating_add(
                     self.handle_message_request(&pending.sender_id, &pending.recipient_id, step)
                         .await,
@@ -734,6 +777,9 @@ impl SimulationHarness {
         self.send_meta_message(requester, responder, step, &request)
             .await;
         self.metrics_tracker.record_missed_message_request();
+        self.log_action(format!(
+            "peer {requester} requested missed messages from {responder} at step {step}"
+        ));
         let Some(history) = self
             .message_history
             .get(&(responder.to_string(), requester.to_string()))
@@ -750,6 +796,11 @@ impl SimulationHarness {
             if self.deliver_missed_message(&entry.envelope, requester, step) {
                 delivered += 1;
             }
+        }
+        if delivered > 0 {
+            self.log_action(format!(
+                "peer {responder} delivered {delivered} missed messages to {requester} at step {step}"
+            ));
         }
         delivered
     }
@@ -799,6 +850,10 @@ impl SimulationHarness {
         if node.receive(message.clone()) {
             self.metrics_tracker.record_missed_message_delivery();
             self.record_delivery_metrics(&message, recipient_id, step);
+            self.log_action(format!(
+                "peer {recipient_id} received missed message {} at step {step}",
+                message.id
+            ));
             return true;
         }
         false
@@ -829,6 +884,9 @@ impl SimulationHarness {
             .push(message);
         self.metrics.store_forwards_stored = self.metrics.store_forwards_stored.saturating_add(1);
         self.metrics_tracker.record_store_forward_stored();
+        self.log_action(format!(
+            "peer {storage_peer_id} stored a store-forward message"
+        ));
     }
 
     fn select_storage_peer(&self, sender: &str, recipient: &str) -> Option<String> {
@@ -848,6 +906,7 @@ impl SimulationHarness {
 
     async fn forward_store_forwards(&mut self, online_set: &HashSet<String>) -> usize {
         let mut forwarded = 0usize;
+        let mut log_entries = Vec::new();
         let storage_peers: Vec<String> = self.stored_forwards.keys().cloned().collect();
         for storage_peer_id in storage_peers {
             if !online_set.contains(&storage_peer_id) {
@@ -864,6 +923,10 @@ impl SimulationHarness {
                             self.metrics.store_forwards_forwarded.saturating_add(1);
                         self.metrics_tracker
                             .record_store_forward_forwarded(&storage_peer_id);
+                        log_entries.push(format!(
+                            "peer {storage_peer_id} forwarded stored message to {}",
+                            entry.store_for_id
+                        ));
                         forwarded = forwarded.saturating_add(1);
                     } else {
                         remaining.push(entry);
@@ -871,6 +934,9 @@ impl SimulationHarness {
                 }
                 *stored = remaining;
             }
+        }
+        for entry in log_entries {
+            self.log_action(entry);
         }
         forwarded
     }
@@ -917,6 +983,18 @@ impl SimulationHarness {
                 .filter(|id| !previous_online.get(*id).copied().unwrap_or(false))
                 .cloned()
                 .collect();
+            let offline: Vec<String> = previous_online
+                .iter()
+                .filter(|(id, was_online)| **was_online && !online_set.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for node_id in &newly_online {
+                self.log_action(format!("peer {node_id} came online at step {step}"));
+            }
+            for node_id in &offline {
+                self.log_action(format!("peer {node_id} went offline at step {step}"));
+            }
 
             let _ = self.forward_store_forwards(&online_set).await;
 
@@ -1026,10 +1104,35 @@ impl SimulationHarness {
         let mut rolling_latency = RollingLatencyTracker::new(100);
         let mut previous_online: HashMap<String, bool> =
             self.nodes.keys().map(|id| (id.clone(), false)).collect();
+        let mut paused = false;
+        let mut stop_requested = false;
 
-        for step in 0..steps {
+        let mut step = 0usize;
+        while step < steps {
             while let Ok(command) = control_rx.try_recv() {
-                self.apply_control_command(command, &mut previous_online);
+                match command {
+                    SimulationControlCommand::SetPaused {
+                        paused: should_pause,
+                    } => {
+                        paused = should_pause;
+                        if paused {
+                            self.log_action("simulation paused".to_string());
+                        } else {
+                            self.log_action("simulation resumed".to_string());
+                        }
+                    }
+                    SimulationControlCommand::Stop => {
+                        stop_requested = true;
+                    }
+                    other => self.apply_control_command(other, &mut previous_online),
+                }
+            }
+            if stop_requested {
+                break;
+            }
+            if paused {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
             }
             let mut sent_messages = 0usize;
             let mut received_messages = 0usize;
@@ -1063,6 +1166,18 @@ impl SimulationHarness {
                 .filter(|id| !previous_online.get(*id).copied().unwrap_or(false))
                 .cloned()
                 .collect();
+            let offline: Vec<String> = previous_online
+                .iter()
+                .filter(|(id, was_online)| **was_online && !online_set.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for node_id in &newly_online {
+                self.log_action(format!("peer {node_id} came online at step {step}"));
+            }
+            for node_id in &offline {
+                self.log_action(format!("peer {node_id} went offline at step {step}"));
+            }
 
             let _ = self.forward_store_forwards(&online_set).await;
 
@@ -1157,6 +1272,7 @@ impl SimulationHarness {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+            step += 1;
         }
 
         self.metrics()
@@ -1666,6 +1782,7 @@ pub async fn run_simulation_scenario(
     let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
+    let steps = scenario.simulation.effective_steps();
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
@@ -1676,10 +1793,9 @@ pub async fn run_simulation_scenario(
         inputs.keypairs,
         inputs.timing,
         inputs.cohort_online_rates,
+        None,
     );
-    let metrics = harness
-        .run(scenario.simulation.steps, inputs.planned_sends)
-        .await;
+    let metrics = harness.run(steps, inputs.planned_sends).await;
     let report = harness.metrics_report();
     shutdown_tx.send(()).ok();
     Ok(SimulationReport { metrics, report })
@@ -1695,6 +1811,7 @@ where
     let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx) = start_relay(relay_config.clone().into_relay_config()).await;
     let inputs = build_simulation_inputs(&scenario.simulation);
+    let steps = scenario.simulation.effective_steps();
     let mut harness = SimulationHarness::new(
         base_url,
         inputs.nodes,
@@ -1705,9 +1822,10 @@ where
         inputs.keypairs,
         inputs.timing,
         inputs.cohort_online_rates,
+        None,
     );
     let metrics = harness
-        .run_with_progress(scenario.simulation.steps, inputs.planned_sends, |update| {
+        .run_with_progress(steps, inputs.planned_sends, |update| {
             on_step(update);
         })
         .await;
@@ -1970,21 +2088,22 @@ fn cohort_name(cohort: &OnlineCohortDefinition) -> &str {
 }
 
 fn build_availability_schedule(config: &SimulationConfig, rng: &mut impl Rng) -> Vec<bool> {
+    let steps = config.effective_steps();
     let Some(availability) = &config.availability else {
-        return vec![true; config.steps];
+        return vec![true; steps];
     };
     match availability {
-        OnlineAvailability::Bernoulli { p_online } => (0..config.steps)
-            .map(|_| rng.gen::<f64>() < *p_online)
-            .collect(),
+        OnlineAvailability::Bernoulli { p_online } => {
+            (0..steps).map(|_| rng.gen::<f64>() < *p_online).collect()
+        }
         OnlineAvailability::Markov {
             p_online_given_online,
             p_online_given_offline,
             start_online_prob,
         } => {
-            let mut schedule = Vec::with_capacity(config.steps);
+            let mut schedule = Vec::with_capacity(steps);
             let mut online = rng.gen::<f64>() < *start_online_prob;
-            for _ in 0..config.steps {
+            for _ in 0..steps {
                 schedule.push(online);
                 let next_prob = if online {
                     *p_online_given_online
@@ -2058,6 +2177,7 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
     let mut cohort_online_counts: HashMap<String, usize> = HashMap::new();
     let mut cohort_total_counts: HashMap<String, usize> = HashMap::new();
     let simulated_seconds_per_step = simulated_seconds_per_step(config);
+    let steps = config.effective_steps();
     let cohorts = if config.cohorts.is_empty() {
         None
     } else {
@@ -2068,8 +2188,7 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
         let (cohort_name, schedule) = if let Some(cohorts) = cohorts {
             let cohort = select_cohort(cohorts, rng);
             let name = cohort_name(cohort).to_string();
-            let schedule =
-                build_cohort_schedule(cohort, config.steps, simulated_seconds_per_step, rng);
+            let schedule = build_cohort_schedule(cohort, steps, simulated_seconds_per_step, rng);
             (name, schedule)
         } else {
             let name = "legacy".to_string();
@@ -2112,6 +2231,7 @@ pub fn build_planned_sends(
 ) -> Vec<PlannedSend> {
     let mut planned = Vec::new();
     let mut counter = 0usize;
+    let steps = config.effective_steps();
     for node_id in &config.node_ids {
         let friends = graph
             .get(node_id)
@@ -2133,7 +2253,7 @@ pub fn build_planned_sends(
                 } else {
                     lambda_per_step.unwrap_or(0.0)
                 };
-                for step in 0..config.steps {
+                for step in 0..steps {
                     let count = sample_poisson(rng, per_step);
                     for _ in 0..count {
                         let recipient = friends[rng.gen_range(0..friends.len())].clone();
@@ -2167,10 +2287,10 @@ pub fn build_planned_sends(
             } => {
                 let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
                 let use_hourly_weights = weights.len() == SIMULATION_HOURS_PER_DAY;
-                let weights = if weights.len() == config.steps || use_hourly_weights {
+                let weights = if weights.len() == steps || use_hourly_weights {
                     weights.clone()
                 } else {
-                    vec![1.0; config.steps.max(1)]
+                    vec![1.0; steps.max(1)]
                 };
                 for _ in 0..*total_posts {
                     let step = if use_hourly_weights {
@@ -2179,7 +2299,7 @@ pub fn build_planned_sends(
                         let simulated_seconds = (hour as f64 * 3600.0) + offset_seconds;
                         let step =
                             (simulated_seconds / simulated_seconds_per_step).floor() as usize;
-                        step.min(config.steps.saturating_sub(1))
+                        step.min(steps.saturating_sub(1))
                     } else {
                         sample_weighted_index(rng, &weights)
                     };
