@@ -66,7 +66,7 @@ async fn main() -> Result<(), String> {
     } else {
         run_simulation_scenario(scenario).await?
     };
-    let output = serde_json::to_string_pretty(&report.metrics).map_err(|err| err.to_string())?;
+    let output = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
     println!("{output}");
     Ok(())
 }
@@ -419,7 +419,7 @@ fn format_size_summary(summary: &SizeSummary) -> String {
     };
     let min = summary.min.unwrap_or(0);
     let max = summary.max.unwrap_or(0);
-    format!("min {min} / avg {average:.2} / max {max}")
+    format!("min {min} bytes / avg {average:.2} bytes / max {max} bytes")
 }
 
 fn message_kind_label(kind: &MessageKind) -> &'static str {

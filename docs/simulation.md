@@ -259,8 +259,10 @@ and values must stay within protocol bounds (1s minimum, 7 days maximum).
 
 ## Simulation metrics
 
-The simulation reports a `SimulationMetrics` struct with counters that track how messages move
-through the system. Each field increments in specific parts of the simulation loop:
+Running `tenet-sim` prints a `SimulationReport` JSON blob that includes both real-time counters
+(`metrics`) and aggregate summaries (`report`). The `metrics` section is a `SimulationMetrics`
+struct with counters that track how messages move through the system. Each field increments in
+specific parts of the simulation loop:
 
 - `planned_messages`: set to the number of planned sends (`plan.len()`) at the start of a run, so
   it reflects how many messages the scenario intended to send.
@@ -285,6 +287,20 @@ Common relationships to expect:
 - Store-and-forward counters typically decrease in order (`store_forwards_stored` ≥
   `store_forwards_forwarded` ≥ `store_forwards_delivered`) since forwarding and delivery depend on
   online peers and successful inbox delivery.
+
+The `report` section (`SimulationMetricsReport`) adds aggregate summaries:
+
+- `peer_feed_messages`: min/avg/max feed message counts per peer.
+- `stored_unforwarded_by_peer`: min/avg/max counts of stored-but-not-forwarded messages per peer.
+- `stored_forwarded_by_peer`: min/avg/max counts of stored-and-forwarded messages per peer.
+- `sent_messages_by_kind`: per message kind min/avg/max sent counts per peer.
+- `message_size_by_kind`: per message kind min/avg/max payload sizes in **bytes**.
+
+If a message kind has `no samples`, it means the scenario did not generate that kind. The current
+scenarios primarily emit direct messages and store-and-forward traffic, so `public` and
+`friend_group` kinds will remain at zero until scenarios start scheduling those messages. Meta
+messages are emitted for online broadcasts, acknowledgements, and missed-message requests; if the
+`meta` kind remains at zero it indicates a simulation bug rather than an optional feature.
 
 ## Manual TUI test
 

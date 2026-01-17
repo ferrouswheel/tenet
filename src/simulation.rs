@@ -264,7 +264,7 @@ pub struct SimulationMetricsReport {
     pub aggregate_metrics: SimulationAggregateMetrics,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SimulationReport {
     pub metrics: SimulationMetrics,
     pub report: SimulationMetricsReport,
@@ -666,16 +666,18 @@ impl SimulationHarness {
             .unwrap_or(0)
     }
 
-    fn enqueue_online_broadcasts(&mut self, node_id: &str, step: usize) {
+    async fn enqueue_online_broadcasts(&mut self, node_id: &str, step: usize) {
         let Some(neighbors) = self.neighbors.get(node_id) else {
             return;
         };
+        let neighbors = neighbors.clone();
         for neighbor in neighbors {
             let meta = MetaMessage::Online {
                 peer_id: node_id.to_string(),
                 timestamp: step as u64,
             };
-            let _ = build_meta_payload(&meta);
+            self.send_meta_message(node_id, &neighbor, step, &meta)
+                .await;
             self.pending_online_broadcasts.push(PendingOnlineBroadcast {
                 sender_id: node_id.to_string(),
                 recipient_id: neighbor.clone(),
@@ -686,7 +688,7 @@ impl SimulationHarness {
         }
     }
 
-    fn process_pending_online_broadcasts(
+    async fn process_pending_online_broadcasts(
         &mut self,
         step: usize,
         online_nodes: &HashSet<String>,
@@ -703,13 +705,13 @@ impl SimulationHarness {
                     peer_id: pending.recipient_id.clone(),
                     online_timestamp: pending.sent_step as u64,
                 };
-                let _ = build_meta_payload(&ack);
+                self.send_meta_message(&pending.recipient_id, &pending.sender_id, step, &ack)
+                    .await;
                 self.metrics_tracker.record_ack();
-                delivered = delivered.saturating_add(self.handle_message_request(
-                    &pending.sender_id,
-                    &pending.recipient_id,
-                    step,
-                ));
+                delivered = delivered.saturating_add(
+                    self.handle_message_request(&pending.sender_id, &pending.recipient_id, step)
+                        .await,
+                );
                 continue;
             }
             remaining.push(pending);
@@ -718,13 +720,19 @@ impl SimulationHarness {
         delivered
     }
 
-    fn handle_message_request(&mut self, requester: &str, responder: &str, step: usize) -> usize {
+    async fn handle_message_request(
+        &mut self,
+        requester: &str,
+        responder: &str,
+        step: usize,
+    ) -> usize {
         let last_seen = self.last_seen_for(requester, responder);
         let request = MetaMessage::MessageRequest {
             peer_id: responder.to_string(),
             since_timestamp: last_seen,
         };
-        let _ = build_meta_payload(&request);
+        self.send_meta_message(requester, responder, step, &request)
+            .await;
         self.metrics_tracker.record_missed_message_request();
         let Some(history) = self
             .message_history
@@ -744,6 +752,34 @@ impl SimulationHarness {
             }
         }
         delivered
+    }
+
+    async fn send_meta_message(
+        &mut self,
+        sender_id: &str,
+        recipient_id: &str,
+        step: usize,
+        meta: &MetaMessage,
+    ) {
+        let Ok(payload) = build_meta_payload(meta) else {
+            return;
+        };
+        let Ok(envelope) = build_envelope_from_payload(
+            sender_id.to_string(),
+            recipient_id.to_string(),
+            None,
+            None,
+            step as u64,
+            self.ttl_seconds,
+            MessageKind::Meta,
+            None,
+            payload,
+        ) else {
+            return;
+        };
+        self.metrics_tracker
+            .record_meta_send(sender_id.to_string(), &envelope);
+        let _ = post_envelope(&self.relay_base_url, &envelope).await;
     }
 
     fn deliver_missed_message(
@@ -907,10 +943,12 @@ impl SimulationHarness {
             }
 
             for node_id in &newly_online {
-                self.enqueue_online_broadcasts(node_id, step);
+                self.enqueue_online_broadcasts(node_id, step).await;
             }
 
-            let _ = self.process_pending_online_broadcasts(step, &online_set);
+            let _ = self
+                .process_pending_online_broadcasts(step, &online_set)
+                .await;
 
             for node_id in &online_ids {
                 if newly_online.contains(node_id) {
@@ -1056,10 +1094,12 @@ impl SimulationHarness {
             }
 
             for node_id in &newly_online {
-                self.enqueue_online_broadcasts(node_id, step);
+                self.enqueue_online_broadcasts(node_id, step).await;
             }
 
-            let missed_deliveries = self.process_pending_online_broadcasts(step, &online_set);
+            let missed_deliveries = self
+                .process_pending_online_broadcasts(step, &online_set)
+                .await;
             received_messages = received_messages.saturating_add(missed_deliveries);
 
             for node_id in &online_ids {
@@ -1543,6 +1583,16 @@ impl MetricsTracker {
 
     fn record_store_forward_delivery(&mut self) {
         self.store_forwards_delivered = self.store_forwards_delivered.saturating_add(1);
+    }
+
+    fn record_meta_send(&mut self, sender_id: String, envelope: &Envelope) {
+        let sender_entry = self.per_peer_sent_by_kind.entry(sender_id).or_default();
+        let kind = envelope.header.message_kind.clone();
+        *sender_entry.entry(kind.clone()).or_insert(0) += 1;
+        self.message_sizes_by_kind
+            .entry(kind)
+            .or_default()
+            .record(envelope.header.payload_size);
     }
 
     fn sent_message_summary_by_kind(
