@@ -16,16 +16,15 @@ use crate::protocol::{
 };
 use crate::relay::{app, RelayConfig, RelayControl, RelayState};
 
-mod client;
 
-pub use client::SimulationClient;
-use client::{Client, ClientContext};
+pub use crate::client::SimulationClient;
+use crate::client::{Client, ClientContext};
 
-const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
-const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
-const SIMULATION_ACK_WINDOW_STEPS: usize = 10;
-const SIMULATION_HOURS_PER_DAY: usize = 24;
-const MESSAGE_KIND_SUMMARIES: [MessageKind; 5] = [
+pub const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
+pub const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
+pub const SIMULATION_ACK_WINDOW_STEPS: usize = 10;
+pub const SIMULATION_HOURS_PER_DAY: usize = 24;
+pub const MESSAGE_KIND_SUMMARIES: [MessageKind; 5] = [
     MessageKind::Public,
     MessageKind::Meta,
     MessageKind::Direct,
@@ -406,9 +405,9 @@ pub struct PlannedSend {
 }
 
 #[derive(Debug, Clone)]
-struct HistoricalMessage {
-    send_step: usize,
-    envelope: Envelope,
+pub struct HistoricalMessage {
+    pub send_step: usize,
+    pub envelope: Envelope,
 }
 
 #[derive(Debug)]
@@ -1338,7 +1337,7 @@ impl SizeStats {
 }
 
 #[derive(Debug)]
-struct MetricsTracker {
+pub struct MetricsTracker {
     per_sender_recipient_counts: HashMap<SenderRecipient, usize>,
     first_delivery_latency: LatencyStats,
     all_recipients_delivery_latency: LatencyStats,
@@ -1387,7 +1386,7 @@ impl MetricsTracker {
         self.simulated_seconds_per_step = simulated_seconds_per_step.max(0.0);
     }
 
-    fn record_send(&mut self, message: &SimMessage, step: usize, envelope: &Envelope) {
+    pub fn record_send(&mut self, message: &SimMessage, step: usize, envelope: &Envelope) {
         let key = SenderRecipient {
             sender: message.sender.clone(),
             recipient: message.recipient.clone(),
@@ -1415,7 +1414,7 @@ impl MetricsTracker {
             .record(envelope.header.payload_size);
     }
 
-    fn record_delivery(
+    pub fn record_delivery(
         &mut self,
         message_id: &str,
         recipient_id: &str,
@@ -1458,27 +1457,27 @@ impl MetricsTracker {
         Some(latency)
     }
 
-    fn record_online_broadcast(&mut self) {
+    pub fn record_online_broadcast(&mut self) {
         self.online_broadcasts_sent = self.online_broadcasts_sent.saturating_add(1);
     }
 
-    fn record_ack(&mut self) {
+    pub fn record_ack(&mut self) {
         self.acks_received = self.acks_received.saturating_add(1);
     }
 
-    fn record_missed_message_request(&mut self) {
+    pub fn record_missed_message_request(&mut self) {
         self.missed_message_requests_sent = self.missed_message_requests_sent.saturating_add(1);
     }
 
-    fn record_missed_message_delivery(&mut self) {
+    pub fn record_missed_message_delivery(&mut self) {
         self.missed_message_deliveries = self.missed_message_deliveries.saturating_add(1);
     }
 
-    fn record_store_forward_stored(&mut self) {
+    pub fn record_store_forward_stored(&mut self) {
         self.store_forwards_stored = self.store_forwards_stored.saturating_add(1);
     }
 
-    fn record_store_forward_forwarded(&mut self, storage_peer_id: &str) {
+    pub fn record_store_forward_forwarded(&mut self, storage_peer_id: &str) {
         self.store_forwards_forwarded = self.store_forwards_forwarded.saturating_add(1);
         *self
             .per_peer_store_forwarded
@@ -1486,11 +1485,11 @@ impl MetricsTracker {
             .or_insert(0) += 1;
     }
 
-    fn record_store_forward_delivery(&mut self) {
+    pub fn record_store_forward_delivery(&mut self) {
         self.store_forwards_delivered = self.store_forwards_delivered.saturating_add(1);
     }
 
-    fn record_meta_send(&mut self, sender_id: String, envelope: &Envelope) {
+    pub fn record_meta_send(&mut self, sender_id: String, envelope: &Envelope) {
         let sender_entry = self.per_peer_sent_by_kind.entry(sender_id).or_default();
         let kind = envelope.header.message_kind.clone();
         *sender_entry.entry(kind.clone()).or_insert(0) += 1;
@@ -1642,7 +1641,7 @@ where
 }
 
 #[derive(Debug)]
-struct RollingLatencyTracker {
+pub struct RollingLatencyTracker {
     window: usize,
     samples: VecDeque<usize>,
 }
@@ -1655,7 +1654,7 @@ impl RollingLatencyTracker {
         }
     }
 
-    fn record(&mut self, latency: usize) {
+    pub fn record(&mut self, latency: usize) {
         if self.samples.len() == self.window {
             self.samples.pop_front();
         }

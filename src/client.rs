@@ -10,7 +10,7 @@ use crate::protocol::{
     decrypt_encrypted_payload, Envelope, MessageKind, MetaMessage,
 };
 
-use super::{
+use crate::simulation::{
     HistoricalMessage, MessageEncryption, MetricsTracker, RollingLatencyTracker, SimMessage,
     SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
