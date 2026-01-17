@@ -1,0 +1,603 @@
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use rand::distributions::Uniform;
+use rand::{Rng, RngCore, SeedableRng};
+use rand_chacha::{ChaCha20Rng, ChaCha8Rng};
+use serde::{Deserialize, Serialize};
+
+use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
+use crate::protocol::{
+    build_encrypted_payload, build_plaintext_payload, ContentId, Envelope, Payload,
+};
+
+use super::random::{generate_message_body, sample_poisson, sample_weighted_index, sample_zipf};
+use super::{
+    start_relay, ClusteringConfig, FriendsPerNode, MessageEncryption, OnlineAvailability,
+    OnlineCohortDefinition, PostFrequency, SimulationClient, SimulationConfig, SimulationHarness,
+    SimulationReport, SimulationScenarioConfig, SimulationStepUpdate, SimulationTimingConfig,
+    SIMULATION_HOURS_PER_DAY, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimMessage {
+    pub id: String,
+    pub sender: String,
+    pub recipient: String,
+    pub body: String,
+    pub payload: Payload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedSend {
+    pub step: usize,
+    pub message: SimMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoricalMessage {
+    pub send_step: usize,
+    pub envelope: Envelope,
+}
+
+#[derive(Debug)]
+pub struct SimulationInputs {
+    pub clients: Vec<SimulationClient>,
+    pub planned_sends: Vec<PlannedSend>,
+    pub direct_links: HashSet<(String, String)>,
+    pub keypairs: HashMap<String, StoredKeypair>,
+    pub encryption: MessageEncryption,
+    pub cohort_online_rates: HashMap<String, f64>,
+    pub timing: SimulationTimingConfig,
+}
+
+pub struct OnlineSchedulePlan {
+    pub schedules: HashMap<String, Vec<bool>>,
+    pub cohort_online_rates: HashMap<String, f64>,
+}
+
+pub async fn run_simulation_scenario(
+    scenario: SimulationScenarioConfig,
+) -> Result<SimulationReport, String> {
+    let relay_config = scenario.relay.clone();
+    let (base_url, shutdown_tx, _relay_control) =
+        start_relay(relay_config.clone().into_relay_config()).await;
+    let inputs = build_simulation_inputs(&scenario.simulation);
+    let steps = scenario.simulation.effective_steps();
+    let mut harness = SimulationHarness::new(
+        base_url,
+        inputs.clients,
+        inputs.direct_links,
+        scenario.direct_enabled.unwrap_or(true),
+        relay_config.ttl_seconds,
+        inputs.encryption,
+        inputs.keypairs,
+        inputs.timing,
+        inputs.cohort_online_rates,
+        None,
+        None,
+    );
+    let metrics = harness.run(steps, inputs.planned_sends).await;
+    let report = harness.metrics_report();
+    shutdown_tx.send(()).ok();
+    Ok(SimulationReport { metrics, report })
+}
+
+pub async fn run_simulation_scenario_with_progress<F>(
+    scenario: SimulationScenarioConfig,
+    mut on_step: F,
+) -> Result<SimulationReport, String>
+where
+    F: FnMut(SimulationStepUpdate),
+{
+    let relay_config = scenario.relay.clone();
+    let (base_url, shutdown_tx, _relay_control) =
+        start_relay(relay_config.clone().into_relay_config()).await;
+    let inputs = build_simulation_inputs(&scenario.simulation);
+    let steps = scenario.simulation.effective_steps();
+    let mut harness = SimulationHarness::new(
+        base_url,
+        inputs.clients,
+        inputs.direct_links,
+        scenario.direct_enabled.unwrap_or(true),
+        relay_config.ttl_seconds,
+        inputs.encryption,
+        inputs.keypairs,
+        inputs.timing,
+        inputs.cohort_online_rates,
+        None,
+        None,
+    );
+    let metrics = harness
+        .run_with_progress(steps, inputs.planned_sends, |update| {
+            on_step(update);
+        })
+        .await;
+    let report = harness.metrics_report();
+    shutdown_tx.send(()).ok();
+    Ok(SimulationReport { metrics, report })
+}
+
+pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
+    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+    let encryption = config
+        .encryption
+        .clone()
+        .unwrap_or(MessageEncryption::Plaintext);
+    let mut crypto_rng = ChaCha20Rng::seed_from_u64(config.seed ^ 0x5A17_5EED);
+    let graph = build_friend_graph(config, &mut rng);
+    let schedule_plan = build_online_schedules(config, &mut rng);
+    let mut keypairs = HashMap::new();
+    for node_id in &config.node_ids {
+        keypairs.insert(node_id.clone(), generate_keypair_with_rng(&mut crypto_rng));
+    }
+    let planned_sends = build_planned_sends(
+        config,
+        &mut rng,
+        &graph,
+        &encryption,
+        &keypairs,
+        if matches!(encryption, MessageEncryption::Encrypted) {
+            Some(&mut crypto_rng as &mut dyn RngCore)
+        } else {
+            None
+        },
+    );
+    let mut direct_links = HashSet::new();
+    let mut clients = Vec::new();
+    for node_id in &config.node_ids {
+        if let Some(friends) = graph.get(node_id) {
+            for friend in friends {
+                direct_links.insert((node_id.clone(), friend.clone()));
+            }
+        }
+        let schedule = schedule_plan
+            .schedules
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default();
+        clients.push(SimulationHarness::build_client(node_id, schedule));
+    }
+    SimulationInputs {
+        clients,
+        planned_sends,
+        direct_links,
+        keypairs,
+        encryption,
+        cohort_online_rates: schedule_plan.cohort_online_rates,
+        timing: SimulationTimingConfig {
+            base_seconds_per_step: config.simulated_time.seconds_per_step as f64,
+            speed_factor: config.simulated_time.default_speed_factor.max(0.0),
+            base_real_time_per_step: Duration::ZERO,
+        },
+    }
+}
+
+pub fn build_friend_graph(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+) -> HashMap<String, Vec<String>> {
+    if let Some(clustering) = &config.clustering {
+        return build_clustered_friend_graph(config, clustering, rng);
+    }
+    let mut graph = HashMap::new();
+    let uniform = Uniform::new_inclusive(0usize, config.node_ids.len().saturating_sub(1));
+    for node_id in &config.node_ids {
+        let friends_target =
+            sample_friends_target(config, rng, config.node_ids.len().saturating_sub(1));
+
+        let mut friends = HashSet::new();
+        while friends.len() < friends_target
+            && friends.len() < config.node_ids.len().saturating_sub(1)
+        {
+            let idx = rng.sample(uniform);
+            let candidate = &config.node_ids[idx];
+            if candidate != node_id {
+                friends.insert(candidate.clone());
+            }
+        }
+        graph.insert(node_id.clone(), friends.into_iter().collect());
+    }
+    graph
+}
+
+fn build_clustered_friend_graph(
+    config: &SimulationConfig,
+    clustering: &ClusteringConfig,
+    rng: &mut impl Rng,
+) -> HashMap<String, Vec<String>> {
+    let mut clusters = Vec::new();
+    let mut start = 0usize;
+    let total = config.node_ids.len();
+    for size in &clustering.cluster_sizes {
+        if start >= total {
+            break;
+        }
+        let end = (start + *size).min(total);
+        clusters.push(config.node_ids[start..end].to_vec());
+        start = end;
+    }
+    if start < total {
+        clusters.push(config.node_ids[start..].to_vec());
+    }
+    if clusters.is_empty() {
+        clusters.push(config.node_ids.clone());
+    }
+
+    let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
+    for cluster in &clusters {
+        for node_id in cluster {
+            let max_friends = cluster.len().saturating_sub(1);
+            let friends_target = sample_friends_target(config, rng, max_friends);
+            let mut friends = HashSet::new();
+            while friends.len() < friends_target && friends.len() < max_friends {
+                let idx = rng.gen_range(0..cluster.len());
+                let candidate = &cluster[idx];
+                if candidate != node_id {
+                    friends.insert(candidate.clone());
+                }
+            }
+            graph.insert(node_id.clone(), friends);
+        }
+    }
+
+    let inter_prob = clustering
+        .inter_cluster_friend_probability
+        .max(0.0)
+        .min(1.0);
+    if inter_prob > 0.0 {
+        let mut cluster_lookup = HashMap::new();
+        for (index, cluster) in clusters.iter().enumerate() {
+            for node_id in cluster {
+                cluster_lookup.insert(node_id, index);
+            }
+        }
+        for node_id in &config.node_ids {
+            let node_cluster = cluster_lookup.get(node_id);
+            for candidate in &config.node_ids {
+                if candidate == node_id {
+                    continue;
+                }
+                let candidate_cluster = cluster_lookup.get(candidate);
+                if node_cluster == candidate_cluster {
+                    continue;
+                }
+                if rng.gen::<f64>() < inter_prob {
+                    graph
+                        .entry(node_id.clone())
+                        .or_insert_with(HashSet::new)
+                        .insert(candidate.clone());
+                }
+            }
+        }
+    }
+
+    graph
+        .into_iter()
+        .map(|(node_id, friends)| (node_id, friends.into_iter().collect()))
+        .collect()
+}
+
+fn sample_friends_target(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+    max_friends: usize,
+) -> usize {
+    match &config.friends_per_node {
+        FriendsPerNode::Uniform { min, max } => rng.gen_range(*min..=(*max).min(max_friends)),
+        FriendsPerNode::Poisson { lambda } => sample_poisson(rng, *lambda).min(max_friends),
+        FriendsPerNode::Zipf { max, exponent } => {
+            sample_zipf(rng, (*max).min(max_friends), *exponent)
+        }
+    }
+}
+
+fn simulated_seconds_per_step(config: &SimulationConfig) -> f64 {
+    let seconds = config.simulated_time.seconds_per_step as f64;
+    let factor = config.simulated_time.default_speed_factor.max(0.0);
+    seconds * factor
+}
+
+fn select_cohort<'a>(
+    cohorts: &'a [OnlineCohortDefinition],
+    rng: &mut impl Rng,
+) -> &'a OnlineCohortDefinition {
+    let weights: Vec<f64> = cohorts.iter().map(cohort_share).collect();
+    let index = sample_weighted_index(rng, &weights);
+    cohorts
+        .get(index)
+        .unwrap_or_else(|| cohorts.first().expect("cohort list cannot be empty"))
+}
+
+fn cohort_share(cohort: &OnlineCohortDefinition) -> f64 {
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { share, .. }
+        | OnlineCohortDefinition::RarelyOnline { share, .. }
+        | OnlineCohortDefinition::Diurnal { share, .. } => *share,
+    }
+}
+
+fn cohort_name(cohort: &OnlineCohortDefinition) -> &str {
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { name, .. }
+        | OnlineCohortDefinition::RarelyOnline { name, .. }
+        | OnlineCohortDefinition::Diurnal { name, .. } => name,
+    }
+}
+
+fn build_availability_schedule(config: &SimulationConfig, rng: &mut impl Rng) -> Vec<bool> {
+    let steps = config.effective_steps();
+    let Some(availability) = &config.availability else {
+        return vec![true; steps];
+    };
+    match availability {
+        OnlineAvailability::Bernoulli { p_online } => {
+            (0..steps).map(|_| rng.gen::<f64>() < *p_online).collect()
+        }
+        OnlineAvailability::Markov {
+            p_online_given_online,
+            p_online_given_offline,
+            start_online_prob,
+        } => {
+            let mut schedule = Vec::with_capacity(steps);
+            let mut online = rng.gen::<f64>() < *start_online_prob;
+            for _ in 0..steps {
+                schedule.push(online);
+                let next_prob = if online {
+                    *p_online_given_online
+                } else {
+                    *p_online_given_offline
+                };
+                online = rng.gen::<f64>() < next_prob;
+            }
+            schedule
+        }
+    }
+}
+
+fn build_cohort_schedule(
+    cohort: &OnlineCohortDefinition,
+    steps: usize,
+    simulated_seconds_per_step: f64,
+    rng: &mut impl Rng,
+) -> Vec<bool> {
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { .. } => vec![true; steps],
+        OnlineCohortDefinition::RarelyOnline {
+            online_probability, ..
+        } => (0..steps)
+            .map(|_| rng.gen::<f64>() < online_probability.clamp(0.0, 1.0))
+            .collect(),
+        OnlineCohortDefinition::Diurnal {
+            online_probability,
+            timezone_offset_hours,
+            hourly_weights,
+            ..
+        } => {
+            let weights = normalize_hourly_weights(hourly_weights);
+            let max_weight = weights
+                .iter()
+                .copied()
+                .fold(0.0_f64, |max, weight| max.max(weight));
+            let max_weight = if max_weight > 0.0 { max_weight } else { 1.0 };
+            let base_probability = online_probability.clamp(0.0, 1.0);
+            (0..steps)
+                .map(|step| {
+                    let hour = ((step as f64 * simulated_seconds_per_step) / 3600.0).floor() as i64;
+                    let hour = (hour + *timezone_offset_hours as i64)
+                        .rem_euclid(SIMULATION_HOURS_PER_DAY as i64)
+                        as usize;
+                    let weight_factor = weights[hour] / max_weight;
+                    rng.gen::<f64>() < (base_probability * weight_factor).clamp(0.0, 1.0)
+                })
+                .collect()
+        }
+    }
+}
+
+fn normalize_hourly_weights(weights: &[f64]) -> Vec<f64> {
+    if weights.len() == SIMULATION_HOURS_PER_DAY {
+        return weights.to_vec();
+    }
+    vec![
+        0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9,
+        1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25,
+    ]
+}
+
+pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> OnlineSchedulePlan {
+    let mut schedules = HashMap::new();
+    let mut cohort_online_counts: HashMap<String, usize> = HashMap::new();
+    let mut cohort_total_counts: HashMap<String, usize> = HashMap::new();
+    let simulated_seconds_per_step = simulated_seconds_per_step(config);
+    let steps = config.effective_steps();
+    let cohorts = if config.cohorts.is_empty() {
+        None
+    } else {
+        Some(config.cohorts.as_slice())
+    };
+
+    for node_id in &config.node_ids {
+        let (cohort_name, schedule) = if let Some(cohorts) = cohorts {
+            let cohort = select_cohort(cohorts, rng);
+            let name = cohort_name(cohort).to_string();
+            let schedule = build_cohort_schedule(cohort, steps, simulated_seconds_per_step, rng);
+            (name, schedule)
+        } else {
+            let name = "legacy".to_string();
+            let schedule = build_availability_schedule(config, rng);
+            (name, schedule)
+        };
+
+        let online_count = schedule.iter().filter(|online| **online).count();
+        *cohort_online_counts.entry(cohort_name.clone()).or_insert(0) += online_count;
+        *cohort_total_counts.entry(cohort_name.clone()).or_insert(0) += schedule.len();
+        schedules.insert(node_id.clone(), schedule);
+    }
+
+    let cohort_online_rates = cohort_total_counts
+        .into_iter()
+        .map(|(cohort, total)| {
+            let online = cohort_online_counts.get(&cohort).copied().unwrap_or(0);
+            let rate = if total > 0 {
+                online as f64 / total as f64
+            } else {
+                0.0
+            };
+            (cohort, rate)
+        })
+        .collect();
+
+    OnlineSchedulePlan {
+        schedules,
+        cohort_online_rates,
+    }
+}
+
+pub fn build_planned_sends(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+    graph: &HashMap<String, Vec<String>>,
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    mut crypto_rng: Option<&mut dyn RngCore>,
+) -> Vec<PlannedSend> {
+    let mut planned = Vec::new();
+    let mut counter = 0usize;
+    let steps = config.effective_steps();
+    for node_id in &config.node_ids {
+        let friends = graph
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if friends.is_empty() {
+            continue;
+        }
+        match &config.post_frequency {
+            PostFrequency::Poisson {
+                lambda_per_step,
+                lambda_per_hour,
+            } => {
+                let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
+                let per_step = if let Some(lambda_per_hour) = lambda_per_hour {
+                    lambda_per_hour * (simulated_seconds_per_step / 3600.0)
+                } else {
+                    lambda_per_step.unwrap_or(0.0)
+                };
+                for step in 0..steps {
+                    let count = sample_poisson(rng, per_step);
+                    for _ in 0..count {
+                        let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                        let body = generate_message_body(rng, &config.message_size_distribution);
+                        let payload = build_message_payload(
+                            encryption,
+                            keypairs,
+                            &mut crypto_rng,
+                            &body,
+                            &recipient,
+                            node_id,
+                            counter,
+                        );
+                        let message_id =
+                            ContentId::from_value(&payload).expect("serialize simulation payload");
+                        let message = SimMessage {
+                            id: message_id.0.clone(),
+                            sender: node_id.clone(),
+                            recipient,
+                            body,
+                            payload,
+                        };
+                        counter += 1;
+                        planned.push(PlannedSend { step, message });
+                    }
+                }
+            }
+            PostFrequency::WeightedSchedule {
+                weights,
+                total_posts,
+            } => {
+                let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
+                let use_hourly_weights = weights.len() == SIMULATION_HOURS_PER_DAY;
+                let weights = if weights.len() == steps || use_hourly_weights {
+                    weights.clone()
+                } else {
+                    vec![1.0; steps.max(1)]
+                };
+                for _ in 0..*total_posts {
+                    let step = if use_hourly_weights {
+                        let hour = sample_weighted_index(rng, &weights);
+                        let offset_seconds = rng.gen_range(0.0..3600.0);
+                        let simulated_seconds = (hour as f64 * 3600.0) + offset_seconds;
+                        let step =
+                            (simulated_seconds / simulated_seconds_per_step).floor() as usize;
+                        step.min(steps.saturating_sub(1))
+                    } else {
+                        sample_weighted_index(rng, &weights)
+                    };
+                    let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                    let body = generate_message_body(rng, &config.message_size_distribution);
+                    let payload = build_message_payload(
+                        encryption,
+                        keypairs,
+                        &mut crypto_rng,
+                        &body,
+                        &recipient,
+                        node_id,
+                        counter,
+                    );
+                    let message_id =
+                        ContentId::from_value(&payload).expect("serialize simulation payload");
+                    let message = SimMessage {
+                        id: message_id.0.clone(),
+                        sender: node_id.clone(),
+                        recipient,
+                        body,
+                        payload,
+                    };
+                    counter += 1;
+                    planned.push(PlannedSend { step, message });
+                }
+            }
+        }
+    }
+    planned
+}
+
+fn build_message_payload(
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    crypto_rng: &mut Option<&mut dyn RngCore>,
+    body: &str,
+    recipient: &str,
+    sender: &str,
+    counter: usize,
+) -> Payload {
+    match encryption {
+        MessageEncryption::Plaintext => {
+            let salt = format!("{sender}-{counter}");
+            build_plaintext_payload(body.to_string(), salt.as_bytes())
+        }
+        MessageEncryption::Encrypted => {
+            let keypair = keypairs.get(recipient).expect("missing recipient keypair");
+            let rng = crypto_rng.as_deref_mut().expect("missing crypto rng");
+            let mut content_key = [0u8; CONTENT_KEY_SIZE];
+            let mut nonce = [0u8; NONCE_SIZE];
+            let mut sender_seed = [0u8; 32];
+            rng.fill_bytes(&mut content_key);
+            rng.fill_bytes(&mut nonce);
+            rng.fill_bytes(&mut sender_seed);
+            build_encrypted_payload(
+                body.as_bytes(),
+                &keypair.public_key_hex,
+                SIMULATION_PAYLOAD_AAD,
+                SIMULATION_HPKE_INFO,
+                &content_key,
+                &nonce,
+                Some(sender_seed),
+            )
+            .expect("encrypt payload")
+        }
+    }
+}
