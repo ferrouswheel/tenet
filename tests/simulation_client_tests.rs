@@ -62,6 +62,8 @@ async fn simulation_client_direct_and_store_forward_paths_increment_metrics() {
         ],
     );
     let mut keypairs = HashMap::new();
+    keypairs.insert("node-a".to_string(), generate_keypair());
+    keypairs.insert("node-b".to_string(), generate_keypair());
     keypairs.insert("node-c".to_string(), generate_keypair());
 
     let mut harness = SimulationHarness::new(
@@ -156,6 +158,10 @@ async fn simulation_client_online_handshake_updates_metrics() {
         &[("node-a", "node-b"), ("node-b", "node-a")],
     );
 
+    let mut keypairs = HashMap::new();
+    keypairs.insert("node-a".to_string(), generate_keypair());
+    keypairs.insert("node-b".to_string(), generate_keypair());
+
     let mut harness = SimulationHarness::new(
         base_url,
         clients,
@@ -163,7 +169,7 @@ async fn simulation_client_online_handshake_updates_metrics() {
         true,
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
-        HashMap::new(),
+        keypairs,
         SimulationTimingConfig {
             base_seconds_per_step: 60.0,
             speed_factor: 1.0,

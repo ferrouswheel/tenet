@@ -118,6 +118,7 @@ pub struct RelayClient {
     online: bool,
     feed: Vec<ClientMessage>,
     seen: HashSet<String>,
+    known_peers: HashMap<String, String>, // peer_id -> signing_public_key_hex
 }
 
 impl RelayClient {
@@ -128,7 +129,12 @@ impl RelayClient {
             online: true,
             feed: Vec::new(),
             seen: HashSet::new(),
+            known_peers: HashMap::new(),
         }
+    }
+
+    pub fn add_peer(&mut self, peer_id: String, signing_public_key_hex: String) {
+        self.known_peers.insert(peer_id, signing_public_key_hex);
     }
 
     pub fn id(&self) -> &str {
@@ -180,6 +186,7 @@ impl RelayClient {
                     None,
                     message,
                     &salt,
+                    &self.keypair.signing_private_key_hex,
                 )?
             }
             ClientEncryption::Encrypted {
@@ -208,6 +215,7 @@ impl RelayClient {
                     MessageKind::Direct,
                     None,
                     payload,
+                    &self.keypair.signing_private_key_hex,
                 )?
             }
         };
@@ -257,10 +265,19 @@ impl RelayClient {
     }
 
     fn decode_envelope(&self, envelope: &Envelope) -> Result<ClientMessage, String> {
-        envelope
-            .header
-            .verify_signature(envelope.version)
-            .map_err(|error| format!("invalid header signature: {error:?}"))?;
+        // Verify signature using sender's public key
+        if let Some(sender_signing_key) = self.known_peers.get(&envelope.header.sender_id) {
+            envelope
+                .header
+                .verify_signature(envelope.version, sender_signing_key)
+                .map_err(|error| format!("invalid header signature: {error:?}"))?;
+        } else {
+            return Err(format!(
+                "unknown sender: {} (cannot verify signature)",
+                envelope.header.sender_id
+            ));
+        }
+
         if envelope.header.message_kind != MessageKind::Direct {
             return Err(format!(
                 "unexpected message kind: {:?}",
@@ -395,6 +412,7 @@ impl Client for RelayClient {
                 MessageKind::Direct,
                 None,
                 message.payload.clone(),
+                &self.keypair.signing_private_key_hex,
             ) else {
                 continue;
             };
@@ -757,6 +775,7 @@ impl SimulationClient {
         context: &mut ClientContext<'_>,
     ) -> Option<Envelope> {
         let payload = build_meta_payload(meta).ok()?;
+        let sender_keypair = context.keypairs.get(sender_id)?;
         let envelope = build_envelope_from_payload(
             sender_id.to_string(),
             recipient_id.to_string(),
@@ -767,6 +786,7 @@ impl SimulationClient {
             MessageKind::Meta,
             None,
             payload,
+            &sender_keypair.signing_private_key_hex,
         )
         .ok()?;
         context
@@ -866,6 +886,7 @@ impl SimulationClient {
             None,
         )
         .ok()?;
+        let sender_keypair = context.keypairs.get(sender_id)?;
         build_envelope_from_payload(
             sender_id.to_string(),
             storage_peer_id.to_string(),
@@ -876,6 +897,7 @@ impl SimulationClient {
             MessageKind::StoreForPeer,
             None,
             outer_payload,
+            &sender_keypair.signing_private_key_hex,
         )
         .ok()
     }
@@ -886,7 +908,12 @@ impl SimulationClient {
         recipient_id: &str,
         context: &ClientContext<'_>,
     ) -> Option<IncomingEnvelopeAction> {
-        if envelope.header.verify_signature(envelope.version).is_err() {
+        let sender_keypair = context.keypairs.get(&envelope.header.sender_id)?;
+        if envelope
+            .header
+            .verify_signature(envelope.version, &sender_keypair.signing_public_key_hex)
+            .is_err()
+        {
             return None;
         }
         match envelope.header.message_kind {
@@ -1055,6 +1082,9 @@ impl Client for SimulationClient {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
+            let Some(sender_keypair) = context.keypairs.get(&message.sender) else {
+                continue;
+            };
             let envelope = match build_envelope_from_payload(
                 message.sender.clone(),
                 message.recipient.clone(),
@@ -1065,6 +1095,7 @@ impl Client for SimulationClient {
                 MessageKind::Direct,
                 None,
                 message.payload.clone(),
+                &sender_keypair.signing_private_key_hex,
             ) {
                 Ok(envelope) => envelope,
                 Err(_) => continue,

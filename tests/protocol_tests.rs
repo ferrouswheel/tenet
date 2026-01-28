@@ -1,9 +1,11 @@
+use tenet::crypto::generate_keypair;
 use tenet::protocol::{
     AttachmentRef, ContentId, Envelope, Header, HeaderError, MessageKind, Payload, ProtocolVersion,
 };
 
 #[test]
 fn envelope_roundtrips_via_json() {
+    let keypair = generate_keypair();
     let payload = Payload {
         id: ContentId::from_bytes(b"payload-body"),
         content_type: "application/octet-stream".to_string(),
@@ -31,7 +33,7 @@ fn envelope_roundtrips_via_json() {
     };
     header.signature = Some(
         header
-            .expected_signature(version)
+            .compute_signature(version, &keypair.signing_private_key_hex)
             .expect("signature generation"),
     );
 
@@ -49,6 +51,7 @@ fn envelope_roundtrips_via_json() {
 
 #[test]
 fn header_signature_fails_with_invalid_signature() {
+    let keypair = generate_keypair();
     let version = ProtocolVersion::V1;
     let header = Header {
         sender_id: "sender-id".to_string(),
@@ -65,13 +68,14 @@ fn header_signature_fails_with_invalid_signature() {
     };
 
     let err = header
-        .verify_signature(version)
+        .verify_signature(version, &keypair.signing_public_key_hex)
         .expect_err("invalid signature");
     assert_eq!(err, HeaderError::InvalidSignature);
 }
 
 #[test]
 fn header_roundtrips_and_validates_message_kinds() {
+    let keypair = generate_keypair();
     let kinds = vec![
         (MessageKind::Public, None, None, None),
         (MessageKind::Meta, None, None, None),
@@ -104,7 +108,7 @@ fn header_roundtrips_and_validates_message_kinds() {
         };
         header.signature = Some(
             header
-                .expected_signature(version)
+                .compute_signature(version, &keypair.signing_private_key_hex)
                 .expect("signature generation"),
         );
 
@@ -113,13 +117,14 @@ fn header_roundtrips_and_validates_message_kinds() {
 
         assert_eq!(decoded, header);
         decoded
-            .verify_signature(version)
+            .verify_signature(version, &keypair.signing_public_key_hex)
             .expect("signature validation");
     }
 }
 
 #[test]
 fn header_rejects_invalid_message_kind_combinations() {
+    let keypair = generate_keypair();
     let version = ProtocolVersion::V1;
     let mut header = Header {
         sender_id: "sender-id".to_string(),
@@ -136,12 +141,12 @@ fn header_rejects_invalid_message_kind_combinations() {
     };
     header.signature = Some(
         header
-            .expected_signature(version)
+            .compute_signature(version, &keypair.signing_private_key_hex)
             .expect("signature generation"),
     );
 
     let err = header
-        .verify_signature(version)
+        .verify_signature(version, &keypair.signing_public_key_hex)
         .expect_err("missing group id");
     assert!(matches!(err, HeaderError::InvalidMessageKind(_)));
 
@@ -149,18 +154,19 @@ fn header_rejects_invalid_message_kind_combinations() {
     header.group_id = Some("group-1".to_string());
     header.signature = Some(
         header
-            .expected_signature(version)
+            .compute_signature(version, &keypair.signing_private_key_hex)
             .expect("signature generation"),
     );
 
     let err = header
-        .verify_signature(version)
+        .verify_signature(version, &keypair.signing_public_key_hex)
         .expect_err("unexpected group id");
     assert!(matches!(err, HeaderError::InvalidMessageKind(_)));
 }
 
 #[test]
 fn header_signature_changes_with_message_kind() {
+    let keypair = generate_keypair();
     let version = ProtocolVersion::V1;
     let mut header = Header {
         sender_id: "sender-id".to_string(),
@@ -177,12 +183,14 @@ fn header_signature_changes_with_message_kind() {
     };
     header.signature = Some(
         header
-            .expected_signature(version)
+            .compute_signature(version, &keypair.signing_private_key_hex)
             .expect("signature generation"),
     );
 
     header.message_kind = MessageKind::Public;
 
-    let err = header.verify_signature(version).expect_err("kind mismatch");
+    let err = header
+        .verify_signature(version, &keypair.signing_public_key_hex)
+        .expect_err("kind mismatch");
     assert_eq!(err, HeaderError::InvalidSignature);
 }

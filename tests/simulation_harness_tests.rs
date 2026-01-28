@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use tenet::crypto::generate_keypair;
 use tenet::protocol::{build_plaintext_payload, ContentId};
 use tenet::relay::RelayConfig;
 use tenet::simulation::{
@@ -126,6 +127,10 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
     direct_links.insert(("node-b".to_string(), "node-a".to_string()));
 
+    let mut keypairs = HashMap::new();
+    keypairs.insert("node-a".to_string(), generate_keypair());
+    keypairs.insert("node-b".to_string(), generate_keypair());
+
     let mut harness = SimulationHarness::new(
         base_url,
         clients,
@@ -133,7 +138,7 @@ async fn simulation_harness_tracks_online_handshake_metrics() {
         true,
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
-        Default::default(),
+        keypairs,
         SimulationTimingConfig {
             base_seconds_per_step: 60.0,
             speed_factor: 1.0,
@@ -176,6 +181,10 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
     direct_links.insert(("node-b".to_string(), "node-a".to_string()));
 
+    let mut keypairs = HashMap::new();
+    keypairs.insert("node-a".to_string(), generate_keypair());
+    keypairs.insert("node-b".to_string(), generate_keypair());
+
     let mut harness = SimulationHarness::new(
         base_url,
         clients,
@@ -183,7 +192,7 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
         true,
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
-        Default::default(),
+        keypairs,
         SimulationTimingConfig {
             base_seconds_per_step: 60.0,
             speed_factor: 1.0,
@@ -241,6 +250,10 @@ async fn simulation_harness_applies_dynamic_updates() {
     direct_links.insert(("node-a".to_string(), "node-b".to_string()));
     direct_links.insert(("node-b".to_string(), "node-a".to_string()));
 
+    let mut keypairs = HashMap::new();
+    keypairs.insert("node-a".to_string(), generate_keypair());
+    keypairs.insert("node-b".to_string(), generate_keypair());
+
     let mut harness = SimulationHarness::new(
         base_url,
         clients,
@@ -248,7 +261,7 @@ async fn simulation_harness_applies_dynamic_updates() {
         true,
         relay_config.ttl.as_secs(),
         MessageEncryption::Plaintext,
-        Default::default(),
+        keypairs,
         SimulationTimingConfig {
             base_seconds_per_step: 60.0,
             speed_factor: 1.0,
