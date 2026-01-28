@@ -304,10 +304,10 @@ Create new scenario files:
 ## Implementation Order & Priority
 
 ### High Priority (Core Functionality)
-1. ✅ **Phase 1.1**: True cryptographic signatures (CRITICAL for security)
-2. ✅ **Phase 1.2**: Peer directory for public key lookup
-3. ✅ **Phase 2**: Public messages (requested by user)
-4. ✅ **Phase 3**: Group messages (requested by user)
+1. ✅ **Phase 1.1**: True cryptographic signatures (CRITICAL for security) - **COMPLETE**
+2. ✅ **Phase 1.2**: Peer directory for public key lookup - **COMPLETE**
+3. **Phase 2**: Public messages (requested by user)
+4. **Phase 3**: Group messages (requested by user)
 
 ### Medium Priority (Completeness)
 5. **Phase 4.1**: Update CLI/TUI binaries
@@ -366,8 +366,8 @@ Create new scenario files:
 
 ## Status Tracking
 
-- [ ] Phase 1.1: Cryptographic Signatures
-- [ ] Phase 1.2: Peer Directory
+- [x] Phase 1.1: Cryptographic Signatures
+- [x] Phase 1.2: Peer Directory
 - [ ] Phase 2: Public Messages
 - [ ] Phase 3: Group Messages
 - [ ] Phase 4: Integration & Polish

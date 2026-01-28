@@ -17,6 +17,108 @@ use crate::simulation::{
     SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
+/// Information about a known peer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub signing_public_key_hex: String,
+    pub encryption_public_key_hex: Option<String>,
+    pub added_at: u64,
+}
+
+/// Registry for managing known peers and their public keys
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRegistry {
+    peers: HashMap<String, PeerInfo>,
+}
+
+impl PeerRegistry {
+    /// Create a new empty peer registry
+    pub fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Add a peer to the registry with their signing public key
+    pub fn add_peer(&mut self, peer_id: String, signing_public_key_hex: String) {
+        self.add_peer_with_encryption(peer_id, signing_public_key_hex, None);
+    }
+
+    /// Add a peer to the registry with both signing and encryption keys
+    pub fn add_peer_with_encryption(
+        &mut self,
+        peer_id: String,
+        signing_public_key_hex: String,
+        encryption_public_key_hex: Option<String>,
+    ) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.peers.insert(
+            peer_id.clone(),
+            PeerInfo {
+                peer_id,
+                signing_public_key_hex,
+                encryption_public_key_hex,
+                added_at: timestamp,
+            },
+        );
+    }
+
+    /// Remove a peer from the registry
+    pub fn remove_peer(&mut self, peer_id: &str) -> Option<PeerInfo> {
+        self.peers.remove(peer_id)
+    }
+
+    /// Get peer information by peer ID
+    pub fn get_peer(&self, peer_id: &str) -> Option<&PeerInfo> {
+        self.peers.get(peer_id)
+    }
+
+    /// Get only the signing public key for a peer
+    pub fn get_signing_key(&self, peer_id: &str) -> Option<&str> {
+        self.peers
+            .get(peer_id)
+            .map(|info| info.signing_public_key_hex.as_str())
+    }
+
+    /// Get only the encryption public key for a peer
+    pub fn get_encryption_key(&self, peer_id: &str) -> Option<&str> {
+        self.peers
+            .get(peer_id)
+            .and_then(|info| info.encryption_public_key_hex.as_deref())
+    }
+
+    /// Check if a peer is in the registry
+    pub fn has_peer(&self, peer_id: &str) -> bool {
+        self.peers.contains_key(peer_id)
+    }
+
+    /// List all peers in the registry
+    pub fn list_peers(&self) -> Vec<&PeerInfo> {
+        self.peers.values().collect()
+    }
+
+    /// Get the number of peers in the registry
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Get all peer IDs
+    pub fn peer_ids(&self) -> Vec<String> {
+        self.peers.keys().cloned().collect()
+    }
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ClientEncryption {
     Plaintext,
@@ -118,7 +220,7 @@ pub struct RelayClient {
     online: bool,
     feed: Vec<ClientMessage>,
     seen: HashSet<String>,
-    known_peers: HashMap<String, String>, // peer_id -> signing_public_key_hex
+    peer_registry: PeerRegistry,
 }
 
 impl RelayClient {
@@ -129,12 +231,41 @@ impl RelayClient {
             online: true,
             feed: Vec::new(),
             seen: HashSet::new(),
-            known_peers: HashMap::new(),
+            peer_registry: PeerRegistry::new(),
         }
     }
 
     pub fn add_peer(&mut self, peer_id: String, signing_public_key_hex: String) {
-        self.known_peers.insert(peer_id, signing_public_key_hex);
+        self.peer_registry.add_peer(peer_id, signing_public_key_hex);
+    }
+
+    pub fn add_peer_with_encryption(
+        &mut self,
+        peer_id: String,
+        signing_public_key_hex: String,
+        encryption_public_key_hex: String,
+    ) {
+        self.peer_registry.add_peer_with_encryption(
+            peer_id,
+            signing_public_key_hex,
+            Some(encryption_public_key_hex),
+        );
+    }
+
+    pub fn remove_peer(&mut self, peer_id: &str) -> Option<PeerInfo> {
+        self.peer_registry.remove_peer(peer_id)
+    }
+
+    pub fn get_peer(&self, peer_id: &str) -> Option<&PeerInfo> {
+        self.peer_registry.get_peer(peer_id)
+    }
+
+    pub fn list_peers(&self) -> Vec<&PeerInfo> {
+        self.peer_registry.list_peers()
+    }
+
+    pub fn peer_registry(&self) -> &PeerRegistry {
+        &self.peer_registry
     }
 
     pub fn id(&self) -> &str {
@@ -266,7 +397,10 @@ impl RelayClient {
 
     fn decode_envelope(&self, envelope: &Envelope) -> Result<ClientMessage, String> {
         // Verify signature using sender's public key
-        if let Some(sender_signing_key) = self.known_peers.get(&envelope.header.sender_id) {
+        if let Some(sender_signing_key) = self
+            .peer_registry
+            .get_signing_key(&envelope.header.sender_id)
+        {
             envelope
                 .header
                 .verify_signature(envelope.version, sender_signing_key)
@@ -621,6 +755,7 @@ pub struct SimulationClient {
     stored_forwards: Vec<StoredForPeerMessage>,
     metrics: ClientMetrics,
     log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
+    peer_registry: PeerRegistry,
 }
 
 impl std::fmt::Debug for SimulationClient {
@@ -635,6 +770,7 @@ impl std::fmt::Debug for SimulationClient {
             .field("stored_forwards", &self.stored_forwards)
             .field("metrics", &self.metrics)
             .field("has_log_sink", &self.log_sink.is_some())
+            .field("peer_registry", &self.peer_registry)
             .finish()
     }
 }
@@ -655,11 +791,45 @@ impl SimulationClient {
             stored_forwards: Vec::new(),
             metrics: ClientMetrics::default(),
             log_sink,
+            peer_registry: PeerRegistry::new(),
         }
     }
 
     pub fn set_log_sink(&mut self, log_sink: Option<std::sync::Arc<dyn ClientLogSink>>) {
         self.log_sink = log_sink;
+    }
+
+    pub fn add_peer(&mut self, peer_id: String, signing_public_key_hex: String) {
+        self.peer_registry.add_peer(peer_id, signing_public_key_hex);
+    }
+
+    pub fn add_peer_with_encryption(
+        &mut self,
+        peer_id: String,
+        signing_public_key_hex: String,
+        encryption_public_key_hex: String,
+    ) {
+        self.peer_registry.add_peer_with_encryption(
+            peer_id,
+            signing_public_key_hex,
+            Some(encryption_public_key_hex),
+        );
+    }
+
+    pub fn remove_peer(&mut self, peer_id: &str) -> Option<PeerInfo> {
+        self.peer_registry.remove_peer(peer_id)
+    }
+
+    pub fn get_peer(&self, peer_id: &str) -> Option<&PeerInfo> {
+        self.peer_registry.get_peer(peer_id)
+    }
+
+    pub fn list_peers(&self) -> Vec<&PeerInfo> {
+        self.peer_registry.list_peers()
+    }
+
+    pub fn peer_registry(&self) -> &PeerRegistry {
+        &self.peer_registry
     }
 
     fn log_action(&self, step: usize, message: impl Into<String>) {
@@ -1333,4 +1503,187 @@ enum DeliveryKind {
 enum IncomingEnvelopeAction {
     DirectMessage(SimMessage),
     StoredForPeer(StoredForPeerMessage),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peer_registry_new() {
+        let registry = PeerRegistry::new();
+        assert_eq!(registry.peer_count(), 0);
+        assert!(registry.list_peers().is_empty());
+    }
+
+    #[test]
+    fn test_peer_registry_add_peer() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer("alice".to_string(), "signing_key_alice".to_string());
+
+        assert_eq!(registry.peer_count(), 1);
+        assert!(registry.has_peer("alice"));
+        assert!(!registry.has_peer("bob"));
+
+        let peer = registry.get_peer("alice").expect("alice should exist");
+        assert_eq!(peer.peer_id, "alice");
+        assert_eq!(peer.signing_public_key_hex, "signing_key_alice");
+        assert!(peer.encryption_public_key_hex.is_none());
+    }
+
+    #[test]
+    fn test_peer_registry_add_peer_with_encryption() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer_with_encryption(
+            "bob".to_string(),
+            "signing_key_bob".to_string(),
+            Some("encryption_key_bob".to_string()),
+        );
+
+        let peer = registry.get_peer("bob").expect("bob should exist");
+        assert_eq!(peer.peer_id, "bob");
+        assert_eq!(peer.signing_public_key_hex, "signing_key_bob");
+        assert_eq!(
+            peer.encryption_public_key_hex.as_deref(),
+            Some("encryption_key_bob")
+        );
+    }
+
+    #[test]
+    fn test_peer_registry_get_signing_key() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer("alice".to_string(), "signing_key_alice".to_string());
+
+        assert_eq!(registry.get_signing_key("alice"), Some("signing_key_alice"));
+        assert_eq!(registry.get_signing_key("unknown"), None);
+    }
+
+    #[test]
+    fn test_peer_registry_get_encryption_key() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer_with_encryption(
+            "bob".to_string(),
+            "signing_key_bob".to_string(),
+            Some("encryption_key_bob".to_string()),
+        );
+
+        assert_eq!(
+            registry.get_encryption_key("bob"),
+            Some("encryption_key_bob")
+        );
+        assert_eq!(registry.get_encryption_key("unknown"), None);
+    }
+
+    #[test]
+    fn test_peer_registry_remove_peer() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer("alice".to_string(), "signing_key_alice".to_string());
+        registry.add_peer("bob".to_string(), "signing_key_bob".to_string());
+
+        assert_eq!(registry.peer_count(), 2);
+
+        let removed = registry.remove_peer("alice");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().peer_id, "alice");
+        assert_eq!(registry.peer_count(), 1);
+        assert!(!registry.has_peer("alice"));
+        assert!(registry.has_peer("bob"));
+
+        let not_found = registry.remove_peer("unknown");
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_peer_registry_list_peers() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer("alice".to_string(), "signing_key_alice".to_string());
+        registry.add_peer("bob".to_string(), "signing_key_bob".to_string());
+        registry.add_peer("charlie".to_string(), "signing_key_charlie".to_string());
+
+        let peers = registry.list_peers();
+        assert_eq!(peers.len(), 3);
+
+        let peer_ids: Vec<&str> = peers.iter().map(|p| p.peer_id.as_str()).collect();
+        assert!(peer_ids.contains(&"alice"));
+        assert!(peer_ids.contains(&"bob"));
+        assert!(peer_ids.contains(&"charlie"));
+    }
+
+    #[test]
+    fn test_peer_registry_peer_ids() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer("alice".to_string(), "signing_key_alice".to_string());
+        registry.add_peer("bob".to_string(), "signing_key_bob".to_string());
+
+        let mut peer_ids = registry.peer_ids();
+        peer_ids.sort();
+        assert_eq!(peer_ids, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn test_peer_registry_update_peer() {
+        let mut registry = PeerRegistry::new();
+        registry.add_peer("alice".to_string(), "old_signing_key".to_string());
+
+        // Adding same peer again should update it
+        registry.add_peer("alice".to_string(), "new_signing_key".to_string());
+
+        assert_eq!(registry.peer_count(), 1);
+        assert_eq!(registry.get_signing_key("alice"), Some("new_signing_key"));
+    }
+
+    #[test]
+    fn test_relay_client_peer_management() {
+        let keypair = StoredKeypair {
+            id: "client1".to_string(),
+            public_key_hex: "client1_pub".to_string(),
+            private_key_hex: "client1_priv".to_string(),
+            signing_public_key_hex: "client1_sign_pub".to_string(),
+            signing_private_key_hex: "client1_sign_priv".to_string(),
+        };
+        let config = ClientConfig::new("http://localhost:8080", 3600, ClientEncryption::Plaintext);
+        let mut client = RelayClient::new(keypair, config);
+
+        client.add_peer("alice".to_string(), "alice_sign_key".to_string());
+        assert_eq!(client.peer_registry().peer_count(), 1);
+        assert!(client.get_peer("alice").is_some());
+
+        client.add_peer_with_encryption(
+            "bob".to_string(),
+            "bob_sign_key".to_string(),
+            "bob_enc_key".to_string(),
+        );
+        assert_eq!(client.peer_registry().peer_count(), 2);
+
+        let peers = client.list_peers();
+        assert_eq!(peers.len(), 2);
+
+        client.remove_peer("alice");
+        assert_eq!(client.peer_registry().peer_count(), 1);
+        assert!(!client.peer_registry().has_peer("alice"));
+    }
+
+    #[test]
+    fn test_simulation_client_peer_management() {
+        let schedule = vec![true, true, false, true];
+        let mut client = SimulationClient::new("client1", schedule, None);
+
+        client.add_peer("alice".to_string(), "alice_sign_key".to_string());
+        assert_eq!(client.peer_registry().peer_count(), 1);
+        assert!(client.get_peer("alice").is_some());
+
+        client.add_peer_with_encryption(
+            "bob".to_string(),
+            "bob_sign_key".to_string(),
+            "bob_enc_key".to_string(),
+        );
+        assert_eq!(client.peer_registry().peer_count(), 2);
+
+        let peers = client.list_peers();
+        assert_eq!(peers.len(), 2);
+
+        client.remove_peer("alice");
+        assert_eq!(client.peer_registry().peer_count(), 1);
+        assert!(!client.peer_registry().has_peer("alice"));
+    }
 }
