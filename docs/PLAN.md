@@ -306,7 +306,7 @@ Create new scenario files:
 ### High Priority (Core Functionality)
 1. ✅ **Phase 1.1**: True cryptographic signatures (CRITICAL for security) - **COMPLETE**
 2. ✅ **Phase 1.2**: Peer directory for public key lookup - **COMPLETE**
-3. **Phase 2**: Public messages (requested by user)
+3. ✅ **Phase 2**: Public messages (requested by user) - **COMPLETE**
 4. **Phase 3**: Group messages (requested by user)
 
 ### Medium Priority (Completeness)
@@ -368,6 +368,6 @@ Create new scenario files:
 
 - [x] Phase 1.1: Cryptographic Signatures
 - [x] Phase 1.2: Peer Directory
-- [ ] Phase 2: Public Messages
+- [x] Phase 2: Public Messages
 - [ ] Phase 3: Group Messages
 - [ ] Phase 4: Integration & Polish
