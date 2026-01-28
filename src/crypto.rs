@@ -2,6 +2,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hpke::aead::ChaCha20Poly1305 as HpkeChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
@@ -28,6 +29,8 @@ pub enum CryptoError {
     InvalidLength(&'static str),
     Hpke(hpke::HpkeError),
     Aead(chacha20poly1305::aead::Error),
+    Signature(ed25519_dalek::SignatureError),
+    InvalidSignature,
 }
 
 impl fmt::Display for CryptoError {
@@ -36,6 +39,8 @@ impl fmt::Display for CryptoError {
             CryptoError::InvalidLength(message) => write!(f, "invalid length: {message}"),
             CryptoError::Hpke(error) => write!(f, "hpke error: {error}"),
             CryptoError::Aead(error) => write!(f, "aead error: {error}"),
+            CryptoError::Signature(error) => write!(f, "signature error: {error}"),
+            CryptoError::InvalidSignature => write!(f, "invalid signature"),
         }
     }
 }
@@ -51,6 +56,12 @@ impl From<hpke::HpkeError> for CryptoError {
 impl From<chacha20poly1305::aead::Error> for CryptoError {
     fn from(error: chacha20poly1305::aead::Error) -> Self {
         CryptoError::Aead(error)
+    }
+}
+
+impl From<ed25519_dalek::SignatureError> for CryptoError {
+    fn from(error: ed25519_dalek::SignatureError) -> Self {
+        CryptoError::Signature(error)
     }
 }
 
@@ -96,6 +107,8 @@ pub struct StoredKeypair {
     pub id: String,
     pub public_key_hex: String,
     pub private_key_hex: String,
+    pub signing_public_key_hex: String,
+    pub signing_private_key_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +139,16 @@ pub fn generate_keypair_with_rng(rng: &mut (impl RngCore + CryptoRng)) -> Stored
     let private_key_bytes = private_key.to_bytes();
     let id = derive_user_id_from_public_key(&public_key_bytes);
 
+    // Generate Ed25519 signing key
+    let signing_key = SigningKey::generate(rng);
+    let verifying_key = signing_key.verifying_key();
+
     StoredKeypair {
         id,
         public_key_hex: hex::encode(public_key_bytes),
         private_key_hex: hex::encode(private_key_bytes),
+        signing_public_key_hex: hex::encode(verifying_key.to_bytes()),
+        signing_private_key_hex: hex::encode(signing_key.to_bytes()),
     }
 }
 
@@ -281,6 +300,51 @@ pub fn unwrap_content_key(
     Ok(plaintext)
 }
 
+/// Sign a message with an Ed25519 private key.
+pub fn sign_message(message: &[u8], signing_private_key_hex: &str) -> Result<String, CryptoError> {
+    let signing_key_bytes = hex::decode(signing_private_key_hex)
+        .map_err(|_| CryptoError::InvalidLength("invalid hex"))?;
+    if signing_key_bytes.len() != 32 {
+        return Err(CryptoError::InvalidLength("signing key must be 32 bytes"));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&signing_key_bytes);
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    let signature = signing_key.sign(message);
+    Ok(URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+}
+
+/// Verify a message signature with an Ed25519 public key.
+pub fn verify_signature(
+    message: &[u8],
+    signature_base64: &str,
+    signing_public_key_hex: &str,
+) -> Result<(), CryptoError> {
+    let verifying_key_bytes = hex::decode(signing_public_key_hex)
+        .map_err(|_| CryptoError::InvalidLength("invalid hex"))?;
+    if verifying_key_bytes.len() != 32 {
+        return Err(CryptoError::InvalidLength("verifying key must be 32 bytes"));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&verifying_key_bytes);
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidSignature)?;
+
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_base64)
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    if signature_bytes.len() != 64 {
+        return Err(CryptoError::InvalidLength("signature must be 64 bytes"));
+    }
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(&signature_bytes);
+    let signature = Signature::from_bytes(&sig_bytes);
+
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +432,40 @@ mod tests {
         let loaded = load_keypair(&path).unwrap();
 
         assert_eq!(loaded, keypair);
+    }
+
+    #[test]
+    fn signs_and_verifies_messages() {
+        let keypair = generate_keypair();
+        let message = b"hello, world!";
+
+        let signature = sign_message(message, &keypair.signing_private_key_hex).unwrap();
+        verify_signature(message, &signature, &keypair.signing_public_key_hex).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_signature() {
+        let keypair = generate_keypair();
+        let message = b"hello, world!";
+        let tampered_message = b"hello, world?";
+
+        let signature = sign_message(message, &keypair.signing_private_key_hex).unwrap();
+        let result = verify_signature(
+            tampered_message,
+            &signature,
+            &keypair.signing_public_key_hex,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_public_key() {
+        let keypair1 = generate_keypair();
+        let keypair2 = generate_keypair();
+        let message = b"hello, world!";
+
+        let signature = sign_message(message, &keypair1.signing_private_key_hex).unwrap();
+        let result = verify_signature(message, &signature, &keypair2.signing_public_key_hex);
+        assert!(result.is_err());
     }
 }

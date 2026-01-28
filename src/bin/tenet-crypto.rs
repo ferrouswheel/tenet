@@ -315,14 +315,24 @@ fn import_key(args: &[String]) -> Result<(), Box<dyn Error>> {
     validate_key_len(&private_key_bytes, "private")?;
 
     let id = derive_user_id_from_public_key(&public_key_bytes);
+
+    // Generate Ed25519 signing keys for the imported identity
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+
     let identity = StoredKeypair {
         id,
         public_key_hex,
         private_key_hex,
+        signing_public_key_hex: hex::encode(verifying_key.to_bytes()),
+        signing_private_key_hex: hex::encode(signing_key.to_bytes()),
     };
 
     store_keypair(&identity_path(), &identity)?;
     println!("identity imported: {}", identity.id);
+    println!("note: new Ed25519 signing keys were generated");
     Ok(())
 }
 

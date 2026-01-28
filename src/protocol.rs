@@ -13,7 +13,8 @@
 //! across transport layers and storage backends.
 
 use crate::crypto::{
-    decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key, CryptoError,
+    decrypt_payload, encrypt_payload, sign_message, unwrap_content_key, verify_signature,
+    wrap_content_key, CryptoError,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -167,18 +168,24 @@ impl Header {
         serde_json::to_vec(&canonical)
     }
 
-    /// Compute the expected signature for this header and version.
-    pub fn expected_signature(
+    /// Compute a signature for this header using Ed25519.
+    pub fn compute_signature(
         &self,
         version: ProtocolVersion,
-    ) -> Result<String, serde_json::Error> {
-        let bytes = self.canonical_signing_bytes(version)?;
-        let digest = Sha256::digest(&bytes);
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
+        signing_private_key_hex: &str,
+    ) -> Result<String, HeaderError> {
+        let bytes = self
+            .canonical_signing_bytes(version)
+            .map_err(|_| HeaderError::InvalidSignature)?;
+        sign_message(&bytes, signing_private_key_hex).map_err(|_| HeaderError::InvalidSignature)
     }
 
     /// Verify signature validity, version compatibility, and TTL bounds.
-    pub fn verify_signature(&self, version: ProtocolVersion) -> Result<(), HeaderError> {
+    pub fn verify_signature(
+        &self,
+        version: ProtocolVersion,
+        signing_public_key_hex: &str,
+    ) -> Result<(), HeaderError> {
         if !version.is_supported() {
             return Err(HeaderError::UnsupportedVersion(version));
         }
@@ -192,14 +199,11 @@ impl Header {
             .signature
             .as_deref()
             .ok_or(HeaderError::MissingSignature)?;
-        let expected = self
-            .expected_signature(version)
+        let bytes = self
+            .canonical_signing_bytes(version)
             .map_err(|_| HeaderError::InvalidSignature)?;
-        if signature == expected {
-            Ok(())
-        } else {
-            Err(HeaderError::InvalidSignature)
-        }
+        verify_signature(&bytes, signature, signing_public_key_hex)
+            .map_err(|_| HeaderError::InvalidSignature)
     }
 
     fn validate_message_kind(&self) -> Result<(), HeaderError> {
@@ -370,6 +374,7 @@ pub fn build_envelope_from_payload(
     message_kind: MessageKind,
     group_id: Option<String>,
     payload: Payload,
+    signing_private_key_hex: &str,
 ) -> Result<Envelope, EnvelopeBuildError> {
     let message_id = ContentId::from_value(&payload)?;
     let mut header = Header {
@@ -386,7 +391,7 @@ pub fn build_envelope_from_payload(
         signature: None,
     };
     header.validate_message_kind()?;
-    let signature = header.expected_signature(ProtocolVersion::V1)?;
+    let signature = header.compute_signature(ProtocolVersion::V1, signing_private_key_hex)?;
     header.signature = Some(signature);
     Ok(Envelope {
         version: ProtocolVersion::V1,
@@ -407,6 +412,7 @@ pub fn build_plaintext_envelope(
     group_id: Option<String>,
     body: impl Into<String>,
     salt: impl AsRef<[u8]>,
+    signing_private_key_hex: &str,
 ) -> Result<Envelope, EnvelopeBuildError> {
     let payload = build_plaintext_payload(body, salt);
     build_envelope_from_payload(
@@ -419,6 +425,7 @@ pub fn build_plaintext_envelope(
         message_kind,
         group_id,
         payload,
+        signing_private_key_hex,
     )
 }
 
