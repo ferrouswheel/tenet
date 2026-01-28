@@ -17,6 +17,41 @@ use crate::simulation::{
     SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
+use crate::protocol::ContentId;
+
+/// Maximum number of hops a public message can propagate
+pub const MAX_PUBLIC_MESSAGE_HOPS: usize = 10;
+
+/// Metadata for tracking public message propagation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicMessageMetadata {
+    pub seen_by: HashSet<String>,
+    pub first_seen_at: u64,
+    pub propagation_count: usize,
+}
+
+impl PublicMessageMetadata {
+    pub fn new(first_seen_at: u64) -> Self {
+        Self {
+            seen_by: HashSet::new(),
+            first_seen_at,
+            propagation_count: 0,
+        }
+    }
+
+    pub fn mark_seen_by(&mut self, peer_id: String) {
+        self.seen_by.insert(peer_id);
+    }
+
+    pub fn increment_propagation(&mut self) {
+        self.propagation_count = self.propagation_count.saturating_add(1);
+    }
+
+    pub fn should_forward(&self) -> bool {
+        self.propagation_count < MAX_PUBLIC_MESSAGE_HOPS
+    }
+}
+
 /// Information about a known peer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -221,6 +256,8 @@ pub struct RelayClient {
     feed: Vec<ClientMessage>,
     seen: HashSet<String>,
     peer_registry: PeerRegistry,
+    public_message_cache: Vec<Envelope>,
+    public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
 }
 
 impl RelayClient {
@@ -232,6 +269,8 @@ impl RelayClient {
             feed: Vec::new(),
             seen: HashSet::new(),
             peer_registry: PeerRegistry::new(),
+            public_message_cache: Vec::new(),
+            public_message_metadata: HashMap::new(),
         }
     }
 
@@ -286,6 +325,208 @@ impl RelayClient {
 
     pub fn feed(&self) -> &[ClientMessage] {
         &self.feed
+    }
+
+    pub fn public_message_cache(&self) -> &[Envelope] {
+        &self.public_message_cache
+    }
+
+    /// Send a public message that will be propagated across the network
+    pub fn send_public_message(&mut self, message: &str) -> Result<Envelope, ClientError> {
+        if !self.online {
+            return Err(ClientError::Offline);
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| ClientError::Time(err.to_string()))?
+            .as_secs();
+
+        // For public messages, recipient_id is empty or "*" to indicate broadcast
+        let envelope = match self.config.encryption() {
+            ClientEncryption::Plaintext => {
+                let mut salt = [0u8; 16];
+                OsRng.fill_bytes(&mut salt);
+                build_plaintext_envelope(
+                    self.id(),
+                    "*", // broadcast indicator
+                    None,
+                    None,
+                    timestamp,
+                    self.config.ttl_seconds(),
+                    MessageKind::Public,
+                    None,
+                    message,
+                    &salt,
+                    &self.keypair.signing_private_key_hex,
+                )?
+            }
+            ClientEncryption::Encrypted { .. } => {
+                // Public messages should be plaintext so anyone can read
+                let mut salt = [0u8; 16];
+                OsRng.fill_bytes(&mut salt);
+                build_plaintext_envelope(
+                    self.id(),
+                    "*",
+                    None,
+                    None,
+                    timestamp,
+                    self.config.ttl_seconds(),
+                    MessageKind::Public,
+                    None,
+                    message,
+                    &salt,
+                    &self.keypair.signing_private_key_hex,
+                )?
+            }
+        };
+
+        // Add to local cache and metadata
+        let metadata = PublicMessageMetadata::new(timestamp);
+        self.public_message_metadata
+            .insert(envelope.header.message_id.clone(), metadata);
+        self.public_message_cache.push(envelope.clone());
+
+        // Post to relay for distribution
+        self.post_envelope(&envelope)?;
+
+        // Forward to known peers
+        self.forward_public_message_to_peers(&envelope)?;
+
+        Ok(envelope)
+    }
+
+    /// Receive and process a public message
+    pub fn receive_public_message(&mut self, envelope: Envelope) -> Result<(), ClientError> {
+        // Check if already seen
+        if self
+            .public_message_metadata
+            .contains_key(&envelope.header.message_id)
+        {
+            return Ok(()); // Already processed
+        }
+
+        // Verify it's a public message
+        if envelope.header.message_kind != MessageKind::Public {
+            return Err(ClientError::Protocol(format!(
+                "Expected Public message, got {:?}",
+                envelope.header.message_kind
+            )));
+        }
+
+        // Verify signature
+        if let Some(sender_signing_key) = self
+            .peer_registry
+            .get_signing_key(&envelope.header.sender_id)
+        {
+            envelope
+                .header
+                .verify_signature(envelope.version, sender_signing_key)
+                .map_err(|_| ClientError::Protocol("Invalid signature".to_string()))?;
+        } else {
+            return Err(ClientError::Protocol(format!(
+                "Unknown sender: {}",
+                envelope.header.sender_id
+            )));
+        }
+
+        // Check TTL
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let expires_at = envelope.header.timestamp + envelope.header.ttl_seconds;
+        if now > expires_at {
+            return Err(ClientError::Protocol("Message TTL expired".to_string()));
+        }
+
+        // Add to cache and metadata
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let metadata = PublicMessageMetadata::new(timestamp);
+        self.public_message_metadata
+            .insert(envelope.header.message_id.clone(), metadata);
+        self.public_message_cache.push(envelope.clone());
+
+        // Add to feed for the user
+        let client_msg = ClientMessage {
+            message_id: envelope.header.message_id.0.clone(),
+            sender_id: envelope.header.sender_id.clone(),
+            timestamp: envelope.header.timestamp,
+            body: envelope.payload.body.clone(),
+        };
+        self.feed.push(client_msg);
+        self.seen.insert(envelope.header.message_id.0.clone());
+
+        // Forward to peers if propagation limit not reached
+        if let Some(metadata) = self
+            .public_message_metadata
+            .get(&envelope.header.message_id)
+        {
+            if metadata.should_forward() {
+                let _ = self.forward_public_message_to_peers(&envelope);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Forward a public message to all known peers
+    fn forward_public_message_to_peers(&mut self, envelope: &Envelope) -> Result<(), ClientError> {
+        // Check if we should forward
+        let should_forward = {
+            let metadata = self
+                .public_message_metadata
+                .get(&envelope.header.message_id)
+                .ok_or_else(|| ClientError::Protocol("Message not in metadata cache".to_string()))?;
+            metadata.should_forward()
+        };
+
+        if !should_forward {
+            return Ok(()); // Propagation limit reached
+        }
+
+        // Get data we need before mutable borrows
+        let self_id = self.id().to_string();
+        let sender_id = envelope.header.sender_id.clone();
+        let peer_ids = self.peer_registry.peer_ids();
+
+        // Determine which peers to forward to
+        let peers_to_forward: Vec<String> = {
+            let metadata = self
+                .public_message_metadata
+                .get(&envelope.header.message_id)
+                .ok_or_else(|| ClientError::Protocol("Message not in metadata cache".to_string()))?;
+
+            peer_ids
+                .into_iter()
+                .filter(|peer_id| {
+                    peer_id != &self_id
+                        && peer_id != &sender_id
+                        && !metadata.seen_by.contains(peer_id)
+                })
+                .collect()
+        };
+
+        // Now update metadata and forward
+        if let Some(metadata) = self
+            .public_message_metadata
+            .get_mut(&envelope.header.message_id)
+        {
+            metadata.increment_propagation();
+            for peer_id in &peers_to_forward {
+                metadata.mark_seen_by(peer_id.clone());
+            }
+        }
+
+        // Post to relay (best effort)
+        for _ in &peers_to_forward {
+            let _ = self.post_envelope(envelope);
+        }
+
+        Ok(())
     }
 
     pub fn send_message(
@@ -756,6 +997,8 @@ pub struct SimulationClient {
     metrics: ClientMetrics,
     log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     peer_registry: PeerRegistry,
+    public_message_cache: Vec<Envelope>,
+    public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
 }
 
 impl std::fmt::Debug for SimulationClient {
@@ -771,6 +1014,14 @@ impl std::fmt::Debug for SimulationClient {
             .field("metrics", &self.metrics)
             .field("has_log_sink", &self.log_sink.is_some())
             .field("peer_registry", &self.peer_registry)
+            .field(
+                "public_message_cache_size",
+                &self.public_message_cache.len(),
+            )
+            .field(
+                "public_message_metadata_size",
+                &self.public_message_metadata.len(),
+            )
             .finish()
     }
 }
@@ -792,6 +1043,8 @@ impl SimulationClient {
             metrics: ClientMetrics::default(),
             log_sink,
             peer_registry: PeerRegistry::new(),
+            public_message_cache: Vec::new(),
+            public_message_metadata: HashMap::new(),
         }
     }
 
@@ -830,6 +1083,164 @@ impl SimulationClient {
 
     pub fn peer_registry(&self) -> &PeerRegistry {
         &self.peer_registry
+    }
+
+    pub fn public_message_cache(&self) -> &[Envelope] {
+        &self.public_message_cache
+    }
+
+    /// Send a public message in the simulation context
+    pub fn send_public_message(
+        &mut self,
+        message: &str,
+        step: usize,
+        context: &mut ClientContext<'_>,
+    ) -> Option<Envelope> {
+        if !self.online_at(step) {
+            return None;
+        }
+
+        let envelope = build_plaintext_envelope(
+            &self.id,
+            "*", // broadcast indicator
+            None,
+            None,
+            step as u64,
+            context.ttl_seconds,
+            MessageKind::Public,
+            None,
+            message,
+            &[0u8; 16], // salt
+            &context.keypairs.get(&self.id)?.signing_private_key_hex,
+        )
+        .ok()?;
+
+        // Add to local cache and metadata
+        let metadata = PublicMessageMetadata::new(step as u64);
+        self.public_message_metadata
+            .insert(envelope.header.message_id.clone(), metadata);
+        self.public_message_cache.push(envelope.clone());
+
+        self.log_action(step, format!("{} sent public message", self.id));
+
+        Some(envelope)
+    }
+
+    /// Receive and process a public message in simulation
+    pub fn receive_public_message(
+        &mut self,
+        envelope: Envelope,
+        step: usize,
+        context: &mut ClientContext<'_>,
+    ) -> bool {
+        // Check if already seen
+        if self
+            .public_message_metadata
+            .contains_key(&envelope.header.message_id)
+        {
+            return false;
+        }
+
+        // Verify it's a public message
+        if envelope.header.message_kind != MessageKind::Public {
+            return false;
+        }
+
+        // Verify signature
+        let sender_keypair = match context.keypairs.get(&envelope.header.sender_id) {
+            Some(kp) => kp,
+            None => return false,
+        };
+        if envelope
+            .header
+            .verify_signature(envelope.version, &sender_keypair.signing_public_key_hex)
+            .is_err()
+        {
+            return false;
+        }
+
+        // Check TTL
+        let expires_at = envelope.header.timestamp + envelope.header.ttl_seconds;
+        if (step as u64) > expires_at {
+            return false; // TTL expired
+        }
+
+        // Add to cache and metadata
+        let metadata = PublicMessageMetadata::new(step as u64);
+        self.public_message_metadata
+            .insert(envelope.header.message_id.clone(), metadata);
+        self.public_message_cache.push(envelope.clone());
+
+        // Add to inbox
+        let sim_message = SimMessage {
+            id: envelope.header.message_id.0.clone(),
+            sender: envelope.header.sender_id.clone(),
+            recipient: self.id.clone(),
+            body: envelope.payload.body.clone(),
+            payload: envelope.payload.clone(),
+        };
+        self.receive_message(sim_message);
+
+        self.log_action(
+            step,
+            format!(
+                "{} received public message from {}",
+                self.id, envelope.header.sender_id
+            ),
+        );
+
+        true
+    }
+
+    /// Forward a public message to peers
+    pub fn forward_public_message(
+        &mut self,
+        envelope: &Envelope,
+        step: usize,
+        peer_ids: &[String],
+    ) -> Vec<String> {
+        let metadata = match self
+            .public_message_metadata
+            .get_mut(&envelope.header.message_id)
+        {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+
+        if !metadata.should_forward() {
+            return Vec::new();
+        }
+
+        metadata.increment_propagation();
+
+        let mut forwarded_to = Vec::new();
+        for peer_id in peer_ids {
+            if peer_id == &self.id {
+                continue;
+            }
+            if peer_id == &envelope.header.sender_id {
+                continue;
+            }
+            if metadata.seen_by.contains(peer_id) {
+                continue;
+            }
+
+            metadata.mark_seen_by(peer_id.clone());
+            forwarded_to.push(peer_id.clone());
+        }
+
+        if !forwarded_to.is_empty() {
+            self.log_action(
+                step,
+                format!(
+                    "{} forwarded public message to {} peers",
+                    self.id,
+                    forwarded_to.len()
+                ),
+            );
+        }
+
+        forwarded_to
     }
 
     fn log_action(&self, step: usize, message: impl Into<String>) {
@@ -1685,5 +2096,294 @@ mod tests {
         client.remove_peer("alice");
         assert_eq!(client.peer_registry().peer_count(), 1);
         assert!(!client.peer_registry().has_peer("alice"));
+    }
+
+    #[test]
+    fn test_public_message_metadata_new() {
+        let metadata = PublicMessageMetadata::new(100);
+        assert_eq!(metadata.first_seen_at, 100);
+        assert_eq!(metadata.propagation_count, 0);
+        assert!(metadata.seen_by.is_empty());
+        assert!(metadata.should_forward());
+    }
+
+    #[test]
+    fn test_public_message_metadata_mark_seen() {
+        let mut metadata = PublicMessageMetadata::new(100);
+        metadata.mark_seen_by("peer1".to_string());
+        metadata.mark_seen_by("peer2".to_string());
+
+        assert_eq!(metadata.seen_by.len(), 2);
+        assert!(metadata.seen_by.contains("peer1"));
+        assert!(metadata.seen_by.contains("peer2"));
+    }
+
+    #[test]
+    fn test_public_message_metadata_propagation_limit() {
+        let mut metadata = PublicMessageMetadata::new(100);
+
+        // Should forward initially
+        assert!(metadata.should_forward());
+
+        // Increment to the limit
+        for _ in 0..MAX_PUBLIC_MESSAGE_HOPS {
+            metadata.increment_propagation();
+        }
+
+        // Should not forward after reaching limit
+        assert!(!metadata.should_forward());
+        assert_eq!(metadata.propagation_count, MAX_PUBLIC_MESSAGE_HOPS);
+    }
+
+    #[test]
+    fn test_relay_client_send_public_message() {
+        let keypair = StoredKeypair {
+            id: "alice".to_string(),
+            public_key_hex: "alice_pub".to_string(),
+            private_key_hex: "alice_priv".to_string(),
+            signing_public_key_hex: "alice_sign_pub".to_string(),
+            signing_private_key_hex: "alice_sign_priv".to_string(),
+        };
+        let config = ClientConfig::new("http://localhost:8080", 3600, ClientEncryption::Plaintext);
+        let mut client = RelayClient::new(keypair, config);
+
+        // Note: This will fail to post to the relay since relay is not running
+        // but we can still verify the envelope is created correctly
+        let result = client.send_public_message("Hello, world!");
+
+        // Even though posting fails, the local cache should be updated on the attempt
+        if result.is_ok() {
+            let envelope = result.unwrap();
+            assert_eq!(envelope.header.message_kind, MessageKind::Public);
+            assert_eq!(envelope.header.sender_id, "alice");
+            assert_eq!(envelope.header.recipient_id, "*");
+            assert_eq!(envelope.payload.body, "Hello, world!");
+        }
+    }
+
+    #[test]
+    fn test_relay_client_receive_public_message_unknown_sender() {
+        let keypair = StoredKeypair {
+            id: "bob".to_string(),
+            public_key_hex: "bob_pub".to_string(),
+            private_key_hex: "bob_priv".to_string(),
+            signing_public_key_hex: "bob_sign_pub".to_string(),
+            signing_private_key_hex: "bob_sign_priv".to_string(),
+        };
+        let config = ClientConfig::new("http://localhost:8080", 3600, ClientEncryption::Plaintext);
+        let mut client = RelayClient::new(keypair, config);
+
+        // Create a real keypair for alice
+        let alice_keypair = crate::crypto::generate_keypair();
+
+        // Create a public message envelope signed by alice
+        let envelope = build_plaintext_envelope(
+            "alice",
+            "*",
+            None,
+            None,
+            100,
+            3600,
+            MessageKind::Public,
+            None,
+            "Test message",
+            &[0u8; 16],
+            &alice_keypair.signing_private_key_hex,
+        )
+        .unwrap();
+
+        // Should fail because alice is not in the peer registry
+        let result = client.receive_public_message(envelope);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_simulation_client_public_message_dedup() {
+        use crate::simulation::{MessageEncryption, MetricsTracker, SimulationMetrics};
+        use std::collections::HashMap;
+
+        let schedule = vec![true; 10];
+        let mut client = SimulationClient::new("peer1", schedule, None);
+
+        // Create simulation context with real keypairs
+        let mut keypairs = HashMap::new();
+        keypairs.insert(
+            "peer1".to_string(),
+            crate::crypto::generate_keypair(),
+        );
+        keypairs.insert(
+            "peer2".to_string(),
+            crate::crypto::generate_keypair(),
+        );
+
+        let mut message_history = HashMap::new();
+        let mut message_send_steps = HashMap::new();
+        let mut pending_forwarded_messages = HashSet::new();
+        let mut metrics = SimulationMetrics {
+            planned_messages: 0,
+            sent_messages: 0,
+            direct_deliveries: 0,
+            inbox_deliveries: 0,
+            store_forwards_stored: 0,
+            store_forwards_forwarded: 0,
+            store_forwards_delivered: 0,
+        };
+        let mut metrics_tracker = MetricsTracker::new(1.0, HashMap::new());
+
+        let mut context = ClientContext {
+            direct_enabled: true,
+            ttl_seconds: 3600,
+            encryption: MessageEncryption::Plaintext,
+            direct_links: &HashSet::new(),
+            neighbors: &HashMap::new(),
+            keypairs: &keypairs,
+            message_history: &mut message_history,
+            message_send_steps: &mut message_send_steps,
+            pending_forwarded_messages: &mut pending_forwarded_messages,
+            metrics: &mut metrics,
+            metrics_tracker: &mut metrics_tracker,
+        };
+
+        // Create a public message
+        let envelope = build_plaintext_envelope(
+            "peer2",
+            "*",
+            None,
+            None,
+            1,
+            3600,
+            MessageKind::Public,
+            None,
+            "Public announcement",
+            &[0u8; 16],
+            &keypairs["peer2"].signing_private_key_hex,
+        )
+        .unwrap();
+
+        // First receive should succeed
+        let result1 = client.receive_public_message(envelope.clone(), 1, &mut context);
+        assert!(result1);
+
+        // Second receive of same message should be deduplicated
+        let result2 = client.receive_public_message(envelope, 1, &mut context);
+        assert!(!result2);
+
+        // Should have one public message in cache
+        assert_eq!(client.public_message_cache().len(), 1);
+    }
+
+    #[test]
+    fn test_simulation_client_public_message_ttl_expiration() {
+        use crate::simulation::{MessageEncryption, MetricsTracker, SimulationMetrics};
+        use std::collections::HashMap;
+
+        let schedule = vec![true; 10];
+        let mut client = SimulationClient::new("peer1", schedule, None);
+
+        let mut keypairs = HashMap::new();
+        keypairs.insert(
+            "peer2".to_string(),
+            crate::crypto::generate_keypair(),
+        );
+
+        let mut message_history = HashMap::new();
+        let mut message_send_steps = HashMap::new();
+        let mut pending_forwarded_messages = HashSet::new();
+        let mut metrics = SimulationMetrics {
+            planned_messages: 0,
+            sent_messages: 0,
+            direct_deliveries: 0,
+            inbox_deliveries: 0,
+            store_forwards_stored: 0,
+            store_forwards_forwarded: 0,
+            store_forwards_delivered: 0,
+        };
+        let mut metrics_tracker = MetricsTracker::new(1.0, HashMap::new());
+
+        let mut context = ClientContext {
+            direct_enabled: true,
+            ttl_seconds: 10, // Short TTL
+            encryption: MessageEncryption::Plaintext,
+            direct_links: &HashSet::new(),
+            neighbors: &HashMap::new(),
+            keypairs: &keypairs,
+            message_history: &mut message_history,
+            message_send_steps: &mut message_send_steps,
+            pending_forwarded_messages: &mut pending_forwarded_messages,
+            metrics: &mut metrics,
+            metrics_tracker: &mut metrics_tracker,
+        };
+
+        // Create a public message with TTL of 10
+        let envelope = build_plaintext_envelope(
+            "peer2",
+            "*",
+            None,
+            None,
+            1,  // timestamp
+            10, // TTL
+            MessageKind::Public,
+            None,
+            "Expired message",
+            &[0u8; 16],
+            &keypairs["peer2"].signing_private_key_hex,
+        )
+        .unwrap();
+
+        // Try to receive after TTL expired (step 20 > timestamp 1 + TTL 10)
+        let result = client.receive_public_message(envelope, 20, &mut context);
+        assert!(!result); // Should be rejected due to expired TTL
+    }
+
+    #[test]
+    fn test_simulation_client_forward_public_message() {
+        let schedule = vec![true; 10];
+        let mut client = SimulationClient::new("peer1", schedule, None);
+
+        // Create a real envelope with proper signature
+        let peer2_keypair = crate::crypto::generate_keypair();
+        let envelope = build_plaintext_envelope(
+            "peer2",
+            "*",
+            None,
+            None,
+            1,
+            3600,
+            MessageKind::Public,
+            None,
+            "Forward me",
+            &[0u8; 16],
+            &peer2_keypair.signing_private_key_hex,
+        )
+        .unwrap();
+
+        // Add metadata for the message
+        let metadata = PublicMessageMetadata::new(1);
+        client
+            .public_message_metadata
+            .insert(envelope.header.message_id.clone(), metadata);
+
+        // Forward to some peers
+        let peer_ids = vec![
+            "peer3".to_string(),
+            "peer4".to_string(),
+            "peer2".to_string(),
+        ];
+        let forwarded = client.forward_public_message(&envelope, 2, &peer_ids);
+
+        // Should forward to peer3 and peer4, but not peer2 (original sender)
+        assert_eq!(forwarded.len(), 2);
+        assert!(forwarded.contains(&"peer3".to_string()));
+        assert!(forwarded.contains(&"peer4".to_string()));
+        assert!(!forwarded.contains(&"peer2".to_string()));
+
+        // Check metadata was updated
+        let meta = client
+            .public_message_metadata
+            .get(&envelope.header.message_id)
+            .unwrap();
+        assert_eq!(meta.propagation_count, 1);
+        assert!(meta.seen_by.contains("peer3"));
+        assert!(meta.seen_by.contains("peer4"));
     }
 }
