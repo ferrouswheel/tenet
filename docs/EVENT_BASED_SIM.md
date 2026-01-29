@@ -514,7 +514,7 @@ impl EventBasedHarness {
 
 **Note**: During Phases 1-5, both step-based and event-based implementations may coexist temporarily for validation purposes. However, **Phase 6 will completely remove the step-based code**. This is not a gradual migration—it's a complete replacement.
 
-### Phase 1: Event Queue Infrastructure (1-2 days)
+### Phase 1: Event Queue Infrastructure (1-2 days) ✅ COMPLETED
 
 **Goal**: Establish event queue, event log, and time management without changing simulation behavior.
 
@@ -555,7 +555,7 @@ impl EventBasedHarness {
 
 ---
 
-### Phase 2: Convert Message Delivery with Latency (2-3 days)
+### Phase 2: Convert Message Delivery with Latency (2-3 days) ✅ COMPLETED
 
 **Goal**: Split message sending into separate send/deliver events with configurable latency.
 
