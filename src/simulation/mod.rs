@@ -37,9 +37,10 @@ pub use random::{
     generate_message_body, sample_message_size, sample_poisson, sample_weighted_index, sample_zipf,
 };
 pub use scenario::{
-    build_friend_graph, build_online_schedules, build_planned_sends, build_simulation_inputs,
-    run_simulation_scenario, run_simulation_scenario_with_progress, HistoricalMessage,
-    OnlineSchedulePlan, PlannedSend, SimMessage, SimulationInputs,
+    build_friend_graph, build_online_events, build_online_schedules, build_planned_sends,
+    build_simulation_inputs, generate_online_schedule_events, run_simulation_scenario,
+    run_simulation_scenario_with_progress, HistoricalMessage, OnlineSchedulePlan, PlannedSend,
+    SimMessage, SimulationInputs,
 };
 
 pub const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
@@ -1236,6 +1237,161 @@ impl EventBasedHarness {
         }
     }
 
+    async fn handle_online_transition(
+        &mut self,
+        client_id: String,
+        going_online: bool,
+    ) -> EventOutcome {
+        self.log_event(format!(
+            "Client {} going {}",
+            client_id,
+            if going_online { "online" } else { "offline" }
+        ));
+
+        // Update client's online state
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            if let Some(sim_client) = client.as_any_mut().downcast_mut::<SimulationClient>() {
+                sim_client.set_online(going_online);
+            }
+        }
+
+        if going_online {
+            // When going online, schedule inbox poll
+            let poll_time = self.clock.simulated_time + 0.1; // Poll shortly after coming online
+            self.event_queue.push(
+                poll_time,
+                Event::InboxPoll {
+                    client_id: client_id.clone(),
+                },
+            );
+
+            // Schedule online announcement to peers
+            let announce_time = self.clock.simulated_time + 0.05;
+            self.event_queue.push(
+                announce_time,
+                Event::OnlineAnnounce {
+                    client_id: client_id.clone(),
+                },
+            );
+
+            // Trigger store-and-forward delivery
+            self.trigger_store_and_forward(&client_id).await;
+        }
+
+        EventOutcome::OnlineTransitioned {
+            new_state: going_online,
+        }
+    }
+
+    async fn handle_inbox_poll(&mut self, client_id: String) -> EventOutcome {
+        // Check if client is online
+        let step = self.clock.simulated_time as usize;
+        let is_online = self
+            .clients
+            .get(&client_id)
+            .map(|c| c.is_online(step))
+            .unwrap_or(false);
+
+        if !is_online {
+            return EventOutcome::InboxPolled {
+                messages_fetched: 0,
+            };
+        }
+
+        // Fetch messages from relay
+        let envelopes = fetch_inbox(&self.relay_base_url, &client_id).await.unwrap_or_default();
+        let messages_fetched = envelopes.len();
+
+        if messages_fetched > 0 {
+            self.log_event(format!(
+                "Client {} polled inbox: {} messages",
+                client_id, messages_fetched
+            ));
+        }
+
+        // Handle inbox messages
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            let mut context = ClientContext {
+                direct_enabled: self.direct_enabled,
+                ttl_seconds: self.ttl_seconds,
+                encryption: self.encryption.clone(),
+                direct_links: &self.direct_links,
+                neighbors: &self.neighbors,
+                keypairs: &self.keypairs,
+                message_history: &mut self.message_history,
+                message_send_steps: &mut self.message_send_steps,
+                pending_forwarded_messages: &mut self.pending_forwarded_messages,
+                metrics: &mut self.metrics,
+                metrics_tracker: &mut self.metrics_tracker,
+            };
+
+            client.handle_inbox(step, envelopes, &mut context, None);
+        }
+
+        // Schedule next poll if still online (default: 60 seconds)
+        if is_online {
+            let next_poll_time = self.clock.simulated_time + 60.0;
+            self.event_queue.push(
+                next_poll_time,
+                Event::InboxPoll {
+                    client_id: client_id.clone(),
+                },
+            );
+        }
+
+        EventOutcome::InboxPolled { messages_fetched }
+    }
+
+    async fn handle_online_announce(&mut self, client_id: String) -> EventOutcome {
+        self.log_event(format!("Client {} announcing online status", client_id));
+
+        // In the event-based simulation, we don't need to do anything specific here
+        // as the online state is already updated. This event is mainly for logging
+        // and potential future extensions.
+
+        EventOutcome::OnlineAnnounced
+    }
+
+    async fn trigger_store_and_forward(&mut self, client_id: &str) {
+        // Build online_set with only this client (the one that just came online)
+        let mut online_set = HashSet::new();
+        online_set.insert(client_id.to_string());
+
+        let step = self.clock.simulated_time as usize;
+
+        // Collect envelopes to forward from all clients
+        let mut forward_envelopes = Vec::new();
+
+        // Get all client IDs upfront to avoid borrow checker issues
+        let client_ids: Vec<String> = self.clients.keys().cloned().collect();
+
+        for peer_id in client_ids {
+            if let Some(client) = self.clients.get_mut(&peer_id) {
+                let mut context = ClientContext {
+                    direct_enabled: self.direct_enabled,
+                    ttl_seconds: self.ttl_seconds,
+                    encryption: self.encryption.clone(),
+                    direct_links: &self.direct_links,
+                    neighbors: &self.neighbors,
+                    keypairs: &self.keypairs,
+                    message_history: &mut self.message_history,
+                    message_send_steps: &mut self.message_send_steps,
+                    pending_forwarded_messages: &mut self.pending_forwarded_messages,
+                    metrics: &mut self.metrics,
+                    metrics_tracker: &mut self.metrics_tracker,
+                };
+
+                // Trigger store-and-forward delivery
+                forward_envelopes.extend(client.forward_store_forwards(step, &online_set, &mut context));
+            }
+        }
+
+        // Post forwarded messages to relay
+        for envelope in forward_envelopes {
+            let _ = post_envelope(&self.relay_base_url, &envelope).await;
+        }
+    }
+
     pub async fn run(&mut self, duration_seconds: f64) -> SimulationReport {
         self.log_event(format!(
             "Starting event-based simulation for {:.2} seconds",
@@ -1294,15 +1450,13 @@ impl EventBasedHarness {
                             .await
                     }
                     Event::OnlineTransition {
-                        client_id: _,
+                        client_id,
                         going_online,
-                    } => EventOutcome::OnlineTransitioned {
-                        new_state: going_online,
-                    },
-                    Event::InboxPoll { client_id: _ } => EventOutcome::InboxPolled {
-                        messages_fetched: 0,
-                    },
-                    Event::OnlineAnnounce { client_id: _ } => EventOutcome::OnlineAnnounced,
+                    } => self.handle_online_transition(client_id, going_online).await,
+                    Event::InboxPoll { client_id } => self.handle_inbox_poll(client_id).await,
+                    Event::OnlineAnnounce { client_id } => {
+                        self.handle_online_announce(client_id).await
+                    }
                     Event::CustomAction { .. } => {
                         EventOutcome::CustomActionExecuted { success: true }
                     }

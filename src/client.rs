@@ -1027,6 +1027,10 @@ impl Client for RelayClient {
     ) -> Option<usize> {
         None
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1150,12 +1154,16 @@ pub(crate) trait Client: Send {
         context: &mut ClientContext<'_>,
         rolling_latency: Option<&mut RollingLatencyTracker>,
     ) -> Option<usize>;
+
+    /// Downcast to Any for event-based simulation
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 #[derive(Clone)]
 pub struct SimulationClient {
     id: String,
     schedule: Vec<bool>,
+    online_state: Option<bool>, // Event-based online state (None = use schedule)
     inbox: Vec<SimMessage>,
     seen: HashSet<String>,
     last_seen_by_peer: HashMap<String, u64>,
@@ -1174,6 +1182,7 @@ impl std::fmt::Debug for SimulationClient {
         f.debug_struct("SimulationClient")
             .field("id", &self.id)
             .field("schedule", &self.schedule)
+            .field("online_state", &self.online_state)
             .field("inbox", &self.inbox)
             .field("seen", &self.seen)
             .field("last_seen_by_peer", &self.last_seen_by_peer)
@@ -1204,6 +1213,7 @@ impl SimulationClient {
         Self {
             id: id.to_string(),
             schedule,
+            online_state: None, // None means use schedule for backward compatibility
             inbox: Vec::new(),
             seen: HashSet::new(),
             last_seen_by_peer: HashMap::new(),
@@ -1964,7 +1974,37 @@ impl SimulationClient {
     }
 
     fn online_at(&self, step: usize) -> bool {
-        self.schedule.get(step).copied().unwrap_or(false)
+        // Use online_state if set (event-based mode), otherwise use schedule (step-based mode)
+        if let Some(online) = self.online_state {
+            online
+        } else {
+            self.schedule.get(step).copied().unwrap_or(false)
+        }
+    }
+
+    /// Set online state for event-based simulation
+    pub fn set_online(&mut self, online: bool) {
+        self.online_state = Some(online);
+    }
+
+    /// Create a client for event-based simulation (no schedule needed)
+    pub fn new_event_based(id: &str, log_sink: Option<std::sync::Arc<dyn ClientLogSink>>) -> Self {
+        Self {
+            id: id.to_string(),
+            schedule: Vec::new(), // Empty schedule for event-based mode
+            online_state: Some(false), // Start offline by default
+            inbox: Vec::new(),
+            seen: HashSet::new(),
+            last_seen_by_peer: HashMap::new(),
+            pending_online_broadcasts: Vec::new(),
+            stored_forwards: Vec::new(),
+            metrics: ClientMetrics::default(),
+            log_sink,
+            peer_registry: PeerRegistry::new(),
+            public_message_cache: Vec::new(),
+            public_message_metadata: HashMap::new(),
+            group_manager: GroupManager::new(),
+        }
     }
 }
 
@@ -2308,6 +2348,10 @@ impl Client for SimulationClient {
             tracker.record(latency);
         }
         Some(latency)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

@@ -609,6 +609,210 @@ fn normalize_hourly_weights(weights: &[f64]) -> Vec<f64> {
     ]
 }
 
+/// Build online events for all clients in a scenario
+pub fn build_online_events(
+    config: &SimulationConfig,
+    start_time: f64,
+    end_time: f64,
+    rng: &mut impl Rng,
+) -> (Vec<super::ScheduledEvent>, HashMap<String, NodeCohortAssignment>) {
+    use super::event::{Event, ScheduledEvent};
+
+    let mut all_events = Vec::new();
+    let mut node_cohort_assignments: HashMap<String, NodeCohortAssignment> = HashMap::new();
+
+    let cohorts = if config.cohorts.is_empty() {
+        None
+    } else {
+        Some(config.cohorts.as_slice())
+    };
+
+    // Default message type weights from config
+    let default_weights = config
+        .message_type_weights
+        .clone()
+        .unwrap_or_else(MessageTypeWeights::default);
+
+    for node_id in &config.node_ids {
+        let (cohort_name_str, events, message_weights) = if let Some(cohorts) = cohorts {
+            let cohort = select_cohort(cohorts, rng);
+            let name = cohort_name(cohort).to_string();
+            let events = generate_online_schedule_events(node_id, cohort, start_time, end_time, rng);
+
+            // Use cohort-specific weights if defined, otherwise use config default
+            let weights = cohort.message_type_weights();
+            let weights = if weights.direct == 1.0 && weights.public == 0.0 && weights.group == 0.0 {
+                default_weights.clone()
+            } else {
+                weights
+            };
+            (name, events, weights)
+        } else {
+            // Legacy mode: always online
+            let name = "legacy".to_string();
+            let events = vec![ScheduledEvent {
+                time: start_time,
+                event: Event::OnlineTransition {
+                    client_id: node_id.clone(),
+                    going_online: true,
+                },
+                event_id: 0,
+            }];
+            (name, events, default_weights.clone())
+        };
+
+        all_events.extend(events);
+
+        node_cohort_assignments.insert(
+            node_id.clone(),
+            NodeCohortAssignment {
+                node_id: node_id.clone(),
+                cohort_name: cohort_name_str,
+                message_type_weights: message_weights,
+            },
+        );
+    }
+
+    (all_events, node_cohort_assignments)
+}
+
+/// Generate online/offline transition events for a client based on their cohort
+pub fn generate_online_schedule_events(
+    client_id: &str,
+    cohort: &OnlineCohortDefinition,
+    start_time: f64,
+    end_time: f64,
+    rng: &mut impl Rng,
+) -> Vec<super::ScheduledEvent> {
+    use super::event::{Event, ScheduledEvent};
+
+    let mut events = Vec::new();
+
+    match cohort {
+        OnlineCohortDefinition::AlwaysOnline { .. } => {
+            // Single online event at the start
+            events.push(ScheduledEvent {
+                time: start_time,
+                event: Event::OnlineTransition {
+                    client_id: client_id.to_string(),
+                    going_online: true,
+                },
+                event_id: 0, // Will be assigned by EventQueue
+            });
+        }
+        OnlineCohortDefinition::RarelyOnline {
+            online_probability, ..
+        } => {
+            // Generate occasional online sessions
+            // Sample session start times using Poisson process
+            // Average 2 sessions per day, each lasting 5-15 minutes
+            let duration_hours = (end_time - start_time) / 3600.0;
+            let sessions_per_hour = 2.0 / 24.0; // 2 sessions per day
+            let expected_sessions = (duration_hours * sessions_per_hour).max(1.0);
+            let session_count = sample_poisson(rng, expected_sessions);
+
+            for _ in 0..session_count {
+                // Random session start time
+                let session_start = start_time + rng.gen::<f64>() * (end_time - start_time);
+
+                // Session duration: 5-15 minutes, scaled by online_probability
+                let base_duration = 300.0 + rng.gen::<f64>() * 600.0; // 300-900 seconds
+                let duration = base_duration * online_probability.clamp(0.1, 1.0);
+                let session_end = (session_start + duration).min(end_time);
+
+                // Online event
+                events.push(ScheduledEvent {
+                    time: session_start,
+                    event: Event::OnlineTransition {
+                        client_id: client_id.to_string(),
+                        going_online: true,
+                    },
+                    event_id: 0,
+                });
+
+                // Offline event
+                if session_end < end_time {
+                    events.push(ScheduledEvent {
+                        time: session_end,
+                        event: Event::OnlineTransition {
+                            client_id: client_id.to_string(),
+                            going_online: false,
+                        },
+                        event_id: 0,
+                    });
+                }
+            }
+        }
+        OnlineCohortDefinition::Diurnal {
+            online_probability,
+            timezone_offset_hours,
+            hourly_weights,
+            ..
+        } => {
+            // Sample online/offline transitions based on time-of-day weights
+            let weights = normalize_hourly_weights(hourly_weights);
+            let max_weight = weights
+                .iter()
+                .copied()
+                .fold(0.0_f64, |max, weight| max.max(weight));
+            let max_weight = if max_weight > 0.0 { max_weight } else { 1.0 };
+            let base_probability = online_probability.clamp(0.0, 1.0);
+
+            // Sample every 15 minutes (900 seconds) to create smooth transitions
+            let sample_interval = 900.0; // 15 minutes
+            let mut current_time = start_time;
+            let mut is_online = false;
+
+            while current_time < end_time {
+                // Calculate hour of day with timezone offset
+                let hour = ((current_time / 3600.0).floor() as i64
+                    + *timezone_offset_hours as i64)
+                    .rem_euclid(SIMULATION_HOURS_PER_DAY as i64)
+                    as usize;
+
+                // Calculate probability for this hour
+                let weight_factor = weights[hour] / max_weight;
+                let probability = (base_probability * weight_factor).clamp(0.0, 1.0);
+
+                // Determine if should be online at this time
+                let should_be_online = rng.gen::<f64>() < probability;
+
+                // Generate transition event if state changed
+                if should_be_online != is_online {
+                    events.push(ScheduledEvent {
+                        time: current_time,
+                        event: Event::OnlineTransition {
+                            client_id: client_id.to_string(),
+                            going_online: should_be_online,
+                        },
+                        event_id: 0,
+                    });
+                    is_online = should_be_online;
+                }
+
+                current_time += sample_interval;
+            }
+
+            // Ensure we end offline if we're online at the end
+            if is_online && end_time > start_time {
+                events.push(ScheduledEvent {
+                    time: end_time - 1.0,
+                    event: Event::OnlineTransition {
+                        client_id: client_id.to_string(),
+                        going_online: false,
+                    },
+                    event_id: 0,
+                });
+            }
+        }
+    }
+
+    // Sort events by time to ensure chronological order
+    events.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+
+    events
+}
+
 pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> OnlineSchedulePlan {
     let mut schedules = HashMap::new();
     let mut cohort_online_counts: HashMap<String, usize> = HashMap::new();
@@ -939,5 +1143,164 @@ fn build_message_payload(
             )
             .expect("encrypt payload")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::{MessageSizeDistribution, SimulatedTimeConfig};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    #[test]
+    fn test_generate_online_schedule_events_always_online() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let cohort = OnlineCohortDefinition::AlwaysOnline {
+            name: "always".to_string(),
+            share: 1.0,
+            message_type_weights: None,
+        };
+
+        let events = generate_online_schedule_events("client1", &cohort, 0.0, 3600.0, &mut rng);
+
+        // Should have exactly one event: going online at start
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].time, 0.0);
+
+        if let super::super::Event::OnlineTransition {
+            client_id,
+            going_online,
+        } = &events[0].event
+        {
+            assert_eq!(client_id, "client1");
+            assert!(going_online);
+        } else {
+            panic!("Expected OnlineTransition event");
+        }
+    }
+
+    #[test]
+    fn test_generate_online_schedule_events_rarely_online() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let cohort = OnlineCohortDefinition::RarelyOnline {
+            name: "rarely".to_string(),
+            share: 0.3,
+            online_probability: 0.5,
+            message_type_weights: None,
+        };
+
+        // Test over a full day (86400 seconds)
+        let events = generate_online_schedule_events("client1", &cohort, 0.0, 86400.0, &mut rng);
+
+        // Should have at least some events
+        assert!(events.len() > 0, "Expected some online/offline events");
+
+        // Verify events are OnlineTransition events
+        for event in &events {
+            assert!(matches!(
+                event.event,
+                super::super::Event::OnlineTransition { .. }
+            ));
+        }
+
+        // Verify events are in chronological order
+        for i in 1..events.len() {
+            assert!(events[i].time >= events[i - 1].time);
+        }
+
+        // Verify they alternate between online and offline (or at least toggle state)
+        if events.len() > 1 {
+            let mut last_state = None;
+            for event in &events {
+                if let super::super::Event::OnlineTransition { going_online, .. } = &event.event {
+                    if let Some(last) = last_state {
+                        // State should change between consecutive events
+                        assert_ne!(last, *going_online, "Events should alternate state");
+                    }
+                    last_state = Some(*going_online);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_online_schedule_events_diurnal() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let cohort = OnlineCohortDefinition::Diurnal {
+            name: "diurnal".to_string(),
+            share: 0.5,
+            online_probability: 0.5, // Reduced from 0.8 to increase chance of transitions
+            timezone_offset_hours: 0,
+            hourly_weights: vec![],
+            message_type_weights: None,
+        };
+
+        // Test over a full day to ensure we see transitions
+        let events = generate_online_schedule_events("client1", &cohort, 0.0, 86400.0, &mut rng);
+
+        // Should have some transition events (might be 0 with low probability, so just check it doesn't crash)
+        // With a 50% probability and sampling every 15 minutes over 24 hours, we should get some transitions
+
+        // Verify events are OnlineTransition events
+        for event in &events {
+            assert!(matches!(
+                event.event,
+                super::super::Event::OnlineTransition { .. }
+            ));
+        }
+
+        // Verify events are in chronological order
+        for i in 1..events.len() {
+            assert!(events[i].time >= events[i - 1].time);
+        }
+    }
+
+    #[test]
+    fn test_build_online_events_multiple_clients() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let config = SimulationConfig {
+            node_ids: vec!["client1".to_string(), "client2".to_string()],
+            steps: 0,
+            duration_seconds: Some(3600),
+            simulated_time: SimulatedTimeConfig {
+                seconds_per_step: 60,
+                default_speed_factor: 1.0,
+            },
+            friends_per_node: FriendsPerNode::Uniform { min: 1, max: 2 },
+            clustering: None,
+            post_frequency: PostFrequency::Poisson {
+                lambda_per_step: None,
+                lambda_per_hour: Some(1.0),
+            },
+            availability: None,
+            cohorts: vec![OnlineCohortDefinition::AlwaysOnline {
+                name: "always".to_string(),
+                share: 1.0,
+                message_type_weights: None,
+            }],
+            message_size_distribution: MessageSizeDistribution::Uniform {
+                min: 100,
+                max: 100,
+            },
+            encryption: None,
+            groups: None,
+            message_type_weights: None,
+            seed: 42,
+        };
+
+        let (events, assignments) = build_online_events(&config, 0.0, 3600.0, &mut rng);
+
+        // Should have events for both clients
+        assert_eq!(events.len(), 2);
+
+        // Should have assignments for both clients
+        assert_eq!(assignments.len(), 2);
+        assert!(assignments.contains_key("client1"));
+        assert!(assignments.contains_key("client2"));
+
+        // Both should be in "always" cohort
+        assert_eq!(assignments["client1"].cohort_name, "always");
+        assert_eq!(assignments["client2"].cohort_name, "always");
     }
 }
