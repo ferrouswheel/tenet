@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use rand::Rng;
+use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::relay::RelayConfig;
@@ -367,4 +369,98 @@ pub struct SimulationScenarioConfig {
     pub simulation: SimulationConfig,
     pub relay: RelayConfigToml,
     pub direct_enabled: Option<bool>,
+}
+
+/// Latency distribution for network operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LatencyDistribution {
+    /// Fixed latency (e.g., 0.5 seconds)
+    Fixed { seconds: f64 },
+
+    /// Uniform random latency
+    Uniform { min: f64, max: f64 },
+
+    /// Normal distribution (mean, std_dev)
+    Normal { mean: f64, std_dev: f64 },
+
+    /// Log-normal (for heavy-tailed delays)
+    LogNormal { mean: f64, std_dev: f64 },
+}
+
+impl Default for LatencyDistribution {
+    fn default() -> Self {
+        LatencyDistribution::Fixed { seconds: 0.0 }
+    }
+}
+
+impl LatencyDistribution {
+    /// Sample a latency value from the distribution
+    pub fn sample(&self, rng: &mut impl Rng) -> f64 {
+        match self {
+            LatencyDistribution::Fixed { seconds } => *seconds,
+            LatencyDistribution::Uniform { min, max } => min + rng.gen::<f64>() * (max - min),
+            LatencyDistribution::Normal { mean, std_dev } => {
+                let normal = Normal::new(*mean, *std_dev).unwrap_or(Normal::new(0.0, 1.0).unwrap());
+                normal.sample(rng).max(0.0)
+            }
+            LatencyDistribution::LogNormal { mean, std_dev } => {
+                let log_normal =
+                    LogNormal::new(*mean, *std_dev).unwrap_or(LogNormal::new(0.0, 1.0).unwrap());
+                log_normal.sample(rng)
+            }
+        }
+    }
+}
+
+/// Network conditions for event-based simulation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConditions {
+    /// Latency for direct peer-to-peer delivery
+    #[serde(default)]
+    pub direct_latency: LatencyDistribution,
+
+    /// Latency for posting to relay
+    #[serde(default)]
+    pub relay_post_latency: LatencyDistribution,
+
+    /// Latency for fetching from relay
+    #[serde(default)]
+    pub relay_fetch_latency: LatencyDistribution,
+
+    /// Probability of message drop (0.0 = no drops, 0.1 = 10% drop rate)
+    #[serde(default)]
+    pub drop_probability: f64,
+}
+
+impl Default for NetworkConditions {
+    fn default() -> Self {
+        NetworkConditions {
+            direct_latency: LatencyDistribution::default(),
+            relay_post_latency: LatencyDistribution::default(),
+            relay_fetch_latency: LatencyDistribution::default(),
+            drop_probability: 0.0,
+        }
+    }
+}
+
+/// Time control configuration for event-based simulation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeControlConfig {
+    /// Initial time control mode
+    #[serde(default)]
+    pub mode: crate::simulation::event::TimeControlMode,
+
+    /// Speed factor for real-time mode (simulated_seconds / real_seconds)
+    #[serde(default = "default_speed_factor")]
+    pub speed_factor: f64,
+}
+
+impl Default for TimeControlConfig {
+    fn default() -> Self {
+        TimeControlConfig {
+            mode: crate::simulation::event::TimeControlMode::FastForward,
+            speed_factor: default_speed_factor(),
+        }
+    }
 }

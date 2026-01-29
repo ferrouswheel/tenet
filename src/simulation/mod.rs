@@ -10,6 +10,7 @@ use crate::protocol::{Envelope, MessageKind};
 use crate::relay::{app, RelayConfig, RelayControl, RelayState};
 
 pub mod config;
+pub mod event;
 pub mod metrics;
 pub mod random;
 pub mod scenario;
@@ -17,9 +18,14 @@ pub mod scenario;
 pub use crate::client::SimulationClient;
 pub use config::{
     ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution, GroupsConfig,
-    MessageEncryption, MessageSizeDistribution, MessageType, MessageTypeWeights,
-    OnlineAvailability, OnlineCohortDefinition, PostFrequency, RelayConfigToml,
-    SimulatedTimeConfig, SimulationConfig, SimulationScenarioConfig, SimulationTimingConfig,
+    LatencyDistribution, MessageEncryption, MessageSizeDistribution, MessageType,
+    MessageTypeWeights, NetworkConditions, OnlineAvailability, OnlineCohortDefinition,
+    PostFrequency, RelayConfigToml, SimulatedTimeConfig, SimulationConfig,
+    SimulationScenarioConfig, SimulationTimingConfig, TimeControlConfig,
+};
+pub use event::{
+    Event, EventLog, EventOutcome, EventQueue, ProcessedEvent, ScheduledEvent, SimulationClock,
+    TimeControlMode,
 };
 pub use metrics::{
     CountSummary, LatencyHistogram, MetricsTracker, RollingLatencySnapshot, RollingLatencyTracker,
@@ -65,6 +71,12 @@ pub enum SimulationControlCommand {
     },
     SetPaused {
         paused: bool,
+    },
+    SetTimeControlMode {
+        mode: TimeControlMode,
+    },
+    JumpToTime {
+        time: f64,
     },
     Stop,
 }
@@ -293,6 +305,14 @@ impl SimulationHarness {
                 );
             }
             SimulationControlCommand::SetPaused { .. } | SimulationControlCommand::Stop => {}
+            SimulationControlCommand::SetTimeControlMode { .. } => {
+                // Event-based time control, not applicable to step-based simulation
+                self.log_action(step, "SetTimeControlMode ignored (event-based only)".to_string());
+            }
+            SimulationControlCommand::JumpToTime { .. } => {
+                // Event-based time control, not applicable to step-based simulation
+                self.log_action(step, "JumpToTime ignored (event-based only)".to_string());
+            }
         }
     }
 

@@ -2052,7 +2052,7 @@ impl Client for SimulationClient {
                         timestamp,
                         context.ttl_seconds,
                         MessageKind::FriendGroup,
-                        group_id,                  // group_id - required for FriendGroup
+                        group_id, // group_id - required for FriendGroup
                         message.payload.clone(),
                         &sender_keypair.signing_private_key_hex,
                     ) {

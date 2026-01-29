@@ -305,13 +305,13 @@ async fn simulation_harness_applies_dynamic_updates() {
 
 #[test]
 fn test_groups_and_message_type_distribution() {
-    use tenet::simulation::{
-        build_simulation_inputs, GroupMembershipsPerNode, GroupSizeDistribution, GroupsConfig,
-        MessageTypeWeights, SimulationConfig, SimulatedTimeConfig, FriendsPerNode, PostFrequency,
-        MessageSizeDistribution,
-    };
     use tenet::protocol::MessageKind;
-    
+    use tenet::simulation::{
+        build_simulation_inputs, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution,
+        GroupsConfig, MessageSizeDistribution, MessageTypeWeights, PostFrequency,
+        SimulatedTimeConfig, SimulationConfig,
+    };
+
     let config = SimulationConfig {
         node_ids: vec![
             "peer-1".to_string(),
@@ -347,20 +347,20 @@ fn test_groups_and_message_type_distribution() {
         }),
         seed: 12345,
     };
-    
+
     let inputs = build_simulation_inputs(&config);
-    
+
     // Print debug info
     println!("\nGroups created: {}", inputs.groups.len());
     for (group_id, group_info) in &inputs.groups {
         println!("  {} - members: {:?}", group_id, group_info.members);
     }
-    
+
     println!("\nNode group assignments:");
     for (node_id, groups) in &inputs.node_groups {
         println!("  {} -> {:?}", node_id, groups);
     }
-    
+
     // Count message types
     let mut direct_count = 0;
     let mut public_count = 0;
@@ -373,20 +373,27 @@ fn test_groups_and_message_type_distribution() {
             _ => {}
         }
     }
-    
+
     println!("\nPlanned messages:");
     println!("  Total: {}", inputs.planned_sends.len());
     println!("  Direct: {}", direct_count);
     println!("  Public: {}", public_count);
     println!("  FriendGroup: {}", group_count);
-    
+
     // Verify groups were created
-    assert!(inputs.groups.len() >= 1, "At least one group should be created");
-    
+    assert!(
+        inputs.groups.len() >= 1,
+        "At least one group should be created"
+    );
+
     // Verify some nodes are in groups
-    let nodes_in_groups: usize = inputs.node_groups.values().filter(|g| !g.is_empty()).count();
+    let nodes_in_groups: usize = inputs
+        .node_groups
+        .values()
+        .filter(|g| !g.is_empty())
+        .count();
     assert!(nodes_in_groups > 0, "Some nodes should be in groups");
-    
+
     // With 40% group weight, we should have some group messages
     // (assuming nodes are in groups)
     if nodes_in_groups > 0 {
