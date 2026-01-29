@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tenet::client::{ClientLogEvent, ClientLogSink};
 use tenet::crypto::generate_keypair;
-use tenet::protocol::{build_plaintext_payload, ContentId};
+use tenet::protocol::{build_plaintext_payload, ContentId, MessageKind};
 use tenet::relay::RelayConfig;
 use tenet::simulation::{
     start_relay, MessageEncryption, PlannedSend, SimMessage, SimulationClient, SimulationHarness,
@@ -97,6 +97,8 @@ async fn simulation_client_direct_and_store_forward_paths_increment_metrics() {
                 recipient: "node-b".to_string(),
                 body: "store-forward".to_string(),
                 payload,
+                message_kind: MessageKind::Direct,
+                group_id: None,
             },
         },
         PlannedSend {
@@ -107,6 +109,8 @@ async fn simulation_client_direct_and_store_forward_paths_increment_metrics() {
                 recipient: "node-b".to_string(),
                 body: "direct".to_string(),
                 payload: direct_payload,
+                message_kind: MessageKind::Direct,
+                group_id: None,
             },
         },
     ];
@@ -286,4 +290,3 @@ fn test_group_creation_and_management() {
     let updated = client.get_group("group-1").expect("get updated group");
     assert!(!updated.is_member("node-c"));
 }
-

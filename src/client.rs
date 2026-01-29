@@ -1375,6 +1375,8 @@ impl SimulationClient {
             recipient: self.id.clone(),
             body: envelope.payload.body.clone(),
             payload: envelope.payload.clone(),
+            message_kind: MessageKind::Public,
+            group_id: None,
         };
         self.receive_message(sim_message);
 
@@ -1569,6 +1571,8 @@ impl SimulationClient {
             recipient: self.id.clone(),
             body,
             payload: envelope.payload.clone(),
+            message_kind: MessageKind::FriendGroup,
+            group_id: Some(group_id.clone()),
         };
         let received = self.receive_message(sim_message);
 
@@ -1748,6 +1752,8 @@ impl SimulationClient {
             recipient: envelope.header.recipient_id.clone(),
             body,
             payload: envelope.payload.clone(),
+            message_kind: MessageKind::Direct,
+            group_id: None,
         })
     }
 
@@ -2008,62 +2014,121 @@ impl Client for SimulationClient {
             let Some(sender_keypair) = context.keypairs.get(&message.sender) else {
                 continue;
             };
-            let envelope = match build_envelope_from_payload(
-                message.sender.clone(),
-                message.recipient.clone(),
-                None,
-                None,
-                timestamp,
-                context.ttl_seconds,
-                MessageKind::Direct,
-                None,
-                message.payload.clone(),
-                &sender_keypair.signing_private_key_hex,
-            ) {
-                Ok(envelope) => envelope,
-                Err(_) => continue,
-            };
-            self.record_message_send(message, step, &envelope, context);
-            self.metrics.messages_sent = self.metrics.messages_sent.saturating_add(1);
-            let recipient_online = online_set.contains(&message.recipient);
-            if context.direct_enabled
-                && context
-                    .direct_links
-                    .contains(&(message.sender.clone(), message.recipient.clone()))
-                && recipient_online
-            {
-                if let Some(decoded) =
-                    self.decode_direct_envelope(&envelope, &message.id, &message.recipient, context)
-                {
-                    direct_deliveries.push(decoded);
-                }
-            }
 
-            if !recipient_online {
-                if let Some(storage_peer_id) =
-                    self.select_storage_peer(&message.sender, &message.recipient, context)
-                {
-                    if let Some(store_envelope) = self.build_store_for_envelope(
-                        &message.sender,
-                        &storage_peer_id,
-                        &message.recipient,
+            // Handle different message kinds
+            match message.message_kind {
+                MessageKind::Public => {
+                    // Public messages are broadcast - recipient is "*"
+                    let envelope = match build_envelope_from_payload(
+                        message.sender.clone(),
+                        "*".to_string(),
+                        None,
+                        None,
                         timestamp,
-                        &envelope,
-                        context,
+                        context.ttl_seconds,
+                        MessageKind::Public,
+                        None,
+                        message.payload.clone(),
+                        &sender_keypair.signing_private_key_hex,
                     ) {
-                        context
-                            .metrics_tracker
-                            .record_send(message, step, &store_envelope);
-                        envelopes.push(store_envelope);
-                        continue;
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    self.record_message_send(message, step, &envelope, context);
+                    self.metrics.messages_sent = self.metrics.messages_sent.saturating_add(1);
+                    context
+                        .metrics_tracker
+                        .record_send(message, step, &envelope);
+                    envelopes.push(envelope);
+                }
+                MessageKind::FriendGroup => {
+                    // Group messages - recipient field contains group ID for tracking
+                    let group_id = message.group_id.clone();
+                    let envelope = match build_envelope_from_payload(
+                        message.sender.clone(),
+                        message.recipient.clone(), // Group ID as recipient for routing
+                        group_id.clone(),
+                        None,
+                        timestamp,
+                        context.ttl_seconds,
+                        MessageKind::FriendGroup,
+                        None,
+                        message.payload.clone(),
+                        &sender_keypair.signing_private_key_hex,
+                    ) {
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    self.record_message_send(message, step, &envelope, context);
+                    self.metrics.messages_sent = self.metrics.messages_sent.saturating_add(1);
+                    context
+                        .metrics_tracker
+                        .record_send(message, step, &envelope);
+                    envelopes.push(envelope);
+                }
+                _ => {
+                    // Direct messages and any other kind - original behavior
+                    let envelope = match build_envelope_from_payload(
+                        message.sender.clone(),
+                        message.recipient.clone(),
+                        None,
+                        None,
+                        timestamp,
+                        context.ttl_seconds,
+                        MessageKind::Direct,
+                        None,
+                        message.payload.clone(),
+                        &sender_keypair.signing_private_key_hex,
+                    ) {
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    self.record_message_send(message, step, &envelope, context);
+                    self.metrics.messages_sent = self.metrics.messages_sent.saturating_add(1);
+                    let recipient_online = online_set.contains(&message.recipient);
+                    if context.direct_enabled
+                        && context
+                            .direct_links
+                            .contains(&(message.sender.clone(), message.recipient.clone()))
+                        && recipient_online
+                    {
+                        if let Some(decoded) = self.decode_direct_envelope(
+                            &envelope,
+                            &message.id,
+                            &message.recipient,
+                            context,
+                        ) {
+                            direct_deliveries.push(decoded);
+                        }
                     }
+
+                    if !recipient_online {
+                        if let Some(storage_peer_id) =
+                            self.select_storage_peer(&message.sender, &message.recipient, context)
+                        {
+                            if let Some(store_envelope) = self.build_store_for_envelope(
+                                &message.sender,
+                                &storage_peer_id,
+                                &message.recipient,
+                                timestamp,
+                                &envelope,
+                                context,
+                            ) {
+                                context
+                                    .metrics_tracker
+                                    .record_send(message, step, &store_envelope);
+                                envelopes.push(store_envelope);
+                                continue;
+                            }
+                        }
+                    }
+
+                    context
+                        .metrics_tracker
+                        .record_send(message, step, &envelope);
+                    envelopes.push(envelope);
                 }
             }
-
-            context
-                .metrics_tracker
-                .record_send(message, step, &envelope);
-            envelopes.push(envelope);
         }
         ClientSendOutcome {
             envelopes,
