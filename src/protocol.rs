@@ -283,6 +283,7 @@ pub struct Payload {
 pub const PLAINTEXT_CONTENT_TYPE: &str = "text/plain";
 pub const ENCRYPTED_CONTENT_TYPE: &str = "application/json;type=tenet.encrypted";
 pub const META_CONTENT_TYPE: &str = "application/json;type=tenet.meta";
+pub const GROUP_ENCRYPTED_CONTENT_TYPE: &str = "application/json;type=tenet.group_encrypted";
 
 /// Metadata-only protocol messages (e.g., presence and recovery hints).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +443,12 @@ pub struct EncryptedPayload {
     pub wrapped_key: WrappedKeyPayload,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupEncryptedPayload {
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
 #[derive(Debug)]
 pub enum PayloadCryptoError {
     Crypto(CryptoError),
@@ -549,6 +556,49 @@ pub fn decrypt_encrypted_payload(
     let nonce = URL_SAFE_NO_PAD.decode(encrypted.nonce_b64.as_bytes())?;
     let ciphertext = URL_SAFE_NO_PAD.decode(encrypted.ciphertext_b64.as_bytes())?;
     Ok(decrypt_payload(&content_key, &nonce, &ciphertext, aad)?)
+}
+
+/// Build a payload for a group message encrypted with a symmetric group key
+pub fn build_group_message_payload(
+    plaintext: impl AsRef<[u8]>,
+    group_key: &[u8; 32],
+    aad: &[u8],
+) -> Result<Payload, PayloadCryptoError> {
+    let (ciphertext, nonce) =
+        crate::crypto::encrypt_group_payload(plaintext.as_ref(), group_key, aad)?;
+
+    let group_encrypted = GroupEncryptedPayload {
+        nonce_b64: URL_SAFE_NO_PAD.encode(&nonce),
+        ciphertext_b64: URL_SAFE_NO_PAD.encode(&ciphertext),
+    };
+
+    let payload_body = serde_json::to_string(&group_encrypted)?;
+    let payload_id = ContentId::from_bytes(payload_body.as_bytes());
+
+    Ok(Payload {
+        id: payload_id,
+        content_type: GROUP_ENCRYPTED_CONTENT_TYPE.to_string(),
+        body: payload_body,
+        attachments: Vec::new(),
+    })
+}
+
+/// Decrypt a group message payload using a symmetric group key
+pub fn decrypt_group_message_payload(
+    payload: &Payload,
+    group_key: &[u8; 32],
+    aad: &[u8],
+) -> Result<Vec<u8>, PayloadCryptoError> {
+    let group_encrypted: GroupEncryptedPayload = serde_json::from_str(&payload.body)?;
+    let nonce = URL_SAFE_NO_PAD.decode(group_encrypted.nonce_b64.as_bytes())?;
+    let ciphertext = URL_SAFE_NO_PAD.decode(group_encrypted.ciphertext_b64.as_bytes())?;
+
+    Ok(crate::crypto::decrypt_group_payload(
+        &ciphertext,
+        &nonce,
+        group_key,
+        aad,
+    )?)
 }
 
 /// Envelope binding a header to an encrypted payload.

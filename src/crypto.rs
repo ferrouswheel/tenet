@@ -345,6 +345,68 @@ pub fn verify_signature(
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
+/// Encrypt a payload for a group using a symmetric group key
+///
+/// Returns (ciphertext, nonce) tuple
+pub fn encrypt_group_payload(
+    plaintext: &[u8],
+    group_key: &[u8; 32],
+    aad: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        ChaCha20Poly1305,
+    };
+
+    let cipher = ChaCha20Poly1305::new(group_key.into());
+
+    // Generate a random nonce
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
+
+    let ciphertext = cipher
+        .encrypt(&nonce_bytes.into(), payload)
+        .map_err(CryptoError::Aead)?;
+
+    Ok((ciphertext, nonce_bytes.to_vec()))
+}
+
+/// Decrypt a group payload using a symmetric group key
+pub fn decrypt_group_payload(
+    ciphertext: &[u8],
+    nonce: &[u8],
+    group_key: &[u8; 32],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        ChaCha20Poly1305,
+    };
+
+    if nonce.len() != 12 {
+        return Err(CryptoError::InvalidLength("nonce must be 12 bytes"));
+    }
+
+    let cipher = ChaCha20Poly1305::new(group_key.into());
+
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(nonce);
+
+    let payload = Payload {
+        msg: ciphertext,
+        aad,
+    };
+
+    cipher
+        .decrypt(&nonce_bytes.into(), payload)
+        .map_err(CryptoError::Aead)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

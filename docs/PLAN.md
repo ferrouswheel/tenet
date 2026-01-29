@@ -307,7 +307,7 @@ Create new scenario files:
 1. ✅ **Phase 1.1**: True cryptographic signatures (CRITICAL for security) - **COMPLETE**
 2. ✅ **Phase 1.2**: Peer directory for public key lookup - **COMPLETE**
 3. ✅ **Phase 2**: Public messages (requested by user) - **COMPLETE**
-4. **Phase 3**: Group messages (requested by user)
+4. ✅ **Phase 3**: Group messages (requested by user) - **COMPLETE**
 
 ### Medium Priority (Completeness)
 5. **Phase 4.1**: Update CLI/TUI binaries
