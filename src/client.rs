@@ -1991,7 +1991,7 @@ impl SimulationClient {
     pub fn new_event_based(id: &str, log_sink: Option<std::sync::Arc<dyn ClientLogSink>>) -> Self {
         Self {
             id: id.to_string(),
-            schedule: Vec::new(), // Empty schedule for event-based mode
+            schedule: Vec::new(),      // Empty schedule for event-based mode
             online_state: Some(false), // Start offline by default
             inbox: Vec::new(),
             seen: HashSet::new(),

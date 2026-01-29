@@ -38,7 +38,8 @@ pub use random::{
 };
 pub use scenario::{
     build_friend_graph, build_online_events, build_online_schedules, build_planned_sends,
-    build_simulation_inputs, generate_online_schedule_events, run_simulation_scenario,
+    build_simulation_inputs, generate_online_schedule_events, run_event_based_scenario,
+    run_event_based_scenario_with_tui, run_simulation_scenario,
     run_simulation_scenario_with_progress, HistoricalMessage, OnlineSchedulePlan, PlannedSend,
     SimMessage, SimulationInputs,
 };
@@ -1299,7 +1300,9 @@ impl EventBasedHarness {
         }
 
         // Fetch messages from relay
-        let envelopes = fetch_inbox(&self.relay_base_url, &client_id).await.unwrap_or_default();
+        let envelopes = fetch_inbox(&self.relay_base_url, &client_id)
+            .await
+            .unwrap_or_default();
         let messages_fetched = envelopes.len();
 
         if messages_fetched > 0 {
@@ -1382,7 +1385,11 @@ impl EventBasedHarness {
                 };
 
                 // Trigger store-and-forward delivery
-                forward_envelopes.extend(client.forward_store_forwards(step, &online_set, &mut context));
+                forward_envelopes.extend(client.forward_store_forwards(
+                    step,
+                    &online_set,
+                    &mut context,
+                ));
             }
         }
 
@@ -1516,6 +1523,194 @@ impl EventBasedHarness {
             .iter()
             .map(|(id, client)| (id.clone(), client.metrics()))
             .collect()
+    }
+
+    /// Run event-based simulation with progress callbacks and control commands
+    pub async fn run_with_progress_and_controls<F>(
+        &mut self,
+        duration_seconds: f64,
+        mut control_rx: mpsc::UnboundedReceiver<SimulationControlCommand>,
+        mut on_progress: F,
+    ) -> SimulationReport
+    where
+        F: FnMut(SimulationStepUpdate),
+    {
+        self.log_event(format!(
+            "Starting event-based simulation for {:.2} seconds",
+            duration_seconds
+        ));
+
+        let mut sent_messages_this_interval = 0usize;
+        let mut received_messages_this_interval = 0usize;
+        let mut last_report_time = 0.0;
+        let report_interval = 1.0; // Report every simulated second
+        let mut rolling_latency = RollingLatencyTracker::new(100);
+
+        loop {
+            // Process control commands
+            while let Ok(command) = control_rx.try_recv() {
+                match command {
+                    SimulationControlCommand::SetTimeControlMode { mode } => {
+                        self.clock.set_mode(mode);
+                        self.log_event(format!("Time control mode changed to {:?}", mode));
+                    }
+                    SimulationControlCommand::JumpToTime { time } => {
+                        self.clock.jump_to(time);
+                        self.log_event(format!("Jumped to time {:.2}s", time));
+                    }
+                    SimulationControlCommand::SetPaused { paused } => {
+                        let mode = if paused {
+                            TimeControlMode::Paused
+                        } else {
+                            TimeControlMode::RealTime { speed_factor: 1.0 }
+                        };
+                        self.clock.set_mode(mode);
+                        if let Some(relay_control) = &self.relay_control {
+                            relay_control.set_paused(paused);
+                        }
+                        self.log_event(if paused {
+                            "Simulation paused".to_string()
+                        } else {
+                            "Simulation resumed".to_string()
+                        });
+                    }
+                    SimulationControlCommand::AdjustSpeedFactor { delta } => {
+                        if let TimeControlMode::RealTime { speed_factor } = self.clock.mode {
+                            let new_speed = (speed_factor + delta).max(0.1);
+                            self.clock.set_mode(TimeControlMode::RealTime {
+                                speed_factor: new_speed,
+                            });
+                            self.log_event(format!("Speed factor adjusted to {:.2}x", new_speed));
+                        }
+                    }
+                    SimulationControlCommand::SetSpeedFactor { speed_factor } => {
+                        self.clock
+                            .set_mode(TimeControlMode::RealTime { speed_factor });
+                        self.log_event(format!("Speed factor set to {:.2}x", speed_factor));
+                    }
+                    SimulationControlCommand::Stop => {
+                        self.log_event("Stop requested".to_string());
+                        break;
+                    }
+                    _ => {
+                        // Other commands not relevant for event-based simulation
+                    }
+                }
+            }
+
+            // Check if we've exceeded simulation duration
+            let next_time = match self.event_queue.peek_time() {
+                Some(time) if time <= duration_seconds => time,
+                _ => break, // No more events or past duration
+            };
+
+            // Update clock based on mode
+            match self.clock.mode {
+                TimeControlMode::FastForward => {
+                    self.clock.jump_to(next_time);
+                }
+                TimeControlMode::RealTime { speed_factor } => {
+                    // Wait for real time to catch up
+                    while self.clock.simulated_time < next_time {
+                        self.clock.update();
+                        let wait_time = (next_time - self.clock.simulated_time) / speed_factor;
+                        if wait_time > 0.001 {
+                            tokio::time::sleep(Duration::from_secs_f64(wait_time.min(0.1))).await;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.clock.jump_to(next_time);
+                }
+                TimeControlMode::Paused => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            }
+
+            // Process all events at current time
+            while let Some(scheduled) = self.event_queue.pop() {
+                if scheduled.time > self.clock.simulated_time {
+                    // Put it back and break
+                    self.event_queue.push(scheduled.time, scheduled.event);
+                    break;
+                }
+
+                let wall_time = std::time::Instant::now();
+                let event = scheduled.event.clone();
+                let outcome = match event {
+                    Event::MessageSend { sender_id, message } => {
+                        sent_messages_this_interval += 1;
+                        self.handle_message_send(sender_id, message).await
+                    }
+                    Event::MessageDeliver {
+                        recipient_id,
+                        envelope,
+                        send_time,
+                    } => {
+                        received_messages_this_interval += 1;
+                        let latency_steps =
+                            ((self.clock.simulated_time - send_time) / 1.0) as usize;
+                        rolling_latency.record(latency_steps);
+                        self.handle_message_deliver(recipient_id, envelope, send_time)
+                            .await
+                    }
+                    Event::OnlineTransition {
+                        client_id,
+                        going_online,
+                    } => self.handle_online_transition(client_id, going_online).await,
+                    Event::InboxPoll { client_id } => self.handle_inbox_poll(client_id).await,
+                    Event::OnlineAnnounce { client_id } => {
+                        self.handle_online_announce(client_id).await
+                    }
+                    Event::CustomAction { .. } => {
+                        EventOutcome::CustomActionExecuted { success: true }
+                    }
+                };
+
+                self.event_log
+                    .record(scheduled.event_id, scheduled.time, wall_time, outcome);
+            }
+
+            // Send progress updates at regular intervals
+            if self.clock.simulated_time - last_report_time >= report_interval {
+                let online_nodes = self
+                    .clients
+                    .values()
+                    .filter(|c| {
+                        let step = self.clock.simulated_time as usize;
+                        c.is_online(step)
+                    })
+                    .count();
+
+                let speed_factor = match self.clock.mode {
+                    TimeControlMode::FastForward => f64::INFINITY,
+                    TimeControlMode::RealTime { speed_factor } => speed_factor,
+                    TimeControlMode::Paused => 0.0,
+                };
+
+                let aggregate_metrics = self.aggregate_metrics();
+                let update = SimulationStepUpdate {
+                    step: self.clock.simulated_time as usize,
+                    total_steps: duration_seconds as usize,
+                    online_nodes,
+                    total_peers: self.clients.len(),
+                    speed_factor,
+                    sent_messages: sent_messages_this_interval,
+                    received_messages: received_messages_this_interval,
+                    rolling_latency: rolling_latency.snapshot(),
+                    aggregate_metrics,
+                };
+                on_progress(update);
+
+                sent_messages_this_interval = 0;
+                received_messages_this_interval = 0;
+                last_report_time = self.clock.simulated_time;
+            }
+        }
+
+        self.log_event("Event-based simulation completed");
+        self.generate_report()
     }
 }
 

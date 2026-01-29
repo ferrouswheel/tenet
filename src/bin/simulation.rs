@@ -51,24 +51,34 @@ enum InputAction {
 async fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let mut use_tui = false;
+    let mut use_event_based = false;
     let mut path = None;
+
     while let Some(arg) = args.next() {
         if arg == "--tui" {
             use_tui = true;
+        } else if arg == "--event-based" || arg == "--events" {
+            use_event_based = true;
         } else if path.is_none() {
             path = Some(arg);
         } else {
-            return Err("usage: tenet-sim [--tui] <path-to-scenario.toml>".to_string());
+            return Err(
+                "usage: simulation [--tui] [--event-based] <path-to-scenario.toml>".to_string(),
+            );
         }
     }
-    let path =
-        path.ok_or_else(|| "usage: tenet-sim [--tui] <path-to-scenario.toml>".to_string())?;
+
+    let path = path.ok_or_else(|| {
+        "usage: simulation [--tui] [--event-based] <path-to-scenario.toml>".to_string()
+    })?;
     let contents = fs::read_to_string(&path).map_err(|err| err.to_string())?;
     let scenario: SimulationScenarioConfig =
         toml::from_str(&contents).map_err(|err| err.to_string())?;
 
     let report = if use_tui {
-        run_with_tui(scenario).await?
+        run_with_tui(scenario, use_event_based).await?
+    } else if use_event_based {
+        tenet::simulation::run_event_based_scenario(scenario).await?
     } else {
         run_simulation_scenario(scenario).await?
     };
@@ -79,6 +89,7 @@ async fn main() -> Result<(), String> {
 
 async fn run_with_tui(
     scenario: SimulationScenarioConfig,
+    use_event_based: bool,
 ) -> Result<tenet::simulation::SimulationReport, String> {
     const RELAY_LOG_LIMIT: usize = 200;
     const REAL_TIME_STEP_DELAY_MS: u64 = 100;
@@ -104,36 +115,48 @@ async fn run_with_tui(
     let scenario_for_task = scenario.clone();
     let total_steps = scenario_for_task.simulation.effective_steps();
     let sim_handle = tokio::spawn(async move {
-        let (base_url, shutdown_tx, relay_control) =
-            tenet::simulation::start_relay(relay_config).await;
-        let mut inputs = tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
-        inputs.timing.base_real_time_per_step = Duration::from_millis(REAL_TIME_STEP_DELAY_MS);
-        let mut harness = tenet::simulation::SimulationHarness::new(
-            base_url,
-            inputs.clients,
-            inputs.direct_links,
-            scenario_for_task.direct_enabled.unwrap_or(true),
-            scenario_for_task.relay.ttl_seconds,
-            inputs.encryption,
-            inputs.keypairs,
-            inputs.timing,
-            inputs.cohort_online_rates,
-            Some(simulation_log_sink),
-            Some(relay_control),
-        );
-        let metrics = harness
-            .run_with_progress_and_controls(
-                total_steps,
-                inputs.planned_sends,
+        if use_event_based {
+            tenet::simulation::run_event_based_scenario_with_tui(
+                scenario_for_task,
                 control_rx,
                 |update| {
                     let _ = tx.send(update);
                 },
             )
-            .await;
-        let report = harness.metrics_report();
-        shutdown_tx.send(()).ok();
-        Ok(tenet::simulation::SimulationReport { metrics, report })
+            .await
+        } else {
+            let (base_url, shutdown_tx, relay_control) =
+                tenet::simulation::start_relay(relay_config).await;
+            let mut inputs =
+                tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
+            inputs.timing.base_real_time_per_step = Duration::from_millis(REAL_TIME_STEP_DELAY_MS);
+            let mut harness = tenet::simulation::SimulationHarness::new(
+                base_url,
+                inputs.clients,
+                inputs.direct_links,
+                scenario_for_task.direct_enabled.unwrap_or(true),
+                scenario_for_task.relay.ttl_seconds,
+                inputs.encryption,
+                inputs.keypairs,
+                inputs.timing,
+                inputs.cohort_online_rates,
+                Some(simulation_log_sink),
+                Some(relay_control),
+            );
+            let metrics = harness
+                .run_with_progress_and_controls(
+                    total_steps,
+                    inputs.planned_sends,
+                    control_rx,
+                    |update| {
+                        let _ = tx.send(update);
+                    },
+                )
+                .await;
+            let report = harness.metrics_report();
+            shutdown_tx.send(()).ok();
+            Ok(tenet::simulation::SimulationReport { metrics, report })
+        }
     });
 
     let input_shutdown = Arc::new(AtomicBool::new(false));
@@ -354,11 +377,10 @@ fn render(
                 .gauge_style(Style::default().fg(Color::Cyan))
                 .ratio(progress)
                 .label(format!(
-                    "Step {}/{} | Time {} / {}",
-                    update.step,
-                    update.total_steps,
+                    "Time {} / {} ({:.1}%)",
                     format_duration(current_sim_seconds),
-                    format_duration(total_sim_seconds)
+                    format_duration(total_sim_seconds),
+                    progress * 100.0
                 ));
             frame.render_widget(progress_gauge, chunks[0]);
 
@@ -369,16 +391,13 @@ fn render(
                     "Speed factor: {:.2}x",
                     update.speed_factor
                 ))),
+                Line::from(Span::raw(format!("Sim time: {:.1}s", current_sim_seconds))),
                 Line::from(Span::raw(format!(
-                    "Sim time per step: {:.1}s",
-                    sim_seconds_per_step
-                ))),
-                Line::from(Span::raw(format!(
-                    "Messages sent (step): {}",
+                    "Messages sent (recent): {}",
                     update.sent_messages
                 ))),
                 Line::from(Span::raw(format!(
-                    "Messages received (step): {}",
+                    "Messages received (recent): {}",
                     update.received_messages
                 ))),
                 Line::from(Span::raw(format!(
@@ -387,8 +406,11 @@ fn render(
                     format_latency(&update.rolling_latency)
                 ))),
             ];
-            let metrics_block = Paragraph::new(metrics_lines)
-                .block(Block::default().borders(Borders::ALL).title("Step Metrics"));
+            let metrics_block = Paragraph::new(metrics_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Current Metrics"),
+            );
             frame.render_widget(metrics_block, chunks[1]);
 
             let aggregate_lines =
@@ -454,8 +476,12 @@ fn render(
             frame.render_widget(hint, chunks[4]);
 
             let command_lines = vec![
-                Line::from(Span::raw("a: add peer | f: add friends")),
-                Line::from(Span::raw("+/-: adjust speed | space: pause/resume")),
+                Line::from(Span::raw(
+                    "a: add peer | f: add friends | +/-: adjust speed",
+                )),
+                Line::from(Span::raw(
+                    "F: fast-forward | R: real-time | P: pause | space: pause/resume",
+                )),
                 Line::from(Span::raw("q: quit")),
             ];
             let command_block = Paragraph::new(command_lines)
@@ -616,6 +642,30 @@ fn handle_key_event(
                 } else {
                     *status_message = "Simulation resumed.".to_string();
                 }
+            }
+            KeyCode::Char('F') => {
+                use tenet::simulation::TimeControlMode;
+                let _ = control_tx.send(SimulationControlCommand::SetTimeControlMode {
+                    mode: TimeControlMode::FastForward,
+                });
+                *paused = false;
+                *status_message = "Switched to fast-forward mode.".to_string();
+            }
+            KeyCode::Char('R') => {
+                use tenet::simulation::TimeControlMode;
+                let _ = control_tx.send(SimulationControlCommand::SetTimeControlMode {
+                    mode: TimeControlMode::RealTime { speed_factor: 1.0 },
+                });
+                *paused = false;
+                *status_message = "Switched to real-time mode (1.0x speed).".to_string();
+            }
+            KeyCode::Char('P') => {
+                use tenet::simulation::TimeControlMode;
+                let _ = control_tx.send(SimulationControlCommand::SetTimeControlMode {
+                    mode: TimeControlMode::Paused,
+                });
+                *paused = true;
+                *status_message = "Simulation paused.".to_string();
             }
             _ => {}
         },

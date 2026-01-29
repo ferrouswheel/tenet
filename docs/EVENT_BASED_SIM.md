@@ -644,7 +644,7 @@ impl EventBasedHarness {
 
 ---
 
-### Phase 4: Time Control Modes (1-2 days)
+### Phase 4: Time Control Modes (1-2 days) ✅ COMPLETED
 
 **Goal**: Support fast-forward and real-time execution with speed control.
 
