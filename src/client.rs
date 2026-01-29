@@ -17,6 +17,7 @@ use crate::simulation::{
     SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
+use crate::groups::{GroupError, GroupInfo, GroupManager};
 use crate::protocol::ContentId;
 
 /// Maximum number of hops a public message can propagate
@@ -258,6 +259,7 @@ pub struct RelayClient {
     peer_registry: PeerRegistry,
     public_message_cache: Vec<Envelope>,
     public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
+    group_manager: GroupManager,
 }
 
 impl RelayClient {
@@ -271,6 +273,7 @@ impl RelayClient {
             peer_registry: PeerRegistry::new(),
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
+            group_manager: GroupManager::new(),
         }
     }
 
@@ -305,6 +308,31 @@ impl RelayClient {
 
     pub fn peer_registry(&self) -> &PeerRegistry {
         &self.peer_registry
+    }
+
+    pub fn group_manager(&self) -> &GroupManager {
+        &self.group_manager
+    }
+
+    pub fn group_manager_mut(&mut self) -> &mut GroupManager {
+        &mut self.group_manager
+    }
+
+    pub fn create_group(
+        &mut self,
+        group_id: String,
+        members: Vec<String>,
+    ) -> Result<GroupInfo, GroupError> {
+        self.group_manager
+            .create_group(group_id, members, self.id().to_string())
+    }
+
+    pub fn get_group(&self, group_id: &str) -> Option<&GroupInfo> {
+        self.group_manager.get_group(group_id)
+    }
+
+    pub fn list_groups(&self) -> Vec<&str> {
+        self.group_manager.list_groups()
     }
 
     pub fn id(&self) -> &str {
@@ -357,7 +385,7 @@ impl RelayClient {
                     MessageKind::Public,
                     None,
                     message,
-                    &salt,
+                    salt,
                     &self.keypair.signing_private_key_hex,
                 )?
             }
@@ -375,7 +403,7 @@ impl RelayClient {
                     MessageKind::Public,
                     None,
                     message,
-                    &salt,
+                    salt,
                     &self.keypair.signing_private_key_hex,
                 )?
             }
@@ -480,7 +508,9 @@ impl RelayClient {
             let metadata = self
                 .public_message_metadata
                 .get(&envelope.header.message_id)
-                .ok_or_else(|| ClientError::Protocol("Message not in metadata cache".to_string()))?;
+                .ok_or_else(|| {
+                    ClientError::Protocol("Message not in metadata cache".to_string())
+                })?;
             metadata.should_forward()
         };
 
@@ -498,7 +528,9 @@ impl RelayClient {
             let metadata = self
                 .public_message_metadata
                 .get(&envelope.header.message_id)
-                .ok_or_else(|| ClientError::Protocol("Message not in metadata cache".to_string()))?;
+                .ok_or_else(|| {
+                    ClientError::Protocol("Message not in metadata cache".to_string())
+                })?;
 
             peer_ids
                 .into_iter()
@@ -525,6 +557,141 @@ impl RelayClient {
         for _ in &peers_to_forward {
             let _ = self.post_envelope(envelope);
         }
+
+        Ok(())
+    }
+
+    /// Send a group message to all members of a group
+    pub fn send_group_message(
+        &mut self,
+        group_id: &str,
+        message: &str,
+    ) -> Result<Envelope, ClientError> {
+        if !self.online {
+            return Err(ClientError::Offline);
+        }
+
+        // Get the group
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| ClientError::Protocol(format!("Group not found: {}", group_id)))?;
+
+        // Verify we're a member
+        if !group.is_member(self.id()) {
+            return Err(ClientError::Protocol(format!(
+                "Not a member of group: {}",
+                group_id
+            )));
+        }
+
+        let group_key = group.group_key;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| ClientError::Time(err.to_string()))?
+            .as_secs();
+
+        // Build group message payload
+        let aad = group_id.as_bytes();
+        let payload =
+            crate::protocol::build_group_message_payload(message.as_bytes(), &group_key, aad)?;
+
+        // Build envelope with group_id
+        let envelope = crate::protocol::build_envelope_from_payload(
+            self.id().to_string(),
+            "*".to_string(), // Broadcast to group
+            None,
+            None,
+            timestamp,
+            self.config.ttl_seconds(),
+            MessageKind::FriendGroup,
+            Some(group_id.to_string()),
+            payload,
+            &self.keypair.signing_private_key_hex,
+        )?;
+
+        // Post to relay
+        self.post_envelope(&envelope)?;
+
+        Ok(envelope)
+    }
+
+    /// Receive and process a group message
+    pub fn receive_group_message(&mut self, envelope: Envelope) -> Result<(), ClientError> {
+        // Check if already seen
+        if self.seen.contains(&envelope.header.message_id.0) {
+            return Ok(()); // Already processed
+        }
+
+        // Verify it's a group message
+        if envelope.header.message_kind != MessageKind::FriendGroup {
+            return Err(ClientError::Protocol(format!(
+                "Expected FriendGroup message, got {:?}",
+                envelope.header.message_kind
+            )));
+        }
+
+        // Get group_id from header
+        let group_id =
+            envelope.header.group_id.as_ref().ok_or_else(|| {
+                ClientError::Protocol("Group message missing group_id".to_string())
+            })?;
+
+        // Get the group
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| ClientError::Protocol(format!("Unknown group: {}", group_id)))?;
+
+        // Verify sender is a group member
+        if !group.is_member(&envelope.header.sender_id) {
+            return Err(ClientError::Protocol(format!(
+                "Sender {} is not a member of group {}",
+                envelope.header.sender_id, group_id
+            )));
+        }
+
+        // Verify we're a member
+        if !group.is_member(self.id()) {
+            return Err(ClientError::Protocol(format!(
+                "Not a member of group: {}",
+                group_id
+            )));
+        }
+
+        // Verify signature
+        if let Some(sender_signing_key) = self
+            .peer_registry
+            .get_signing_key(&envelope.header.sender_id)
+        {
+            envelope
+                .header
+                .verify_signature(envelope.version, sender_signing_key)
+                .map_err(|_| ClientError::Protocol("Invalid signature".to_string()))?;
+        } else {
+            return Err(ClientError::Protocol(format!(
+                "Unknown sender: {}",
+                envelope.header.sender_id
+            )));
+        }
+
+        // Decrypt the payload
+        let group_key = &group.group_key;
+        let aad = group_id.as_bytes();
+        let plaintext =
+            crate::protocol::decrypt_group_message_payload(&envelope.payload, group_key, aad)?;
+        let body = String::from_utf8(plaintext)
+            .map_err(|e| ClientError::Protocol(format!("Invalid UTF-8: {}", e)))?;
+
+        // Add to feed
+        let client_msg = ClientMessage {
+            message_id: envelope.header.message_id.0.clone(),
+            sender_id: envelope.header.sender_id.clone(),
+            timestamp: envelope.header.timestamp,
+            body,
+        };
+        self.feed.push(client_msg);
+        self.seen.insert(envelope.header.message_id.0.clone());
 
         Ok(())
     }
@@ -557,7 +724,7 @@ impl RelayClient {
                     MessageKind::Direct,
                     None,
                     message,
-                    &salt,
+                    salt,
                     &self.keypair.signing_private_key_hex,
                 )?
             }
@@ -999,6 +1166,7 @@ pub struct SimulationClient {
     peer_registry: PeerRegistry,
     public_message_cache: Vec<Envelope>,
     public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
+    group_manager: GroupManager,
 }
 
 impl std::fmt::Debug for SimulationClient {
@@ -1022,6 +1190,7 @@ impl std::fmt::Debug for SimulationClient {
                 "public_message_metadata_size",
                 &self.public_message_metadata.len(),
             )
+            .field("group_manager", &self.group_manager)
             .finish()
     }
 }
@@ -1045,6 +1214,7 @@ impl SimulationClient {
             peer_registry: PeerRegistry::new(),
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
+            group_manager: GroupManager::new(),
         }
     }
 
@@ -1085,12 +1255,38 @@ impl SimulationClient {
         &self.peer_registry
     }
 
+    pub fn group_manager(&self) -> &GroupManager {
+        &self.group_manager
+    }
+
+    pub fn group_manager_mut(&mut self) -> &mut GroupManager {
+        &mut self.group_manager
+    }
+
+    pub fn create_group(
+        &mut self,
+        group_id: String,
+        members: Vec<String>,
+    ) -> Result<GroupInfo, GroupError> {
+        self.group_manager
+            .create_group(group_id, members, self.id.clone())
+    }
+
+    pub fn get_group(&self, group_id: &str) -> Option<&GroupInfo> {
+        self.group_manager.get_group(group_id)
+    }
+
+    pub fn list_groups(&self) -> Vec<&str> {
+        self.group_manager.list_groups()
+    }
+
     pub fn public_message_cache(&self) -> &[Envelope] {
         &self.public_message_cache
     }
 
     /// Send a public message in the simulation context
-    pub fn send_public_message(
+    #[allow(dead_code)]
+    pub(crate) fn send_public_message(
         &mut self,
         message: &str,
         step: usize,
@@ -1110,7 +1306,7 @@ impl SimulationClient {
             MessageKind::Public,
             None,
             message,
-            &[0u8; 16], // salt
+            [0u8; 16], // salt
             &context.keypairs.get(&self.id)?.signing_private_key_hex,
         )
         .ok()?;
@@ -1127,7 +1323,8 @@ impl SimulationClient {
     }
 
     /// Receive and process a public message in simulation
-    pub fn receive_public_message(
+    #[allow(dead_code)]
+    pub(crate) fn receive_public_message(
         &mut self,
         envelope: Envelope,
         step: usize,
@@ -1241,6 +1438,151 @@ impl SimulationClient {
         }
 
         forwarded_to
+    }
+
+    /// Send a group message in the simulation context
+    #[allow(dead_code)]
+    pub(crate) fn send_group_message(
+        &mut self,
+        group_id: &str,
+        message: &str,
+        step: usize,
+        context: &mut ClientContext<'_>,
+    ) -> Option<Envelope> {
+        if !self.online_at(step) {
+            return None;
+        }
+
+        // Get the group
+        let group = self.group_manager.get_group(group_id)?;
+
+        // Verify we're a member
+        if !group.is_member(&self.id) {
+            return None;
+        }
+
+        let group_key = group.group_key;
+        let aad = group_id.as_bytes();
+
+        // Build group message payload
+        let payload =
+            crate::protocol::build_group_message_payload(message.as_bytes(), &group_key, aad)
+                .ok()?;
+
+        // Get sender keypair
+        let sender_keypair = context.keypairs.get(&self.id)?;
+
+        // Build envelope with group_id
+        let envelope = crate::protocol::build_envelope_from_payload(
+            self.id.clone(),
+            "*".to_string(), // Broadcast to group
+            None,
+            None,
+            step as u64,
+            context.ttl_seconds,
+            MessageKind::FriendGroup,
+            Some(group_id.to_string()),
+            payload,
+            &sender_keypair.signing_private_key_hex,
+        )
+        .ok()?;
+
+        self.log_action(
+            step,
+            format!("{} sent group message to {}", self.id, group_id),
+        );
+
+        Some(envelope)
+    }
+
+    /// Receive and process a group message in simulation
+    #[allow(dead_code)]
+    pub(crate) fn receive_group_message(
+        &mut self,
+        envelope: Envelope,
+        step: usize,
+        context: &mut ClientContext<'_>,
+    ) -> bool {
+        // Check if already seen
+        if self.seen.contains(&envelope.header.message_id.0) {
+            return false;
+        }
+
+        // Verify it's a group message
+        if envelope.header.message_kind != MessageKind::FriendGroup {
+            return false;
+        }
+
+        // Get group_id from header
+        let group_id = match &envelope.header.group_id {
+            Some(gid) => gid,
+            None => return false,
+        };
+
+        // Get the group
+        let group = match self.group_manager.get_group(group_id) {
+            Some(g) => g,
+            None => return false,
+        };
+
+        // Verify sender is a group member
+        if !group.is_member(&envelope.header.sender_id) {
+            return false;
+        }
+
+        // Verify we're a member
+        if !group.is_member(&self.id) {
+            return false;
+        }
+
+        // Verify signature
+        let sender_keypair = match context.keypairs.get(&envelope.header.sender_id) {
+            Some(kp) => kp,
+            None => return false,
+        };
+        if envelope
+            .header
+            .verify_signature(envelope.version, &sender_keypair.signing_public_key_hex)
+            .is_err()
+        {
+            return false;
+        }
+
+        // Decrypt the payload
+        let group_key = &group.group_key;
+        let aad = group_id.as_bytes();
+        let plaintext =
+            match crate::protocol::decrypt_group_message_payload(&envelope.payload, group_key, aad)
+            {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+        let body = match String::from_utf8(plaintext) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+
+        // Add to inbox
+        let sim_message = SimMessage {
+            id: envelope.header.message_id.0.clone(),
+            sender: envelope.header.sender_id.clone(),
+            recipient: self.id.clone(),
+            body,
+            payload: envelope.payload.clone(),
+        };
+        let received = self.receive_message(sim_message);
+
+        if received {
+            self.log_action(
+                step,
+                format!(
+                    "{} received group message from {} in group {}",
+                    self.id, envelope.header.sender_id, group_id
+                ),
+            );
+        }
+
+        received
     }
 
     fn log_action(&self, step: usize, message: impl Into<String>) {
@@ -1894,10 +2236,10 @@ impl Client for SimulationClient {
         step: usize,
         message: SimMessage,
         context: &mut ClientContext<'_>,
-        mut rolling_latency: Option<&mut RollingLatencyTracker>,
+        rolling_latency: Option<&mut RollingLatencyTracker>,
     ) -> Option<usize> {
         let latency = self.apply_delivery(step, message, context, DeliveryKind::Direct)?;
-        if let Some(tracker) = rolling_latency.as_deref_mut() {
+        if let Some(tracker) = rolling_latency {
             tracker.record(latency);
         }
         Some(latency)
@@ -2207,14 +2549,8 @@ mod tests {
 
         // Create simulation context with real keypairs
         let mut keypairs = HashMap::new();
-        keypairs.insert(
-            "peer1".to_string(),
-            crate::crypto::generate_keypair(),
-        );
-        keypairs.insert(
-            "peer2".to_string(),
-            crate::crypto::generate_keypair(),
-        );
+        keypairs.insert("peer1".to_string(), crate::crypto::generate_keypair());
+        keypairs.insert("peer2".to_string(), crate::crypto::generate_keypair());
 
         let mut message_history = HashMap::new();
         let mut message_send_steps = HashMap::new();
@@ -2281,10 +2617,7 @@ mod tests {
         let mut client = SimulationClient::new("peer1", schedule, None);
 
         let mut keypairs = HashMap::new();
-        keypairs.insert(
-            "peer2".to_string(),
-            crate::crypto::generate_keypair(),
-        );
+        keypairs.insert("peer2".to_string(), crate::crypto::generate_keypair());
 
         let mut message_history = HashMap::new();
         let mut message_send_steps = HashMap::new();

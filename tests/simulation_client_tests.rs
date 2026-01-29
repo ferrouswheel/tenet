@@ -241,3 +241,49 @@ async fn client_log_sink_adapter_forwards_to_simulation_logger() {
             && (entry.contains("node-a") || entry.contains("node-b"))
     }));
 }
+
+#[test]
+fn test_group_creation_and_management() {
+    let log_sink = Arc::new(|_: ClientLogEvent| {});
+    let mut client = SimulationClient::new("node-a", vec![true], Some(log_sink));
+
+    // Create a group
+    let group = client
+        .create_group(
+            "group-1".to_string(),
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .expect("create group");
+
+    assert_eq!(group.group_id, "group-1");
+    assert_eq!(group.creator_id, "node-a");
+    assert!(group.is_member("node-a"));
+    assert!(group.is_member("node-b"));
+    assert!(!group.is_member("node-c"));
+
+    // Get the group
+    let retrieved = client.get_group("group-1").expect("get group");
+    assert_eq!(retrieved.group_id, "group-1");
+
+    // List groups
+    let groups = client.list_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], "group-1");
+
+    // Add member
+    client
+        .group_manager_mut()
+        .add_member("group-1", "node-c")
+        .expect("add member");
+    let updated = client.get_group("group-1").expect("get updated group");
+    assert!(updated.is_member("node-c"));
+
+    // Remove member
+    client
+        .group_manager_mut()
+        .remove_member("group-1", "node-c")
+        .expect("remove member");
+    let updated = client.get_group("group-1").expect("get updated group");
+    assert!(!updated.is_member("node-c"));
+}
+
