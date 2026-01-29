@@ -2,7 +2,9 @@
 
 ## Overview
 
-This document outlines the plan to migrate Tenet's simulation from a **step-based synchronous model** to an **event-based asynchronous model** with temporal ordering and configurable time control.
+This document outlines the plan to **replace** Tenet's simulation from a **step-based synchronous model** to an **event-based asynchronous model** with temporal ordering and configurable time control.
+
+**Important**: This is a **complete replacement**, not a gradual migration. The step-based implementation will be entirely removed after the event-based system is validated. No backward compatibility will be maintained.
 
 ### Motivation
 
@@ -510,6 +512,8 @@ impl EventBasedHarness {
 
 ## Phased Implementation Plan
 
+**Note**: During Phases 1-5, both step-based and event-based implementations may coexist temporarily for validation purposes. However, **Phase 6 will completely remove the step-based code**. This is not a gradual migration—it's a complete replacement.
+
 ### Phase 1: Event Queue Infrastructure (1-2 days)
 
 **Goal**: Establish event queue, event log, and time management without changing simulation behavior.
@@ -569,28 +573,28 @@ impl EventBasedHarness {
 3. Convert `build_planned_sends()` to generate `MessageSend` events
    - Instead of `HashMap<step, Vec<SimMessage>>`, create `Vec<ScheduledEvent>`
    - Keep existing Poisson sampling, but assign continuous timestamps
-   - Distribute events uniformly within step duration (for compatibility)
+   - Distribute events uniformly within time windows
 
 4. Update metrics tracking
    - Change `message_send_steps: HashMap<String, usize>` to `message_send_times: HashMap<String, f64>`
    - Update latency calculations to use event times directly
    - Preserve existing metrics API for reporting
 
-5. Create parallel harness implementation
-   - Keep existing `SimulationHarness` for step-based
-   - Create `EventBasedHarness` with event loop
-   - Share client/config types between both
+5. Refactor `SimulationHarness` to use event-based execution
+   - Replace step-based loop with event loop
+   - Rename to `EventBasedHarness` or update in-place
+   - Keep step-based implementation temporarily for validation (will be removed in Phase 6)
 
 **Testing**:
 - Integration test: Send message with fixed latency, verify delivery time
 - Integration test: Send message with uniform latency, verify range
-- Compare step-based vs event-based output for simple scenario (zero latency)
-- Verify metrics match between implementations
+- Compare outputs with step-based implementation for validation (zero latency)
+- Verify metrics are accurate
 
 **Acceptance Criteria**:
 - Messages delivered with correct latency
 - Metrics track send/deliver times accurately
-- Event-based simulation produces equivalent results to step-based (when latency=0)
+- Event-based simulation produces sensible results
 
 ---
 
@@ -620,7 +624,6 @@ impl EventBasedHarness {
 4. Update scenario builder
    - Replace `build_online_schedules()` with `build_online_events()`
    - Populate initial event queue with online/offline transitions
-   - Maintain backward compatibility for step-based mode
 
 5. Add periodic inbox polling
    - When client goes online, schedule periodic `InboxPoll` events
@@ -637,7 +640,7 @@ impl EventBasedHarness {
 - Online/offline state changes at correct times
 - Clients poll inbox while online
 - Store-and-forward delivers when recipient comes online
-- No regression in delivery rates compared to step-based
+- Delivery rates are reasonable and consistent
 
 ---
 
@@ -667,9 +670,9 @@ impl EventBasedHarness {
    - Default to fast-forward for non-interactive runs
    - Default to real-time 1x for `--tui` mode
 
-5. Integrate with `run_with_progress_and_controls()`
-   - Convert to event-based if scenario has event configuration
-   - Fall back to step-based for legacy scenarios
+5. Update `run_with_progress_and_controls()`
+   - Refactor to use event-based execution
+   - Remove step-based loop logic
 
 **Testing**:
 - Unit test: Fast-forward processes all events immediately
@@ -730,98 +733,152 @@ impl EventBasedHarness {
 
 ---
 
-### Phase 6: Testing, Optimization, Documentation (2-3 days)
+### Phase 6: Cleanup, Testing, Documentation (2-3 days)
 
-**Goal**: Validate correctness, optimize performance, and document usage.
+**Goal**: Remove step-based simulation, validate event-based correctness, optimize performance, and document usage.
 
 **Tasks**:
-1. Comprehensive testing
-   - Convert existing scenario fixtures to event-based
-   - Create new scenarios demonstrating event features:
-     - `latency_test.toml`: Various latency distributions
-     - `burst_traffic.toml`: Clustered message generation
-     - `dynamic_topology.toml`: Peers joining/leaving
-   - Run regression tests comparing step-based vs event-based
-   - Fuzz testing: Random event sequences, verify consistency
+1. **Remove step-based simulation code**
+   - Delete `SimulationHarness::run()` step-based loop (mod.rs:299-548)
+   - Delete `build_online_schedules()` (scenario.rs)
+   - Remove step-based fields from `SimulationClient`:
+     - `schedule: Vec<bool>`
+     - `is_online(step: usize)` - replace with `is_online() -> bool`
+   - Remove step-indexed data structures:
+     - `HashMap<usize, Vec<SimMessage>>` planned sends
+     - `message_send_steps: HashMap<String, usize>`
+   - Remove `SimulatedTimeConfig::seconds_per_step`
+   - Keep only: `EventBasedHarness` and event-based APIs
 
-2. Performance optimization
+2. **Delete obsolete tests**
+   - Remove step-based integration tests:
+     - `tests/simulation_harness_tests.rs` (step-based sections)
+     - `tests/simulation_client_tests.rs` (step-based sections)
+   - Remove step-based scenario fixtures (if any have hardcoded step logic)
+   - Audit and remove any tests that assume fixed-step execution
+
+3. **Create comprehensive event-based tests**
+   - **Unit tests**:
+     - Event queue ordering and tie-breaking
+     - Latency distribution sampling
+     - Time control mode switching
+     - Event generation with Poisson/uniform distributions
+   - **Integration tests** (`tests/event_based_simulation_tests.rs`):
+     - Message send → deliver with latency
+     - Online transition triggers inbox poll
+     - Store-and-forward on peer online
+     - Diurnal cohort online patterns
+     - Fast-forward vs real-time execution
+   - **Scenario-based tests**:
+     - `scenarios/event_latency_test.toml`: Various latency distributions
+     - `scenarios/event_burst_traffic.toml`: Clustered message generation
+     - `scenarios/event_diurnal_patterns.toml`: Time-of-day online behavior
+   - **Property tests**:
+     - Event temporal ordering invariant
+     - Message delivery latency >= configured minimum
+     - Event log consistency (no gaps, monotonic time)
+
+4. Performance optimization
    - Profile event loop to identify bottlenecks
    - Optimize event queue operations (consider `BTreeMap` for ties)
    - Batch event processing when multiple at same time
    - Memory optimization: Reuse allocations, shrink vectors
 
-3. Event log analysis tools
+5. Event log analysis tools
    - `analyze_event_log.rs`: CLI tool to query logs
    - Filters: By event type, time range, client ID
    - Aggregations: Event frequency, latency histograms
    - Visualizations: Timeline view, causality graphs
 
-4. Documentation
+6. Documentation
    - Update `docs/architecture.md` with event-based design
    - Create `docs/SIMULATION_GUIDE.md` for scenario authoring
    - Add inline documentation to all event types and APIs
-   - Example scenario configs with comments
-
-5. Migration guide
-   - Document differences between step-based and event-based
-   - Provide conversion checklist for existing scenarios
-   - Explain when to use each mode
-   - Performance/accuracy trade-offs
+   - Example scenario configs with comments explaining event-based parameters
 
 **Testing**:
-- All existing tests pass with event-based harness
-- New scenarios run successfully
-- Performance benchmarks: Event-based vs step-based speed
-- Memory usage profiling
+- All new event-based tests pass
+- Scenarios demonstrate event features work correctly
+- Performance benchmarks show acceptable speed
+- Memory usage profiling shows no leaks
+- Event log correctly records all processed events
 
 **Acceptance Criteria**:
-- Event-based simulation is default for new scenarios
-- Step-based simulation remains available for compatibility
-- Documentation covers all features and migration path
-- Performance is acceptable (within 2x of step-based)
+- Step-based simulation code completely removed
+- All tests use event-based harness
+- Documentation covers all event-based features
+- No mentions of "steps" remain in simulation code (except in historical context)
+- Performance is acceptable for typical scenarios
 
 ---
 
-## Migration Strategy
+## Replacement Strategy
 
-### Backward Compatibility
+### Complete Replacement (No Backward Compatibility)
 
-To avoid breaking existing scenarios and tests:
+This is a **clean replacement** of the step-based simulation with event-based execution. The step-based implementation will be **completely removed** in Phase 6.
 
-1. **Dual implementation**: Keep both `SimulationHarness` (step-based) and `EventBasedHarness`
-2. **Scenario detection**: If config has `latency_distribution` or `event_based: true`, use `EventBasedHarness`
-3. **API compatibility**: Both harnesses return same `SimulationReport` type
-4. **Client trait unchanged**: `Client` works with both implementations (minor extensions for state)
+**Rationale**:
+- Simplifies codebase (single implementation to maintain)
+- Avoids confusion between two execution models
+- Forces proper migration of all scenarios and tests
+- Event-based model is strictly more capable
 
-### Conversion Checklist for Scenarios
+### Scenario Conversion
 
-To convert a step-based scenario to event-based:
+All existing scenario TOML files must be updated to work with event-based execution:
+
+**Changes to configuration**:
+1. Remove `steps` field (replaced by simulation duration)
+2. Add `duration_seconds` or `max_time_seconds`
+3. Update `simulated_time` config to remove `seconds_per_step`
+4. Add optional `network_conditions` for latency
+
+**Example conversion**:
 
 ```toml
-# Add to [simulation] section:
-event_based = true
+# OLD (step-based):
+[simulation]
+node_ids = ["peer-1", "peer-2"]
+steps = 60  # 60 steps
 
-# Add optional latency configuration:
+[simulation.simulated_time]
+seconds_per_step = 300  # 5 minutes per step
+default_speed_factor = 1.0
+
+# NEW (event-based):
+[simulation]
+node_ids = ["peer-1", "peer-2"]
+duration_seconds = 18000  # 5 hours (60 steps * 300 seconds)
+
+[simulation.time_control]
+mode = "fast-forward"  # Or "realtime" with speed_factor
+speed_factor = 1.0
+
 [simulation.network_conditions]
 direct_latency = { type = "fixed", seconds = 0.1 }
 relay_post_latency = { type = "uniform", min = 0.2, max = 0.5 }
 relay_fetch_latency = { type = "fixed", seconds = 0.1 }
-drop_probability = 0.0
-
-# Add optional time control (default: fast-forward):
-[simulation.time_control]
-mode = "realtime"
-speed_factor = 10.0
+drop_probability = 0.0  # No message drops
 ```
-
-Existing scenarios without these fields will continue using step-based harness.
 
 ### Testing Strategy
 
-1. **Equivalence tests**: Run same scenario with both harnesses, compare metrics (zero latency)
-2. **Regression tests**: Ensure all existing tests pass (default to step-based)
-3. **New feature tests**: Event-specific tests use `EventBasedHarness` directly
-4. **Integration tests**: Mixed scenarios (some step-based, some event-based)
+1. **During implementation (Phases 1-5)**: Both implementations exist temporarily
+   - New tests use event-based harness
+   - Keep existing tests running with step-based (to ensure no regressions)
+   - Compare outputs between implementations for validation
+
+2. **Phase 6 cleanup**:
+   - Delete all step-based code
+   - Remove obsolete tests
+   - Update all scenario fixtures
+   - Create comprehensive event-based test suite
+
+3. **Final state**:
+   - Only event-based implementation exists
+   - All tests use event-based harness
+   - All scenarios use event-based configuration
 
 ---
 
@@ -858,21 +915,14 @@ Existing scenarios without these fields will continue using step-based harness.
 - **Failure simulation**: Can drop messages between send/deliver
 - **Realistic ordering**: Messages sent later can arrive earlier (if latency varies)
 
-### 3. Why keep step-based harness?
-
-- **Backward compatibility**: Existing tests/scenarios continue working
-- **Deterministic debugging**: Fixed steps easier to reason about
-- **Performance**: Step-based can be faster for simple scenarios (no event queue overhead)
-- **Gradual migration**: Teams can adopt event-based incrementally
-
-### 4. Why log processed events separately from queue?
+### 3. Why log processed events separately from queue?
 
 - **Causality**: A processed event may schedule an event earlier than queued events
 - **FIFO log**: Processed events are logged in temporal order, but not queue insertion order
 - **Debugging**: Complete history of what happened, not what's pending
 - **Replay**: Can reconstruct simulation from log
 
-### 5. Why support multiple time control modes?
+### 4. Why support multiple time control modes?
 
 - **Development**: Fast-forward for quick iteration
 - **Debugging**: Real-time with speed control to observe behavior
