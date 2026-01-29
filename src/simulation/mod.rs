@@ -16,7 +16,8 @@ pub mod scenario;
 
 pub use crate::client::SimulationClient;
 pub use config::{
-    ClusteringConfig, FriendsPerNode, MessageEncryption, MessageSizeDistribution,
+    ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution, GroupsConfig,
+    MessageEncryption, MessageSizeDistribution, MessageType, MessageTypeWeights,
     OnlineAvailability, OnlineCohortDefinition, PostFrequency, RelayConfigToml,
     SimulatedTimeConfig, SimulationConfig, SimulationScenarioConfig, SimulationTimingConfig,
 };

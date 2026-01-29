@@ -1,0 +1,61 @@
+# Test scenario for public messages
+# This scenario tests public message broadcasting with different cohorts
+# having different message type probabilities.
+
+[simulation]
+node_ids = ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6"]
+steps = 30
+seed = 123
+
+[simulation.simulated_time]
+seconds_per_step = 300
+default_speed_factor = 1.0
+
+[simulation.friends_per_node]
+type = "uniform"
+min = 3
+max = 5
+
+[simulation.post_frequency]
+type = "poisson"
+lambda_per_hour = 5.0
+
+# Default message type weights for the simulation (used when cohort doesn't specify)
+[simulation.message_type_weights]
+direct = 0.5
+public = 0.5
+group = 0.0
+
+# Cohort that posts mostly public messages
+[[simulation.cohorts]]
+name = "broadcasters"
+type = "always_online"
+share = 0.5
+[simulation.cohorts.message_type_weights]
+direct = 0.2
+public = 0.8
+group = 0.0
+
+# Cohort that posts mostly direct messages
+[[simulation.cohorts]]
+name = "direct-messengers"
+type = "rarely_online"
+share = 0.5
+online_probability = 0.6
+[simulation.cohorts.message_type_weights]
+direct = 0.8
+public = 0.2
+group = 0.0
+
+[simulation.message_size_distribution]
+type = "uniform"
+min = 20
+max = 100
+
+[relay]
+ttl_seconds = 1800
+max_messages = 500
+max_bytes = 1048576
+retry_backoff_seconds = [1, 2, 4]
+peer_log_window_seconds = 30
+peer_log_interval_seconds = 10

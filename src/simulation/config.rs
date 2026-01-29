@@ -8,6 +8,71 @@ fn default_seconds_per_step() -> u64 {
     60
 }
 
+fn default_message_type_weights() -> MessageTypeWeights {
+    MessageTypeWeights {
+        direct: 1.0,
+        public: 0.0,
+        group: 0.0,
+    }
+}
+
+/// Weights for different message types (direct, public, group).
+/// These values are normalized at runtime to sum to 1.0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageTypeWeights {
+    #[serde(default = "default_direct_weight")]
+    pub direct: f64,
+    #[serde(default)]
+    pub public: f64,
+    #[serde(default)]
+    pub group: f64,
+}
+
+fn default_direct_weight() -> f64 {
+    1.0
+}
+
+impl Default for MessageTypeWeights {
+    fn default() -> Self {
+        default_message_type_weights()
+    }
+}
+
+impl MessageTypeWeights {
+    /// Normalize weights so they sum to 1.0
+    pub fn normalized(&self) -> (f64, f64, f64) {
+        let total = self.direct.max(0.0) + self.public.max(0.0) + self.group.max(0.0);
+        if total <= 0.0 {
+            return (1.0, 0.0, 0.0);
+        }
+        (
+            self.direct.max(0.0) / total,
+            self.public.max(0.0) / total,
+            self.group.max(0.0) / total,
+        )
+    }
+
+    /// Sample a message type based on weights
+    pub fn sample(&self, random_value: f64) -> MessageType {
+        let (direct, public, _group) = self.normalized();
+        if random_value < direct {
+            MessageType::Direct
+        } else if random_value < direct + public {
+            MessageType::Public
+        } else {
+            MessageType::Group
+        }
+    }
+}
+
+/// Message type for simulation planning
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageType {
+    Direct,
+    Public,
+    Group,
+}
+
 fn default_speed_factor() -> f64 {
     1.0
 }
@@ -36,7 +101,77 @@ pub struct SimulationConfig {
     pub cohorts: Vec<OnlineCohortDefinition>,
     pub message_size_distribution: MessageSizeDistribution,
     pub encryption: Option<MessageEncryption>,
+    #[serde(default)]
+    pub groups: Option<GroupsConfig>,
+    #[serde(default)]
+    pub message_type_weights: Option<MessageTypeWeights>,
     pub seed: u64,
+}
+
+/// Configuration for groups in simulation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupsConfig {
+    /// Number of groups to create
+    #[serde(default = "default_group_count")]
+    pub count: usize,
+    /// Distribution of group sizes
+    #[serde(default)]
+    pub size_distribution: GroupSizeDistribution,
+    /// How many groups each node should be a member of
+    #[serde(default)]
+    pub memberships_per_node: GroupMembershipsPerNode,
+}
+
+fn default_group_count() -> usize {
+    3
+}
+
+impl Default for GroupsConfig {
+    fn default() -> Self {
+        Self {
+            count: default_group_count(),
+            size_distribution: GroupSizeDistribution::default(),
+            memberships_per_node: GroupMembershipsPerNode::default(),
+        }
+    }
+}
+
+/// Distribution of group sizes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GroupSizeDistribution {
+    /// All groups have the same size range
+    Uniform { min: usize, max: usize },
+    /// Groups are sized to include a fraction of all nodes
+    FractionOfNodes {
+        min_fraction: f64,
+        max_fraction: f64,
+    },
+}
+
+impl Default for GroupSizeDistribution {
+    fn default() -> Self {
+        GroupSizeDistribution::FractionOfNodes {
+            min_fraction: 0.2,
+            max_fraction: 0.5,
+        }
+    }
+}
+
+/// How many groups each node should be a member of
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GroupMembershipsPerNode {
+    /// Each node is in a fixed number of groups
+    Fixed { count: usize },
+    /// Each node is in a random number of groups
+    Uniform { min: usize, max: usize },
+}
+
+impl Default for GroupMembershipsPerNode {
+    fn default() -> Self {
+        GroupMembershipsPerNode::Fixed { count: 1 }
+    }
 }
 
 impl SimulationConfig {
@@ -85,11 +220,15 @@ pub enum OnlineCohortDefinition {
     AlwaysOnline {
         name: String,
         share: f64,
+        #[serde(default)]
+        message_type_weights: Option<MessageTypeWeights>,
     },
     RarelyOnline {
         name: String,
         share: f64,
         online_probability: f64,
+        #[serde(default)]
+        message_type_weights: Option<MessageTypeWeights>,
     },
     Diurnal {
         name: String,
@@ -99,7 +238,29 @@ pub enum OnlineCohortDefinition {
         timezone_offset_hours: i32,
         #[serde(default)]
         hourly_weights: Vec<f64>,
+        #[serde(default)]
+        message_type_weights: Option<MessageTypeWeights>,
     },
+}
+
+impl OnlineCohortDefinition {
+    /// Get the message type weights for this cohort, returning defaults if not specified
+    pub fn message_type_weights(&self) -> MessageTypeWeights {
+        match self {
+            OnlineCohortDefinition::AlwaysOnline {
+                message_type_weights,
+                ..
+            }
+            | OnlineCohortDefinition::RarelyOnline {
+                message_type_weights,
+                ..
+            }
+            | OnlineCohortDefinition::Diurnal {
+                message_type_weights,
+                ..
+            } => message_type_weights.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

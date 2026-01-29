@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use tenet::crypto::generate_keypair;
-use tenet::protocol::{build_plaintext_payload, ContentId};
+use tenet::protocol::{build_plaintext_payload, ContentId, MessageKind};
 use tenet::relay::RelayConfig;
 use tenet::simulation::{
     build_simulation_inputs, start_relay, FriendsPerNode, MessageEncryption,
@@ -48,6 +48,8 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         cohorts: Vec::new(),
         message_size_distribution: MessageSizeDistribution::Uniform { min: 8, max: 32 },
         encryption: Some(MessageEncryption::Plaintext),
+        groups: None,
+        message_type_weights: None,
         seed: 42,
     };
 
@@ -78,6 +80,8 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
             recipient: "node-b".to_string(),
             body: "relay me".to_string(),
             payload,
+            message_kind: MessageKind::Direct,
+            group_id: None,
         },
     });
     let payload = build_plaintext_payload("direct and relay", b"message-c");
@@ -91,6 +95,8 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
             recipient: "node-b".to_string(),
             body: "direct and relay".to_string(),
             payload,
+            message_kind: MessageKind::Direct,
+            group_id: None,
         },
     });
 
@@ -213,6 +219,8 @@ async fn simulation_harness_delivers_missed_messages_after_handshake() {
             recipient: "node-a".to_string(),
             body: "missed".to_string(),
             payload,
+            message_kind: MessageKind::Direct,
+            group_id: None,
         },
     }];
 

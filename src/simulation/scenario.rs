@@ -7,15 +7,17 @@ use rand_chacha::{ChaCha20Rng, ChaCha8Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
+use crate::groups::GroupInfo;
 use crate::protocol::{
-    build_encrypted_payload, build_plaintext_payload, ContentId, Envelope, Payload,
+    build_encrypted_payload, build_plaintext_payload, ContentId, Envelope, MessageKind, Payload,
 };
 
 use super::random::{generate_message_body, sample_poisson, sample_weighted_index, sample_zipf};
 use super::{
-    start_relay, ClusteringConfig, FriendsPerNode, MessageEncryption, OnlineAvailability,
-    OnlineCohortDefinition, PostFrequency, SimulationClient, SimulationConfig, SimulationHarness,
-    SimulationReport, SimulationScenarioConfig, SimulationStepUpdate, SimulationTimingConfig,
+    start_relay, ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution,
+    MessageEncryption, MessageType, MessageTypeWeights, OnlineAvailability, OnlineCohortDefinition,
+    PostFrequency, SimulationClient, SimulationConfig, SimulationHarness, SimulationReport,
+    SimulationScenarioConfig, SimulationStepUpdate, SimulationTimingConfig,
     SIMULATION_HOURS_PER_DAY, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
@@ -26,6 +28,14 @@ pub struct SimMessage {
     pub recipient: String,
     pub body: String,
     pub payload: Payload,
+    #[serde(default = "default_message_kind")]
+    pub message_kind: MessageKind,
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+fn default_message_kind() -> MessageKind {
+    MessageKind::Direct
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,11 +59,22 @@ pub struct SimulationInputs {
     pub encryption: MessageEncryption,
     pub cohort_online_rates: HashMap<String, f64>,
     pub timing: SimulationTimingConfig,
+    pub groups: HashMap<String, GroupInfo>,
+    pub node_groups: HashMap<String, Vec<String>>,
+}
+
+/// Mapping of nodes to their assigned cohorts (for message type weights)
+#[derive(Debug, Clone)]
+pub struct NodeCohortAssignment {
+    pub node_id: String,
+    pub cohort_name: String,
+    pub message_type_weights: MessageTypeWeights,
 }
 
 pub struct OnlineSchedulePlan {
     pub schedules: HashMap<String, Vec<bool>>,
     pub cohort_online_rates: HashMap<String, f64>,
+    pub node_cohort_assignments: HashMap<String, NodeCohortAssignment>,
 }
 
 pub async fn run_simulation_scenario(
@@ -131,12 +152,18 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
     for node_id in &config.node_ids {
         keypairs.insert(node_id.clone(), generate_keypair_with_rng(&mut crypto_rng));
     }
+
+    // Build groups if configured
+    let (groups, node_groups) = build_groups(config, &mut rng);
+
     let planned_sends = build_planned_sends(
         config,
         &mut rng,
         &graph,
         &encryption,
         &keypairs,
+        &schedule_plan.node_cohort_assignments,
+        &node_groups,
         if matches!(encryption, MessageEncryption::Encrypted) {
             Some(&mut crypto_rng as &mut dyn RngCore)
         } else {
@@ -170,6 +197,183 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             speed_factor: config.simulated_time.default_speed_factor.max(0.0),
             base_real_time_per_step: Duration::ZERO,
         },
+        groups,
+        node_groups,
+    }
+}
+
+/// Build groups and assign nodes to them based on configuration
+fn build_groups(
+    config: &SimulationConfig,
+    rng: &mut impl Rng,
+) -> (HashMap<String, GroupInfo>, HashMap<String, Vec<String>>) {
+    let mut groups = HashMap::new();
+    let mut node_groups: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Initialize empty group lists for all nodes
+    for node_id in &config.node_ids {
+        node_groups.insert(node_id.clone(), Vec::new());
+    }
+
+    let Some(groups_config) = &config.groups else {
+        return (groups, node_groups);
+    };
+
+    let node_count = config.node_ids.len();
+    if node_count == 0 || groups_config.count == 0 {
+        return (groups, node_groups);
+    }
+
+    // Create the specified number of groups
+    for i in 0..groups_config.count {
+        let group_id = format!("group-{}", i + 1);
+
+        // Determine group size based on distribution
+        let target_size = match &groups_config.size_distribution {
+            GroupSizeDistribution::Uniform { min, max } => {
+                rng.gen_range(*min..=(*max).min(node_count))
+            }
+            GroupSizeDistribution::FractionOfNodes {
+                min_fraction,
+                max_fraction,
+            } => {
+                let min_size = (node_count as f64 * min_fraction.clamp(0.0, 1.0)).ceil() as usize;
+                let max_size = (node_count as f64 * max_fraction.clamp(0.0, 1.0)).ceil() as usize;
+                rng.gen_range(min_size.max(1)..=max_size.max(min_size).min(node_count))
+            }
+        };
+
+        // Select random members for this group
+        let mut available_nodes: Vec<&String> = config.node_ids.iter().collect();
+        let mut members = Vec::new();
+        for _ in 0..target_size.min(available_nodes.len()) {
+            let idx = rng.gen_range(0..available_nodes.len());
+            members.push(available_nodes.remove(idx).clone());
+        }
+
+        // Create the group (first member is creator for simplicity)
+        let creator = members.first().cloned().unwrap_or_default();
+        let group_info = GroupInfo::new(group_id.clone(), members.clone(), creator);
+
+        // Update node_groups mapping
+        for member in &members {
+            if let Some(groups_list) = node_groups.get_mut(member) {
+                groups_list.push(group_id.clone());
+            }
+        }
+
+        groups.insert(group_id, group_info);
+    }
+
+    // Ensure each node is in the required number of groups based on memberships_per_node
+    match &groups_config.memberships_per_node {
+        GroupMembershipsPerNode::Fixed { count } => {
+            ensure_minimum_memberships(config, &mut groups, &mut node_groups, *count, rng);
+        }
+        GroupMembershipsPerNode::Uniform { min, max } => {
+            // For each node, ensure they're in at least min groups
+            ensure_minimum_memberships(config, &mut groups, &mut node_groups, *min, rng);
+            // Add additional random memberships up to max
+            add_random_memberships(config, &mut groups, &mut node_groups, *min, *max, rng);
+        }
+    }
+
+    (groups, node_groups)
+}
+
+fn ensure_minimum_memberships(
+    config: &SimulationConfig,
+    groups: &mut HashMap<String, GroupInfo>,
+    node_groups: &mut HashMap<String, Vec<String>>,
+    min_count: usize,
+    rng: &mut impl Rng,
+) {
+    if groups.is_empty() || min_count == 0 {
+        return;
+    }
+
+    let group_ids: Vec<String> = groups.keys().cloned().collect();
+
+    for node_id in &config.node_ids {
+        let current_count = node_groups.get(node_id).map(|g| g.len()).unwrap_or(0);
+        if current_count >= min_count {
+            continue;
+        }
+
+        // Add node to random groups until they reach min_count
+        let needed = min_count - current_count;
+        let current_groups: HashSet<String> = node_groups
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        let mut available_groups: Vec<&String> = group_ids
+            .iter()
+            .filter(|g| !current_groups.contains(*g))
+            .collect();
+
+        for _ in 0..needed.min(available_groups.len()) {
+            let idx = rng.gen_range(0..available_groups.len());
+            let group_id = available_groups.remove(idx).clone();
+
+            // Add node to this group
+            if let Some(group) = groups.get_mut(&group_id) {
+                group.members.insert(node_id.clone());
+            }
+            if let Some(groups_list) = node_groups.get_mut(node_id) {
+                groups_list.push(group_id);
+            }
+        }
+    }
+}
+
+fn add_random_memberships(
+    config: &SimulationConfig,
+    groups: &mut HashMap<String, GroupInfo>,
+    node_groups: &mut HashMap<String, Vec<String>>,
+    min: usize,
+    max: usize,
+    rng: &mut impl Rng,
+) {
+    if groups.is_empty() || max <= min {
+        return;
+    }
+
+    let group_ids: Vec<String> = groups.keys().cloned().collect();
+
+    for node_id in &config.node_ids {
+        let current_count = node_groups.get(node_id).map(|g| g.len()).unwrap_or(0);
+        let target = rng.gen_range(min..=max);
+        if current_count >= target {
+            continue;
+        }
+
+        let needed = target - current_count;
+        let current_groups: HashSet<String> = node_groups
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        let mut available_groups: Vec<&String> = group_ids
+            .iter()
+            .filter(|g| !current_groups.contains(*g))
+            .collect();
+
+        for _ in 0..needed.min(available_groups.len()) {
+            let idx = rng.gen_range(0..available_groups.len());
+            let group_id = available_groups.remove(idx).clone();
+
+            if let Some(group) = groups.get_mut(&group_id) {
+                group.members.insert(node_id.clone());
+            }
+            if let Some(groups_list) = node_groups.get_mut(node_id) {
+                groups_list.push(group_id);
+            }
+        }
     }
 }
 
@@ -409,6 +613,7 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
     let mut schedules = HashMap::new();
     let mut cohort_online_counts: HashMap<String, usize> = HashMap::new();
     let mut cohort_total_counts: HashMap<String, usize> = HashMap::new();
+    let mut node_cohort_assignments: HashMap<String, NodeCohortAssignment> = HashMap::new();
     let simulated_seconds_per_step = simulated_seconds_per_step(config);
     let steps = config.effective_steps();
     let cohorts = if config.cohorts.is_empty() {
@@ -417,22 +622,52 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
         Some(config.cohorts.as_slice())
     };
 
+    // Default message type weights from config (used when cohort doesn't specify)
+    let default_weights = config
+        .message_type_weights
+        .clone()
+        .unwrap_or_else(MessageTypeWeights::default);
+
     for node_id in &config.node_ids {
-        let (cohort_name, schedule) = if let Some(cohorts) = cohorts {
+        let (cohort_name_str, schedule, message_weights) = if let Some(cohorts) = cohorts {
             let cohort = select_cohort(cohorts, rng);
             let name = cohort_name(cohort).to_string();
             let schedule = build_cohort_schedule(cohort, steps, simulated_seconds_per_step, rng);
-            (name, schedule)
+            // Use cohort-specific weights if defined, otherwise use config default
+            let weights = cohort.message_type_weights();
+            let weights = if weights.direct == 1.0 && weights.public == 0.0 && weights.group == 0.0
+            {
+                // This is the default - check if cohort actually defined weights
+                // If not, use the simulation-level default
+                default_weights.clone()
+            } else {
+                weights
+            };
+            (name, schedule, weights)
         } else {
             let name = "legacy".to_string();
             let schedule = build_availability_schedule(config, rng);
-            (name, schedule)
+            (name, schedule, default_weights.clone())
         };
 
         let online_count = schedule.iter().filter(|online| **online).count();
-        *cohort_online_counts.entry(cohort_name.clone()).or_insert(0) += online_count;
-        *cohort_total_counts.entry(cohort_name.clone()).or_insert(0) += schedule.len();
+        *cohort_online_counts
+            .entry(cohort_name_str.clone())
+            .or_insert(0) += online_count;
+        *cohort_total_counts
+            .entry(cohort_name_str.clone())
+            .or_insert(0) += schedule.len();
         schedules.insert(node_id.clone(), schedule);
+
+        // Store the cohort assignment with message type weights
+        node_cohort_assignments.insert(
+            node_id.clone(),
+            NodeCohortAssignment {
+                node_id: node_id.clone(),
+                cohort_name: cohort_name_str,
+                message_type_weights: message_weights,
+            },
+        );
     }
 
     let cohort_online_rates = cohort_total_counts
@@ -451,6 +686,7 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
     OnlineSchedulePlan {
         schedules,
         cohort_online_rates,
+        node_cohort_assignments,
     }
 }
 
@@ -460,11 +696,17 @@ pub fn build_planned_sends(
     graph: &HashMap<String, Vec<String>>,
     encryption: &MessageEncryption,
     keypairs: &HashMap<String, StoredKeypair>,
+    node_cohort_assignments: &HashMap<String, NodeCohortAssignment>,
+    node_groups: &HashMap<String, Vec<String>>,
     mut crypto_rng: Option<&mut dyn RngCore>,
 ) -> Vec<PlannedSend> {
     let mut planned = Vec::new();
     let mut counter = 0usize;
     let steps = config.effective_steps();
+
+    // Default message type weights
+    let default_weights = MessageTypeWeights::default();
+
     for node_id in &config.node_ids {
         let friends = graph
             .get(node_id)
@@ -472,9 +714,16 @@ pub fn build_planned_sends(
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
-        if friends.is_empty() {
-            continue;
-        }
+
+        // Get the node's groups
+        let groups = node_groups.get(node_id).cloned().unwrap_or_default();
+
+        // Get message type weights for this node
+        let weights = node_cohort_assignments
+            .get(node_id)
+            .map(|a| &a.message_type_weights)
+            .unwrap_or(&default_weights);
+
         match &config.post_frequency {
             PostFrequency::Poisson {
                 lambda_per_step,
@@ -489,80 +738,171 @@ pub fn build_planned_sends(
                 for step in 0..steps {
                     let count = sample_poisson(rng, per_step);
                     for _ in 0..count {
-                        let recipient = friends[rng.gen_range(0..friends.len())].clone();
-                        let body = generate_message_body(rng, &config.message_size_distribution);
-                        let payload = build_message_payload(
+                        if let Some(message) = build_planned_message(
+                            node_id,
+                            &friends,
+                            &groups,
+                            weights,
+                            config,
                             encryption,
                             keypairs,
                             &mut crypto_rng,
-                            &body,
-                            &recipient,
-                            node_id,
-                            counter,
-                        );
-                        let message_id =
-                            ContentId::from_value(&payload).expect("serialize simulation payload");
-                        let message = SimMessage {
-                            id: message_id.0.clone(),
-                            sender: node_id.clone(),
-                            recipient,
-                            body,
-                            payload,
-                        };
-                        counter += 1;
-                        planned.push(PlannedSend { step, message });
+                            &mut counter,
+                            rng,
+                        ) {
+                            planned.push(PlannedSend { step, message });
+                        }
                     }
                 }
             }
             PostFrequency::WeightedSchedule {
-                weights,
+                weights: schedule_weights,
                 total_posts,
             } => {
                 let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
-                let use_hourly_weights = weights.len() == SIMULATION_HOURS_PER_DAY;
-                let weights = if weights.len() == steps || use_hourly_weights {
-                    weights.clone()
+                let use_hourly_weights = schedule_weights.len() == SIMULATION_HOURS_PER_DAY;
+                let schedule_weights = if schedule_weights.len() == steps || use_hourly_weights {
+                    schedule_weights.clone()
                 } else {
                     vec![1.0; steps.max(1)]
                 };
                 for _ in 0..*total_posts {
                     let step = if use_hourly_weights {
-                        let hour = sample_weighted_index(rng, &weights);
+                        let hour = sample_weighted_index(rng, &schedule_weights);
                         let offset_seconds = rng.gen_range(0.0..3600.0);
                         let simulated_seconds = (hour as f64 * 3600.0) + offset_seconds;
                         let step =
                             (simulated_seconds / simulated_seconds_per_step).floor() as usize;
                         step.min(steps.saturating_sub(1))
                     } else {
-                        sample_weighted_index(rng, &weights)
+                        sample_weighted_index(rng, &schedule_weights)
                     };
-                    let recipient = friends[rng.gen_range(0..friends.len())].clone();
-                    let body = generate_message_body(rng, &config.message_size_distribution);
-                    let payload = build_message_payload(
+                    if let Some(message) = build_planned_message(
+                        node_id,
+                        &friends,
+                        &groups,
+                        weights,
+                        config,
                         encryption,
                         keypairs,
                         &mut crypto_rng,
-                        &body,
-                        &recipient,
-                        node_id,
-                        counter,
-                    );
-                    let message_id =
-                        ContentId::from_value(&payload).expect("serialize simulation payload");
-                    let message = SimMessage {
-                        id: message_id.0.clone(),
-                        sender: node_id.clone(),
-                        recipient,
-                        body,
-                        payload,
-                    };
-                    counter += 1;
-                    planned.push(PlannedSend { step, message });
+                        &mut counter,
+                        rng,
+                    ) {
+                        planned.push(PlannedSend { step, message });
+                    }
                 }
             }
         }
     }
     planned
+}
+
+/// Build a planned message based on message type weights
+fn build_planned_message(
+    node_id: &str,
+    friends: &[String],
+    groups: &[String],
+    weights: &MessageTypeWeights,
+    config: &SimulationConfig,
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    crypto_rng: &mut Option<&mut dyn RngCore>,
+    counter: &mut usize,
+    rng: &mut impl Rng,
+) -> Option<SimMessage> {
+    // Sample message type based on weights
+    let random_value: f64 = rng.gen();
+    let message_type = weights.sample(random_value);
+
+    match message_type {
+        MessageType::Direct => {
+            // Direct message requires a friend as recipient
+            if friends.is_empty() {
+                return None;
+            }
+            let recipient = friends[rng.gen_range(0..friends.len())].clone();
+            let body = generate_message_body(rng, &config.message_size_distribution);
+            let payload = build_message_payload(
+                encryption, keypairs, crypto_rng, &body, &recipient, node_id, *counter,
+            );
+            let message_id = ContentId::from_value(&payload).expect("serialize simulation payload");
+            *counter += 1;
+            Some(SimMessage {
+                id: message_id.0.clone(),
+                sender: node_id.to_string(),
+                recipient,
+                body,
+                payload,
+                message_kind: MessageKind::Direct,
+                group_id: None,
+            })
+        }
+        MessageType::Public => {
+            // Public message - recipient is "*" (broadcast)
+            let body = generate_message_body(rng, &config.message_size_distribution);
+            // Public messages are always plaintext
+            let salt = format!("{node_id}-{counter}");
+            let payload = build_plaintext_payload(body.clone(), salt.as_bytes());
+            let message_id = ContentId::from_value(&payload).expect("serialize simulation payload");
+            *counter += 1;
+            Some(SimMessage {
+                id: message_id.0.clone(),
+                sender: node_id.to_string(),
+                recipient: "*".to_string(),
+                body,
+                payload,
+                message_kind: MessageKind::Public,
+                group_id: None,
+            })
+        }
+        MessageType::Group => {
+            // Group message requires being in a group
+            if groups.is_empty() {
+                // Fall back to direct message if no groups
+                if friends.is_empty() {
+                    return None;
+                }
+                let recipient = friends[rng.gen_range(0..friends.len())].clone();
+                let body = generate_message_body(rng, &config.message_size_distribution);
+                let payload = build_message_payload(
+                    encryption, keypairs, crypto_rng, &body, &recipient, node_id, *counter,
+                );
+                let message_id =
+                    ContentId::from_value(&payload).expect("serialize simulation payload");
+                *counter += 1;
+                return Some(SimMessage {
+                    id: message_id.0.clone(),
+                    sender: node_id.to_string(),
+                    recipient,
+                    body,
+                    payload,
+                    message_kind: MessageKind::Direct,
+                    group_id: None,
+                });
+            }
+
+            // Select a random group
+            let group_id = groups[rng.gen_range(0..groups.len())].clone();
+            let body = generate_message_body(rng, &config.message_size_distribution);
+            // Group messages use symmetric encryption (handled by the client when sending)
+            // For planning, we build a plaintext payload that will be encrypted at send time
+            let salt = format!("{node_id}-{group_id}-{counter}");
+            let payload = build_plaintext_payload(body.clone(), salt.as_bytes());
+            let message_id = ContentId::from_value(&payload).expect("serialize simulation payload");
+            *counter += 1;
+            Some(SimMessage {
+                id: message_id.0.clone(),
+                sender: node_id.to_string(),
+                // For group messages, recipient is the group ID for tracking purposes
+                recipient: group_id.clone(),
+                body,
+                payload,
+                message_kind: MessageKind::FriendGroup,
+                group_id: Some(group_id),
+            })
+        }
+    }
 }
 
 fn build_message_payload(
