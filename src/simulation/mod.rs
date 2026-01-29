@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use axum::Router;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::client::{Client, ClientContext, ClientLogEvent, ClientLogSink, ClientMetrics};
@@ -21,8 +21,8 @@ pub use config::{
     ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution, GroupsConfig,
     LatencyDistribution, MessageEncryption, MessageSizeDistribution, MessageType,
     MessageTypeWeights, NetworkConditions, OnlineAvailability, OnlineCohortDefinition,
-    PostFrequency, RelayConfigToml, SimulatedTimeConfig, SimulationConfig,
-    SimulationScenarioConfig, SimulationTimingConfig, TimeControlConfig,
+    PostFrequency, ReactionConfig, RelayConfigToml, SimulatedTimeConfig, SimulationConfig,
+    SimulationScenarioConfig, SimulationTimingConfig, TimeControlConfig, TimeDistribution,
 };
 pub use event::{
     Event, EventLog, EventOutcome, EventQueue, ProcessedEvent, ScheduledEvent, SimulationClock,
@@ -38,8 +38,8 @@ pub use random::{
 };
 pub use scenario::{
     build_friend_graph, build_online_events, build_online_schedules, build_planned_sends,
-    build_simulation_inputs, generate_online_schedule_events, run_event_based_scenario,
-    run_event_based_scenario_with_tui, run_simulation_scenario,
+    build_simulation_inputs, generate_message_events, generate_online_schedule_events,
+    run_event_based_scenario, run_event_based_scenario_with_tui, run_simulation_scenario,
     run_simulation_scenario_with_progress, HistoricalMessage, OnlineSchedulePlan, PlannedSend,
     SimMessage, SimulationInputs,
 };
@@ -1014,6 +1014,7 @@ pub struct EventBasedHarness {
     metrics: SimulationMetrics,
     metrics_tracker: MetricsTracker,
     network_conditions: NetworkConditions,
+    reaction_config: Option<ReactionConfig>,
     log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
     client_log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     relay_control: Option<RelayControl>,
@@ -1033,6 +1034,7 @@ impl EventBasedHarness {
         keypairs: HashMap<String, StoredKeypair>,
         network_conditions: NetworkConditions,
         cohort_online_rates: HashMap<String, f64>,
+        reaction_config: Option<ReactionConfig>,
         log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
         relay_control: Option<RelayControl>,
         seed: u64,
@@ -1089,6 +1091,7 @@ impl EventBasedHarness {
             },
             metrics_tracker: MetricsTracker::new(1.0, cohort_online_rates),
             network_conditions,
+            reaction_config,
             log_sink,
             client_log_sink,
             relay_control,
@@ -1215,6 +1218,7 @@ impl EventBasedHarness {
         };
 
         let step = self.clock.simulated_time as usize;
+        let sender_id = envelope.header.sender_id.clone();
 
         if let Some(client) = self.clients.get_mut(&recipient_id) {
             // Create a SimMessage from envelope for direct delivery
@@ -1229,6 +1233,31 @@ impl EventBasedHarness {
             };
 
             let result = client.handle_direct_delivery(step, sim_message, &mut context, None);
+
+            // Check if we should generate a reaction (reply) event
+            if result.is_some() {
+                if let Some(reaction_config) = &self.reaction_config {
+                    let should_reply = self.rng.gen::<f64>() < reaction_config.reply_probability;
+                    if should_reply {
+                        // Schedule a reply event after a delay
+                        let delay = reaction_config
+                            .reply_delay_distribution
+                            .sample(&mut self.rng);
+                        let reply_time = self.clock.simulated_time + delay;
+
+                        // Note: In a full implementation, we would create a reply message here
+                        // For now, we just log that a reaction would occur
+                        self.log_event(format!(
+                            "Reaction: {} will reply to {} after {:.2}s delay (at t={:.2})",
+                            recipient_id, sender_id, delay, reply_time
+                        ));
+
+                        // TODO: Actually generate and schedule a reply message event
+                        // This would require access to the message generation logic
+                        // which is currently in scenario.rs
+                    }
+                }
+            }
 
             EventOutcome::MessageDelivered {
                 accepted: result.is_some(),
