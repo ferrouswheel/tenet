@@ -139,6 +139,135 @@ where
     Ok(SimulationReport { metrics, report })
 }
 
+/// Run event-based simulation scenario
+pub async fn run_event_based_scenario(
+    scenario: SimulationScenarioConfig,
+) -> Result<SimulationReport, String> {
+    use super::event::{SimulationClock, TimeControlMode};
+    use super::{EventBasedHarness, NetworkConditions};
+    use crate::simulation::planned_sends_to_events;
+
+    let relay_config = scenario.relay.clone();
+    let (base_url, shutdown_tx, _relay_control) =
+        start_relay(relay_config.clone().into_relay_config()).await;
+
+    let inputs = build_simulation_inputs(&scenario.simulation);
+    let duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
+        let steps = scenario.simulation.effective_steps();
+        let seconds_per_step = scenario.simulation.simulated_time.seconds_per_step;
+        (steps as u64 * seconds_per_step) as u64
+    }) as f64;
+
+    let time_control_mode = TimeControlMode::FastForward;
+    let clock = SimulationClock::new(time_control_mode);
+
+    let network_conditions = NetworkConditions::default();
+
+    let mut harness = EventBasedHarness::new(
+        clock,
+        base_url,
+        inputs.clients,
+        inputs.direct_links,
+        scenario.direct_enabled.unwrap_or(true),
+        relay_config.ttl_seconds,
+        inputs.encryption,
+        inputs.keypairs,
+        network_conditions,
+        inputs.cohort_online_rates,
+        None,
+        None,
+        scenario.simulation.seed,
+    );
+
+    // Convert planned sends to events and schedule them
+    let events = planned_sends_to_events(inputs.planned_sends, &scenario.simulation.simulated_time);
+    for event in events {
+        harness.schedule_event(event.time, event.event);
+    }
+
+    // Schedule online/offline events
+    let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
+    let (online_events, _node_cohorts) =
+        build_online_events(&scenario.simulation, 0.0, duration_seconds, &mut rng);
+    for event in online_events {
+        harness.schedule_event(event.time, event.event);
+    }
+
+    let report = harness.run(duration_seconds).await;
+    shutdown_tx.send(()).ok();
+    Ok(report)
+}
+
+/// Run event-based simulation scenario with TUI progress updates
+pub async fn run_event_based_scenario_with_tui<F>(
+    scenario: SimulationScenarioConfig,
+    control_rx: tokio::sync::mpsc::UnboundedReceiver<super::SimulationControlCommand>,
+    mut on_progress: F,
+) -> Result<SimulationReport, String>
+where
+    F: FnMut(SimulationStepUpdate),
+{
+    use super::event::{SimulationClock, TimeControlMode};
+    use super::{EventBasedHarness, NetworkConditions};
+    use crate::simulation::planned_sends_to_events;
+
+    let relay_config = scenario.relay.clone();
+    let (base_url, shutdown_tx, relay_control) =
+        start_relay(relay_config.clone().into_relay_config()).await;
+
+    let inputs = build_simulation_inputs(&scenario.simulation);
+    let duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
+        let steps = scenario.simulation.effective_steps();
+        let seconds_per_step = scenario.simulation.simulated_time.seconds_per_step;
+        (steps as u64 * seconds_per_step) as u64
+    }) as f64;
+
+    // Default to real-time mode for TUI
+    let time_control_mode = TimeControlMode::RealTime { speed_factor: 1.0 };
+    let clock = SimulationClock::new(time_control_mode);
+
+    let network_conditions = NetworkConditions::default();
+
+    let mut harness = EventBasedHarness::new(
+        clock,
+        base_url,
+        inputs.clients,
+        inputs.direct_links,
+        scenario.direct_enabled.unwrap_or(true),
+        relay_config.ttl_seconds,
+        inputs.encryption,
+        inputs.keypairs,
+        network_conditions,
+        inputs.cohort_online_rates,
+        None,
+        Some(relay_control),
+        scenario.simulation.seed,
+    );
+
+    // Convert planned sends to events and schedule them
+    let events = planned_sends_to_events(inputs.planned_sends, &scenario.simulation.simulated_time);
+    for event in events {
+        harness.schedule_event(event.time, event.event);
+    }
+
+    // Schedule online/offline events
+    let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
+    let (online_events, _node_cohorts) =
+        build_online_events(&scenario.simulation, 0.0, duration_seconds, &mut rng);
+    for event in online_events {
+        harness.schedule_event(event.time, event.event);
+    }
+
+    let report = harness
+        .run_with_progress_and_controls(duration_seconds, control_rx, |update| {
+            on_progress(update);
+        })
+        .await;
+
+    shutdown_tx.send(()).ok();
+    Ok(report)
+}
+
 pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let encryption = config
@@ -615,7 +744,10 @@ pub fn build_online_events(
     start_time: f64,
     end_time: f64,
     rng: &mut impl Rng,
-) -> (Vec<super::ScheduledEvent>, HashMap<String, NodeCohortAssignment>) {
+) -> (
+    Vec<super::ScheduledEvent>,
+    HashMap<String, NodeCohortAssignment>,
+) {
     use super::event::{Event, ScheduledEvent};
 
     let mut all_events = Vec::new();
@@ -637,11 +769,13 @@ pub fn build_online_events(
         let (cohort_name_str, events, message_weights) = if let Some(cohorts) = cohorts {
             let cohort = select_cohort(cohorts, rng);
             let name = cohort_name(cohort).to_string();
-            let events = generate_online_schedule_events(node_id, cohort, start_time, end_time, rng);
+            let events =
+                generate_online_schedule_events(node_id, cohort, start_time, end_time, rng);
 
             // Use cohort-specific weights if defined, otherwise use config default
             let weights = cohort.message_type_weights();
-            let weights = if weights.direct == 1.0 && weights.public == 0.0 && weights.group == 0.0 {
+            let weights = if weights.direct == 1.0 && weights.public == 0.0 && weights.group == 0.0
+            {
                 default_weights.clone()
             } else {
                 weights
@@ -765,8 +899,7 @@ pub fn generate_online_schedule_events(
 
             while current_time < end_time {
                 // Calculate hour of day with timezone offset
-                let hour = ((current_time / 3600.0).floor() as i64
-                    + *timezone_offset_hours as i64)
+                let hour = ((current_time / 3600.0).floor() as i64 + *timezone_offset_hours as i64)
                     .rem_euclid(SIMULATION_HOURS_PER_DAY as i64)
                     as usize;
 
@@ -808,7 +941,11 @@ pub fn generate_online_schedule_events(
     }
 
     // Sort events by time to ensure chronological order
-    events.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+    events.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     events
 }
@@ -1279,10 +1416,7 @@ mod tests {
                 share: 1.0,
                 message_type_weights: None,
             }],
-            message_size_distribution: MessageSizeDistribution::Uniform {
-                min: 100,
-                max: 100,
-            },
+            message_size_distribution: MessageSizeDistribution::Uniform { min: 100, max: 100 },
             encryption: None,
             groups: None,
             message_type_weights: None,
