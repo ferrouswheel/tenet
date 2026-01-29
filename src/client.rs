@@ -2047,12 +2047,12 @@ impl Client for SimulationClient {
                     let envelope = match build_envelope_from_payload(
                         message.sender.clone(),
                         message.recipient.clone(), // Group ID as recipient for routing
-                        group_id.clone(),
-                        None,
+                        None,                      // store_for - not used for group messages
+                        None,                      // storage_peer_id - not used for group messages
                         timestamp,
                         context.ttl_seconds,
                         MessageKind::FriendGroup,
-                        None,
+                        group_id,                  // group_id - required for FriendGroup
                         message.payload.clone(),
                         &sender_keypair.signing_private_key_hex,
                     ) {
