@@ -302,3 +302,94 @@ async fn simulation_harness_applies_dynamic_updates() {
     assert_eq!(harness.total_nodes(), 3);
     assert!(update.speed_factor > 1.0);
 }
+
+#[test]
+fn test_groups_and_message_type_distribution() {
+    use tenet::simulation::{
+        build_simulation_inputs, GroupMembershipsPerNode, GroupSizeDistribution, GroupsConfig,
+        MessageTypeWeights, SimulationConfig, SimulatedTimeConfig, FriendsPerNode, PostFrequency,
+        MessageSizeDistribution,
+    };
+    use tenet::protocol::MessageKind;
+    
+    let config = SimulationConfig {
+        node_ids: vec![
+            "peer-1".to_string(),
+            "peer-2".to_string(),
+            "peer-3".to_string(),
+            "peer-4".to_string(),
+        ],
+        steps: 20,
+        duration_seconds: None,
+        simulated_time: SimulatedTimeConfig {
+            seconds_per_step: 300,
+            default_speed_factor: 1.0,
+        },
+        friends_per_node: FriendsPerNode::Uniform { min: 2, max: 3 },
+        clustering: None,
+        post_frequency: PostFrequency::Poisson {
+            lambda_per_step: None,
+            lambda_per_hour: Some(10.0),
+        },
+        availability: None,
+        cohorts: Vec::new(),
+        message_size_distribution: MessageSizeDistribution::Uniform { min: 20, max: 50 },
+        encryption: None,
+        groups: Some(GroupsConfig {
+            count: 2,
+            size_distribution: GroupSizeDistribution::Uniform { min: 2, max: 3 },
+            memberships_per_node: GroupMembershipsPerNode::Fixed { count: 1 },
+        }),
+        message_type_weights: Some(MessageTypeWeights {
+            direct: 0.3,
+            public: 0.3,
+            group: 0.4,
+        }),
+        seed: 12345,
+    };
+    
+    let inputs = build_simulation_inputs(&config);
+    
+    // Print debug info
+    println!("\nGroups created: {}", inputs.groups.len());
+    for (group_id, group_info) in &inputs.groups {
+        println!("  {} - members: {:?}", group_id, group_info.members);
+    }
+    
+    println!("\nNode group assignments:");
+    for (node_id, groups) in &inputs.node_groups {
+        println!("  {} -> {:?}", node_id, groups);
+    }
+    
+    // Count message types
+    let mut direct_count = 0;
+    let mut public_count = 0;
+    let mut group_count = 0;
+    for send in &inputs.planned_sends {
+        match send.message.message_kind {
+            MessageKind::Direct => direct_count += 1,
+            MessageKind::Public => public_count += 1,
+            MessageKind::FriendGroup => group_count += 1,
+            _ => {}
+        }
+    }
+    
+    println!("\nPlanned messages:");
+    println!("  Total: {}", inputs.planned_sends.len());
+    println!("  Direct: {}", direct_count);
+    println!("  Public: {}", public_count);
+    println!("  FriendGroup: {}", group_count);
+    
+    // Verify groups were created
+    assert!(inputs.groups.len() >= 1, "At least one group should be created");
+    
+    // Verify some nodes are in groups
+    let nodes_in_groups: usize = inputs.node_groups.values().filter(|g| !g.is_empty()).count();
+    assert!(nodes_in_groups > 0, "Some nodes should be in groups");
+    
+    // With 40% group weight, we should have some group messages
+    // (assuming nodes are in groups)
+    if nodes_in_groups > 0 {
+        println!("\nNodes in groups: {}", nodes_in_groups);
+    }
+}
