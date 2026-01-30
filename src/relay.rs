@@ -119,7 +119,7 @@ impl RelayState {
         }
     }
 
-    pub fn start_peer_log_task(&self) {
+    pub fn start_peer_log_task(&self, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) {
         if self.config.peer_log_interval.is_zero() {
             return;
         }
@@ -127,20 +127,26 @@ impl RelayState {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(state.config.peer_log_interval);
             loop {
-                ticker.tick().await;
-                let now = Instant::now();
-                let count = {
-                    let inner = state.inner.lock().await;
-                    count_recent_peers(&inner, now, state.config.peer_log_window)
-                };
-                log_message(
-                    &state.config,
-                    format!(
-                        "relay: {} peers connected in last {}s",
-                        count,
-                        state.config.peer_log_window.as_secs()
-                    ),
-                );
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let now = Instant::now();
+                        let count = {
+                            let inner = state.inner.lock().await;
+                            count_recent_peers(&inner, now, state.config.peer_log_window)
+                        };
+                        log_message(
+                            &state.config,
+                            format!(
+                                "relay: {} peers connected in last {}s",
+                                count,
+                                state.config.peer_log_window.as_secs()
+                            ),
+                        );
+                    }
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                }
             }
         });
     }

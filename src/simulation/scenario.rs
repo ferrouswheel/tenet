@@ -141,6 +141,7 @@ pub async fn run_event_based_scenario(
 pub async fn run_event_based_scenario_with_tui<F>(
     scenario: SimulationScenarioConfig,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<super::SimulationControlCommand>,
+    relay_config_override: crate::relay::RelayConfig,
     mut on_progress: F,
 ) -> Result<SimulationReport, String>
 where
@@ -150,9 +151,8 @@ where
     use super::{EventBasedHarness, NetworkConditions};
     use crate::simulation::planned_sends_to_events;
 
-    let relay_config = scenario.relay.clone();
     let (base_url, shutdown_tx, relay_control) =
-        start_relay(relay_config.clone().into_relay_config()).await;
+        start_relay(relay_config_override).await;
 
     let inputs = build_simulation_inputs(&scenario.simulation);
     let duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
@@ -167,13 +167,15 @@ where
 
     let network_conditions = NetworkConditions::default();
 
+    let ttl_seconds = scenario.relay.ttl_seconds;
+
     let mut harness = EventBasedHarness::new(
         clock,
         base_url,
         inputs.clients,
         inputs.direct_links,
         scenario.direct_enabled.unwrap_or(true),
-        relay_config.ttl_seconds,
+        ttl_seconds,
         inputs.encryption,
         inputs.keypairs,
         network_conditions,

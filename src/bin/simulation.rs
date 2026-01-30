@@ -106,6 +106,7 @@ async fn run_with_tui(
         tenet::simulation::run_event_based_scenario_with_tui(
             scenario_for_task,
             control_rx,
+            relay_config,
             |update| {
                 let _ = tx.send(update);
             },
