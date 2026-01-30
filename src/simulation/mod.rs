@@ -332,7 +332,8 @@ impl SimulationHarness {
 pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>, RelayControl) {
     let relay_control = RelayControl::new(config.pause_flag.clone());
     let state = RelayState::new(config);
-    state.start_peer_log_task();
+    let (peer_log_shutdown_tx, peer_log_shutdown_rx) = oneshot::channel();
+    state.start_peer_log_task(peer_log_shutdown_rx);
     let app: Router = app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -345,6 +346,8 @@ pub async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>, R
     });
     tokio::spawn(async move {
         let _ = server.await;
+        // Signal peer log task to shutdown after server is done
+        let _ = peer_log_shutdown_tx.send(());
     });
 
     (format!("http://{}", addr), shutdown_tx, relay_control)
