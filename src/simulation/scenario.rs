@@ -189,6 +189,19 @@ where
 
     // Convert planned sends to events and schedule them
     let events = planned_sends_to_events(inputs.planned_sends, &scenario.simulation.simulated_time);
+    harness.log_event(format!(
+        "Scheduling {} message events across {:.0}s duration",
+        events.len(),
+        duration_seconds
+    ));
+    // Log time range of events
+    if let (Some(first), Some(last)) = (events.first(), events.last()) {
+        harness.log_event(format!(
+            "Message events from {:.0}s to {:.0}s",
+            first.time,
+            last.time
+        ));
+    }
     for event in events {
         harness.schedule_event(event.time, event.event);
     }
@@ -197,6 +210,7 @@ where
     let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
     let (online_events, _node_cohorts) =
         build_online_events(&scenario.simulation, 0.0, duration_seconds, &mut rng);
+    harness.log_event(format!("Scheduling {} online/offline events", online_events.len()));
     for event in online_events {
         harness.schedule_event(event.time, event.event);
     }
@@ -1124,14 +1138,21 @@ pub fn build_planned_sends(
                 time_distribution: _,
             } => {
                 let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
-                let per_step = if let Some(lambda_per_hour) = lambda_per_hour {
-                    lambda_per_hour * (simulated_seconds_per_step / 3600.0)
-                } else {
-                    lambda_per_step.unwrap_or(0.0)
-                };
-                for step in 0..steps {
-                    let count = sample_poisson(rng, per_step);
-                    for _ in 0..count {
+
+                // For event-based simulation (lambda_per_hour specified), generate events
+                // uniformly across the entire duration to avoid clustering in discrete steps
+                if let Some(lambda_per_hour) = lambda_per_hour {
+                    let total_duration_seconds = steps as f64 * simulated_seconds_per_step;
+                    let total_duration_hours = total_duration_seconds / 3600.0;
+                    let expected_total = lambda_per_hour * total_duration_hours;
+                    let total_count = sample_poisson(rng, expected_total);
+
+                    // Generate events at random times across the duration
+                    for _ in 0..total_count {
+                        let time_seconds = rng.gen::<f64>() * total_duration_seconds;
+                        let step = (time_seconds / simulated_seconds_per_step).floor() as usize;
+                        let step = step.min(steps.saturating_sub(1));
+
                         if let Some(message) = build_planned_message(
                             node_id,
                             &friends,
@@ -1145,6 +1166,28 @@ pub fn build_planned_sends(
                             rng,
                         ) {
                             planned.push(PlannedSend { step, message });
+                        }
+                    }
+                } else {
+                    // Legacy step-based generation for lambda_per_step
+                    let per_step = lambda_per_step.unwrap_or(0.0);
+                    for step in 0..steps {
+                        let count = sample_poisson(rng, per_step);
+                        for _ in 0..count {
+                            if let Some(message) = build_planned_message(
+                                node_id,
+                                &friends,
+                                &groups,
+                                weights,
+                                config,
+                                encryption,
+                                keypairs,
+                                &mut crypto_rng,
+                                &mut counter,
+                                rng,
+                            ) {
+                                planned.push(PlannedSend { step, message });
+                            }
                         }
                     }
                 }
