@@ -142,6 +142,7 @@ pub async fn run_event_based_scenario_with_tui<F>(
     scenario: SimulationScenarioConfig,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<super::SimulationControlCommand>,
     relay_config_override: crate::relay::RelayConfig,
+    log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
     mut on_progress: F,
 ) -> Result<SimulationReport, String>
 where
@@ -181,7 +182,7 @@ where
         network_conditions,
         inputs.cohort_online_rates,
         scenario.simulation.reaction_config.clone(),
-        None,
+        log_sink,
         Some(relay_control),
         scenario.simulation.seed,
     );
