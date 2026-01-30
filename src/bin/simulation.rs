@@ -93,12 +93,15 @@ async fn run_with_tui(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (relay_log_tx, mut relay_log_rx) = mpsc::unbounded_channel();
-    let (_sim_log_tx, mut sim_log_rx) = mpsc::unbounded_channel();
+    let (sim_log_tx, mut sim_log_rx) = mpsc::unbounded_channel();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let mut relay_config = scenario.relay.clone().into_relay_config();
     relay_config.log_sink = Some(Arc::new(move |line: String| {
         let _ = relay_log_tx.send(line);
     }));
+    let sim_log_sink = Arc::new(move |line: String| {
+        let _ = sim_log_tx.send(line);
+    });
     let scenario_for_task = scenario.clone();
     // For event-based simulation, total_steps is the duration in seconds
     let total_duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
@@ -111,6 +114,7 @@ async fn run_with_tui(
             scenario_for_task,
             control_rx,
             relay_config,
+            Some(sim_log_sink),
             |update| {
                 let _ = tx.send(update);
             },

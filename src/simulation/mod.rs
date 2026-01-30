@@ -1070,6 +1070,8 @@ impl EventBasedHarness {
             match self.clock.mode {
                 TimeControlMode::FastForward => {
                     self.clock.jump_to(next_time);
+                    // Yield to allow TUI and other tasks to process updates
+                    tokio::task::yield_now().await;
                 }
                 TimeControlMode::RealTime { speed_factor } => {
                     // Wait for real time to catch up
