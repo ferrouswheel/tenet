@@ -1031,7 +1031,39 @@ impl EventBasedHarness {
             // Check if we've exceeded simulation duration
             let next_time = match self.event_queue.peek_time() {
                 Some(time) if time <= duration_seconds => time,
-                _ => break, // No more events or past duration
+                _ => {
+                    // No more events or past duration - send final progress update
+                    self.clock.jump_to(duration_seconds);
+                    let online_nodes = self
+                        .clients
+                        .values()
+                        .filter(|c| {
+                            let step = self.clock.simulated_time as usize;
+                            c.is_online(step)
+                        })
+                        .count();
+
+                    let speed_factor = match self.clock.mode {
+                        TimeControlMode::FastForward => f64::INFINITY,
+                        TimeControlMode::RealTime { speed_factor } => speed_factor,
+                        TimeControlMode::Paused => 0.0,
+                    };
+
+                    let aggregate_metrics = self.aggregate_metrics();
+                    let update = SimulationStepUpdate {
+                        step: self.clock.simulated_time as usize,
+                        total_steps: duration_seconds as usize,
+                        online_nodes,
+                        total_peers: self.clients.len(),
+                        speed_factor,
+                        sent_messages: sent_messages_this_interval,
+                        received_messages: received_messages_this_interval,
+                        rolling_latency: rolling_latency.snapshot(),
+                        aggregate_metrics,
+                    };
+                    on_progress(update);
+                    break;
+                }
             };
 
             // Update clock based on mode
