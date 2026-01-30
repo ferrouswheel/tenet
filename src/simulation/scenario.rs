@@ -161,8 +161,8 @@ where
         (steps as u64 * seconds_per_step) as u64
     }) as f64;
 
-    // Default to real-time mode for TUI
-    let time_control_mode = TimeControlMode::RealTime { speed_factor: 1.0 };
+    // Default to fast-forward mode for TUI (users can adjust speed with controls)
+    let time_control_mode = TimeControlMode::FastForward;
     let clock = SimulationClock::new(time_control_mode);
 
     let network_conditions = NetworkConditions::default();
