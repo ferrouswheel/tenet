@@ -133,7 +133,6 @@ async fn run_with_tui(
         }
     });
 
-    let mut last_update: Option<SimulationStepUpdate> = None;
     let mut relay_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
     let mut sim_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
     let mut input_mode = InputMode::Normal;
@@ -142,8 +141,8 @@ async fn run_with_tui(
     let mut paused = false;
     let base_seconds_per_step = scenario.simulation.simulated_time.seconds_per_step as f64;
 
-    // Render initial blank state
-    let initial_update = SimulationStepUpdate {
+    // Create initial update
+    let mut current_update = SimulationStepUpdate {
         step: 0,
         total_steps,
         online_nodes: 0,
@@ -160,9 +159,11 @@ async fn run_with_tui(
         },
         aggregate_metrics: tenet::simulation::SimulationAggregateMetrics::empty(),
     };
+
+    // Render initial state
     render(
         &mut terminal,
-        &initial_update,
+        &current_update,
         &[],
         &[],
         &status_message,
@@ -176,10 +177,10 @@ async fn run_with_tui(
             update = rx.recv() => {
                 match update {
                     Some(update) => {
-                        last_update = Some(update.clone());
+                        current_update = update;
                         render(
                             &mut terminal,
-                            &update,
+                            &current_update,
                             sim_logs.make_contiguous(),
                             relay_logs.make_contiguous(),
                             &status_message,
@@ -197,18 +198,16 @@ async fn run_with_tui(
                         sim_logs.pop_front();
                     }
                     sim_logs.push_back(line);
-                    if let Some(update) = &last_update {
-                        render(
-                            &mut terminal,
-                            update,
-                            sim_logs.make_contiguous(),
-                            relay_logs.make_contiguous(),
-                            &status_message,
-                            paused,
-                            base_seconds_per_step,
-                        )
-                        .map_err(|err| err.to_string())?;
-                    }
+                    render(
+                        &mut terminal,
+                        &current_update,
+                        sim_logs.make_contiguous(),
+                        relay_logs.make_contiguous(),
+                        &status_message,
+                        paused,
+                        base_seconds_per_step,
+                    )
+                    .map_err(|err| err.to_string())?;
                 } else if rx.is_closed() {
                     break;
                 }
@@ -219,18 +218,16 @@ async fn run_with_tui(
                         relay_logs.pop_front();
                     }
                     relay_logs.push_back(line);
-                    if let Some(update) = &last_update {
-                        render(
-                            &mut terminal,
-                            update,
-                            sim_logs.make_contiguous(),
-                            relay_logs.make_contiguous(),
-                            &status_message,
-                            paused,
-                            base_seconds_per_step,
-                        )
-                        .map_err(|err| err.to_string())?;
-                    }
+                    render(
+                        &mut terminal,
+                        &current_update,
+                        sim_logs.make_contiguous(),
+                        relay_logs.make_contiguous(),
+                        &status_message,
+                        paused,
+                        base_seconds_per_step,
+                    )
+                    .map_err(|err| err.to_string())?;
                 } else if rx.is_closed() {
                     break;
                 }
@@ -252,47 +249,30 @@ async fn run_with_tui(
                         status_message = "Stopping simulation...".to_string();
                         // Don't break - let simulation finish naturally
                     }
-                    if let Some(update) = &last_update {
-                        render(
-                            &mut terminal,
-                            update,
-                            sim_logs.make_contiguous(),
-                            relay_logs.make_contiguous(),
-                            &status_message,
-                            paused,
-                            base_seconds_per_step,
-                        )
-                        .map_err(|err| err.to_string())?;
-                    }
+                    render(
+                        &mut terminal,
+                        &current_update,
+                        sim_logs.make_contiguous(),
+                        relay_logs.make_contiguous(),
+                        &status_message,
+                        paused,
+                        base_seconds_per_step,
+                    )
+                    .map_err(|err| err.to_string())?;
                 }
             }
         }
     }
 
     // Simulation has finished (rx closed)
-    let completion_update = last_update.unwrap_or_else(|| SimulationStepUpdate {
-        step: total_steps,
-        total_steps,
-        online_nodes: 0,
-        total_peers: scenario.simulation.node_ids.len(),
-        speed_factor: scenario.simulation.simulated_time.default_speed_factor,
-        sent_messages: 0,
-        received_messages: 0,
-        rolling_latency: RollingLatencySnapshot {
-            min: None,
-            max: None,
-            average: None,
-            samples: 0,
-            window: 0,
-        },
-        aggregate_metrics: tenet::simulation::SimulationAggregateMetrics::empty(),
-    });
+    // Update status for final display
+    status_message = "Simulation complete. Press q to exit.".to_string();
     render(
         &mut terminal,
-        &completion_update,
+        &current_update,
         sim_logs.make_contiguous(),
         relay_logs.make_contiguous(),
-        "Simulation complete. Press q to exit.",
+        &status_message,
         paused,
         base_seconds_per_step,
     )
