@@ -100,8 +100,12 @@ async fn run_with_tui(
         let _ = relay_log_tx.send(line);
     }));
     let scenario_for_task = scenario.clone();
-    // For progress display, compute equivalent total steps from duration
-    let total_steps = scenario_for_task.simulation.effective_steps();
+    // For event-based simulation, total_steps is the duration in seconds
+    let total_duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
+        let steps = scenario.simulation.effective_steps();
+        let seconds_per_step = scenario.simulation.simulated_time.seconds_per_step;
+        (steps as u64 * seconds_per_step) as u64
+    });
     let sim_handle = tokio::spawn(async move {
         tenet::simulation::run_event_based_scenario_with_tui(
             scenario_for_task,
@@ -144,7 +148,7 @@ async fn run_with_tui(
     // Create initial update
     let mut current_update = SimulationStepUpdate {
         step: 0,
-        total_steps,
+        total_steps: total_duration_seconds as usize,
         online_nodes: 0,
         total_peers: scenario.simulation.node_ids.len(),
         speed_factor: scenario.simulation.simulated_time.default_speed_factor,
@@ -240,7 +244,7 @@ async fn run_with_tui(
                         &mut status_message,
                         &control_tx,
                         &mut auto_peer_index,
-                        total_steps,
+                        total_duration_seconds as usize,
                         SPEED_STEP,
                         &mut paused,
                     );
@@ -299,7 +303,7 @@ fn render(
     relay_logs: &[String],
     status: &str,
     paused: bool,
-    base_seconds_per_step: f64,
+    _base_seconds_per_step: f64,
 ) -> io::Result<()> {
     terminal
         .draw(|frame| {
@@ -317,10 +321,10 @@ fn render(
                 ])
                 .split(size);
 
-            let sim_seconds_per_step = base_seconds_per_step * update.speed_factor.max(0.0);
-            let current_sim_seconds = update.step as f64 * sim_seconds_per_step;
-            let total_sim_seconds = update.total_steps as f64 * sim_seconds_per_step;
-            let progress = update.step as f64 / update.total_steps.max(1) as f64;
+            // For event-based simulation, step and total_steps are already in seconds
+            let current_sim_seconds = update.step as f64;
+            let total_sim_seconds = update.total_steps as f64;
+            let progress = current_sim_seconds / total_sim_seconds.max(1.0);
             let progress_gauge = Gauge::default()
                 .block(
                     Block::default()
@@ -337,13 +341,17 @@ fn render(
                 ));
             frame.render_widget(progress_gauge, chunks[0]);
 
+            let speed_display = if update.speed_factor.is_infinite() {
+                "Speed: FastForward".to_string()
+            } else if update.speed_factor == 0.0 {
+                "Speed: Paused".to_string()
+            } else {
+                format!("Speed: {:.2}x", update.speed_factor)
+            };
             let metrics_lines = vec![
                 Line::from(Span::raw(format!("Total peers: {}", update.total_peers))),
                 Line::from(Span::raw(format!("Online peers: {}", update.online_nodes))),
-                Line::from(Span::raw(format!(
-                    "Speed factor: {:.2}x",
-                    update.speed_factor
-                ))),
+                Line::from(Span::raw(speed_display)),
                 Line::from(Span::raw(format!("Sim time: {:.1}s", current_sim_seconds))),
                 Line::from(Span::raw(format!(
                     "Messages sent (recent): {}",
