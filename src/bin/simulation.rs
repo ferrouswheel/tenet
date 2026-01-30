@@ -93,7 +93,7 @@ async fn run_with_tui(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (relay_log_tx, mut relay_log_rx) = mpsc::unbounded_channel();
-    let (sim_log_tx, mut sim_log_rx) = mpsc::unbounded_channel();
+    let (_sim_log_tx, mut sim_log_rx) = mpsc::unbounded_channel();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let mut relay_config = scenario.relay.clone().into_relay_config();
     relay_config.log_sink = Some(Arc::new(move |line: String| {
@@ -139,9 +139,37 @@ async fn run_with_tui(
     let mut input_mode = InputMode::Normal;
     let mut status_message = "Simulation running.".to_string();
     let mut auto_peer_index = 1usize;
-    let mut quit_requested = false;
     let mut paused = false;
     let base_seconds_per_step = scenario.simulation.simulated_time.seconds_per_step as f64;
+
+    // Render initial blank state
+    let initial_update = SimulationStepUpdate {
+        step: 0,
+        total_steps,
+        online_nodes: 0,
+        total_peers: scenario.simulation.node_ids.len(),
+        speed_factor: scenario.simulation.simulated_time.default_speed_factor,
+        sent_messages: 0,
+        received_messages: 0,
+        rolling_latency: RollingLatencySnapshot {
+            min: None,
+            max: None,
+            average: None,
+            samples: 0,
+            window: 0,
+        },
+        aggregate_metrics: tenet::simulation::SimulationAggregateMetrics::empty(),
+    };
+    render(
+        &mut terminal,
+        &initial_update,
+        &[],
+        &[],
+        &status_message,
+        paused,
+        base_seconds_per_step,
+    )
+    .map_err(|err| err.to_string())?;
 
     loop {
         tokio::select! {
@@ -221,8 +249,8 @@ async fn run_with_tui(
                     );
                     if action == InputAction::Quit {
                         let _ = control_tx.send(SimulationControlCommand::Stop);
-                        quit_requested = true;
-                        break;
+                        status_message = "Stopping simulation...".to_string();
+                        // Don't break - let simulation finish naturally
                     }
                     if let Some(update) = &last_update {
                         render(
@@ -241,17 +269,7 @@ async fn run_with_tui(
         }
     }
 
-    if quit_requested {
-        input_shutdown.store(true, Ordering::SeqCst);
-        let _ = input_handle.await;
-        disable_raw_mode().map_err(|err| err.to_string())?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|err| err.to_string())?;
-        terminal.show_cursor().map_err(|err| err.to_string())?;
-        return sim_handle
-            .await
-            .map_err(|err| format!("simulation task failed: {err}"))?;
-    }
-
+    // Simulation has finished (rx closed)
     let completion_update = last_update.unwrap_or_else(|| SimulationStepUpdate {
         step: total_steps,
         total_steps,
