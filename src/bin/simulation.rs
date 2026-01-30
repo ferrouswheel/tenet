@@ -19,11 +19,11 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+use tenet::crypto::generate_keypair;
 use tenet::protocol::MessageKind;
 use tenet::simulation::{
-    run_simulation_scenario, CountSummary, RollingLatencySnapshot, SimulationAggregateMetrics,
-    SimulationControlCommand, SimulationHarness, SimulationScenarioConfig, SimulationStepUpdate,
-    SizeSummary,
+    CountSummary, RollingLatencySnapshot, SimulationAggregateMetrics, SimulationClient,
+    SimulationControlCommand, SimulationScenarioConfig, SimulationStepUpdate, SizeSummary,
 };
 
 const MESSAGE_KIND_ORDER: [MessageKind; 5] = [
@@ -51,36 +51,28 @@ enum InputAction {
 async fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let mut use_tui = false;
-    let mut use_event_based = false;
     let mut path = None;
 
     while let Some(arg) = args.next() {
         if arg == "--tui" {
             use_tui = true;
-        } else if arg == "--event-based" || arg == "--events" {
-            use_event_based = true;
         } else if path.is_none() {
             path = Some(arg);
         } else {
-            return Err(
-                "usage: simulation [--tui] [--event-based] <path-to-scenario.toml>".to_string(),
-            );
+            return Err("usage: simulation [--tui] <path-to-scenario.toml>".to_string());
         }
     }
 
-    let path = path.ok_or_else(|| {
-        "usage: simulation [--tui] [--event-based] <path-to-scenario.toml>".to_string()
-    })?;
+    let path =
+        path.ok_or_else(|| "usage: simulation [--tui] <path-to-scenario.toml>".to_string())?;
     let contents = fs::read_to_string(&path).map_err(|err| err.to_string())?;
     let scenario: SimulationScenarioConfig =
         toml::from_str(&contents).map_err(|err| err.to_string())?;
 
     let report = if use_tui {
-        run_with_tui(scenario, use_event_based).await?
-    } else if use_event_based {
-        tenet::simulation::run_event_based_scenario(scenario).await?
+        run_with_tui(scenario).await?
     } else {
-        run_simulation_scenario(scenario).await?
+        tenet::simulation::run_event_based_scenario(scenario).await?
     };
     let output = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
     println!("{output}");
@@ -89,10 +81,8 @@ async fn main() -> Result<(), String> {
 
 async fn run_with_tui(
     scenario: SimulationScenarioConfig,
-    use_event_based: bool,
 ) -> Result<tenet::simulation::SimulationReport, String> {
     const RELAY_LOG_LIMIT: usize = 200;
-    const REAL_TIME_STEP_DELAY_MS: u64 = 100;
     const SPEED_STEP: f64 = 0.10;
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
@@ -109,54 +99,18 @@ async fn run_with_tui(
     relay_config.log_sink = Some(Arc::new(move |line: String| {
         let _ = relay_log_tx.send(line);
     }));
-    let simulation_log_sink = Arc::new(move |line: String| {
-        let _ = sim_log_tx.send(line);
-    });
     let scenario_for_task = scenario.clone();
+    // For progress display, compute equivalent total steps from duration
     let total_steps = scenario_for_task.simulation.effective_steps();
     let sim_handle = tokio::spawn(async move {
-        if use_event_based {
-            tenet::simulation::run_event_based_scenario_with_tui(
-                scenario_for_task,
-                control_rx,
-                |update| {
-                    let _ = tx.send(update);
-                },
-            )
-            .await
-        } else {
-            let (base_url, shutdown_tx, relay_control) =
-                tenet::simulation::start_relay(relay_config).await;
-            let mut inputs =
-                tenet::simulation::build_simulation_inputs(&scenario_for_task.simulation);
-            inputs.timing.base_real_time_per_step = Duration::from_millis(REAL_TIME_STEP_DELAY_MS);
-            let mut harness = tenet::simulation::SimulationHarness::new(
-                base_url,
-                inputs.clients,
-                inputs.direct_links,
-                scenario_for_task.direct_enabled.unwrap_or(true),
-                scenario_for_task.relay.ttl_seconds,
-                inputs.encryption,
-                inputs.keypairs,
-                inputs.timing,
-                inputs.cohort_online_rates,
-                Some(simulation_log_sink),
-                Some(relay_control),
-            );
-            let metrics = harness
-                .run_with_progress_and_controls(
-                    total_steps,
-                    inputs.planned_sends,
-                    control_rx,
-                    |update| {
-                        let _ = tx.send(update);
-                    },
-                )
-                .await;
-            let report = harness.metrics_report();
-            shutdown_tx.send(()).ok();
-            Ok(tenet::simulation::SimulationReport { metrics, report })
-        }
+        tenet::simulation::run_event_based_scenario_with_tui(
+            scenario_for_task,
+            control_rx,
+            |update| {
+                let _ = tx.send(update);
+            },
+        )
+        .await
     });
 
     let input_shutdown = Arc::new(AtomicBool::new(false));
@@ -601,7 +555,7 @@ fn handle_key_event(
     status_message: &mut String,
     control_tx: &mpsc::UnboundedSender<SimulationControlCommand>,
     auto_peer_index: &mut usize,
-    total_steps: usize,
+    _total_steps: usize,
     speed_step: f64,
     paused: &mut bool,
 ) -> InputAction {
@@ -687,8 +641,9 @@ fn handle_key_event(
                 } else {
                     trimmed.to_string()
                 };
-                let schedule = vec![true; total_steps];
-                let (client, keypair) = SimulationHarness::build_peer(&node_id, schedule);
+                // For event-based simulation, create client with empty schedule
+                let client = SimulationClient::new(&node_id, vec![], None);
+                let keypair = generate_keypair();
                 let _ = control_tx.send(SimulationControlCommand::AddPeer { client, keypair });
                 *input_mode = InputMode::Normal;
                 *status_message = format!("Added peer request queued for {node_id}.");

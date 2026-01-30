@@ -77,68 +77,6 @@ pub struct OnlineSchedulePlan {
     pub node_cohort_assignments: HashMap<String, NodeCohortAssignment>,
 }
 
-pub async fn run_simulation_scenario(
-    scenario: SimulationScenarioConfig,
-) -> Result<SimulationReport, String> {
-    let relay_config = scenario.relay.clone();
-    let (base_url, shutdown_tx, _relay_control) =
-        start_relay(relay_config.clone().into_relay_config()).await;
-    let inputs = build_simulation_inputs(&scenario.simulation);
-    let steps = scenario.simulation.effective_steps();
-    let mut harness = SimulationHarness::new(
-        base_url,
-        inputs.clients,
-        inputs.direct_links,
-        scenario.direct_enabled.unwrap_or(true),
-        relay_config.ttl_seconds,
-        inputs.encryption,
-        inputs.keypairs,
-        inputs.timing,
-        inputs.cohort_online_rates,
-        None,
-        None,
-    );
-    let metrics = harness.run(steps, inputs.planned_sends).await;
-    let report = harness.metrics_report();
-    shutdown_tx.send(()).ok();
-    Ok(SimulationReport { metrics, report })
-}
-
-pub async fn run_simulation_scenario_with_progress<F>(
-    scenario: SimulationScenarioConfig,
-    mut on_step: F,
-) -> Result<SimulationReport, String>
-where
-    F: FnMut(SimulationStepUpdate),
-{
-    let relay_config = scenario.relay.clone();
-    let (base_url, shutdown_tx, _relay_control) =
-        start_relay(relay_config.clone().into_relay_config()).await;
-    let inputs = build_simulation_inputs(&scenario.simulation);
-    let steps = scenario.simulation.effective_steps();
-    let mut harness = SimulationHarness::new(
-        base_url,
-        inputs.clients,
-        inputs.direct_links,
-        scenario.direct_enabled.unwrap_or(true),
-        relay_config.ttl_seconds,
-        inputs.encryption,
-        inputs.keypairs,
-        inputs.timing,
-        inputs.cohort_online_rates,
-        None,
-        None,
-    );
-    let metrics = harness
-        .run_with_progress(steps, inputs.planned_sends, |update| {
-            on_step(update);
-        })
-        .await;
-    let report = harness.metrics_report();
-    shutdown_tx.send(()).ok();
-    Ok(SimulationReport { metrics, report })
-}
-
 /// Run event-based simulation scenario
 pub async fn run_event_based_scenario(
     scenario: SimulationScenarioConfig,
