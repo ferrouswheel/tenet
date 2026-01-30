@@ -17,7 +17,7 @@ use super::{
     start_relay, ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution,
     MessageEncryption, MessageType, MessageTypeWeights, OnlineAvailability, OnlineCohortDefinition,
     PostFrequency, SimulationClient, SimulationConfig, SimulationHarness, SimulationReport,
-    SimulationScenarioConfig, SimulationStepUpdate, SimulationTimingConfig,
+    SimulationScenarioConfig, SimulationStepUpdate, SimulationTimingConfig, TimeDistribution,
     SIMULATION_HOURS_PER_DAY, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
@@ -174,6 +174,7 @@ pub async fn run_event_based_scenario(
         inputs.keypairs,
         network_conditions,
         inputs.cohort_online_rates,
+        scenario.simulation.reaction_config.clone(),
         None,
         None,
         scenario.simulation.seed,
@@ -239,6 +240,7 @@ where
         inputs.keypairs,
         network_conditions,
         inputs.cohort_online_rates,
+        scenario.simulation.reaction_config.clone(),
         None,
         Some(relay_control),
         scenario.simulation.seed,
@@ -950,6 +952,115 @@ pub fn generate_online_schedule_events(
     events
 }
 
+/// Generate message send events over a time window using time-based distributions
+/// This is an alternative to step-based planned sends for event-based simulations
+pub fn generate_message_events(
+    sender_id: &str,
+    friends: &[String],
+    groups: &[String],
+    start_time: f64,
+    end_time: f64,
+    lambda_per_hour: f64,
+    time_distribution: &TimeDistribution,
+    message_type_weights: &MessageTypeWeights,
+    config: &SimulationConfig,
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    crypto_rng: &mut Option<&mut dyn RngCore>,
+    counter: &mut usize,
+    rng: &mut impl Rng,
+) -> Vec<super::ScheduledEvent> {
+    use super::event::{Event, ScheduledEvent};
+
+    let duration_hours = (end_time - start_time) / 3600.0;
+    let expected_count = lambda_per_hour * duration_hours;
+
+    // Sample total count from Poisson distribution
+    let count = sample_poisson(rng, expected_count);
+
+    // Generate event times based on distribution
+    let event_times = match time_distribution {
+        TimeDistribution::Uniform => {
+            // Uniform distribution of event times within window
+            (0..count)
+                .map(|_| start_time + rng.gen::<f64>() * (end_time - start_time))
+                .collect::<Vec<f64>>()
+        }
+        TimeDistribution::Clustered {
+            cluster_count,
+            cluster_spread,
+        } => {
+            // Create cluster centers uniformly distributed
+            let cluster_centers: Vec<f64> = (0..*cluster_count)
+                .map(|_| start_time + rng.gen::<f64>() * (end_time - start_time))
+                .collect();
+
+            // Distribute events among clusters
+            (0..count)
+                .map(|_| {
+                    // Pick a random cluster
+                    let cluster_idx = rng.gen_range(0..cluster_centers.len());
+                    let center = cluster_centers[cluster_idx];
+
+                    // Sample from normal distribution around cluster center
+                    let offset = rng.gen::<f64>() * cluster_spread - cluster_spread / 2.0;
+                    (center + offset).clamp(start_time, end_time)
+                })
+                .collect()
+        }
+        TimeDistribution::Bursty {
+            burst_count,
+            burst_duration,
+        } => {
+            // Create burst start times uniformly distributed
+            let burst_starts: Vec<f64> = (0..*burst_count)
+                .map(|_| start_time + rng.gen::<f64>() * (end_time - start_time - burst_duration))
+                .collect();
+
+            // Distribute events among bursts
+            (0..count)
+                .map(|_| {
+                    // Pick a random burst
+                    let burst_idx = rng.gen_range(0..burst_starts.len());
+                    let burst_start = burst_starts[burst_idx];
+
+                    // Sample uniformly within burst duration
+                    burst_start + rng.gen::<f64>() * burst_duration
+                })
+                .collect()
+        }
+    };
+
+    // Create events for each time
+    event_times
+        .into_iter()
+        .filter_map(|time| {
+            // Build a message for this event
+            let message = build_planned_message(
+                sender_id,
+                friends,
+                groups,
+                message_type_weights,
+                config,
+                encryption,
+                keypairs,
+                crypto_rng,
+                counter,
+                rng,
+            )?;
+
+            Some(ScheduledEvent {
+                time,
+                event: Event::MessageSend {
+                    sender_id: sender_id.to_string(),
+                    message,
+                },
+                event_id: 0, // Will be assigned by EventQueue
+            })
+        })
+        .collect()
+}
+
 pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> OnlineSchedulePlan {
     let mut schedules = HashMap::new();
     let mut cohort_online_counts: HashMap<String, usize> = HashMap::new();
@@ -1069,6 +1180,7 @@ pub fn build_planned_sends(
             PostFrequency::Poisson {
                 lambda_per_step,
                 lambda_per_hour,
+                time_distribution: _,
             } => {
                 let simulated_seconds_per_step = simulated_seconds_per_step(config).max(1.0);
                 let per_step = if let Some(lambda_per_hour) = lambda_per_hour {
@@ -1409,6 +1521,7 @@ mod tests {
             post_frequency: PostFrequency::Poisson {
                 lambda_per_step: None,
                 lambda_per_hour: Some(1.0),
+                time_distribution: None,
             },
             availability: None,
             cohorts: vec![OnlineCohortDefinition::AlwaysOnline {
@@ -1420,6 +1533,7 @@ mod tests {
             encryption: None,
             groups: None,
             message_type_weights: None,
+            reaction_config: None,
             seed: 42,
         };
 

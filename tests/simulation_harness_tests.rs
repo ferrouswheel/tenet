@@ -50,6 +50,7 @@ async fn simulation_harness_routes_relay_and_direct_with_dedup() {
         encryption: Some(MessageEncryption::Plaintext),
         groups: None,
         message_type_weights: None,
+        reaction_config: None,
         seed: 42,
     };
 
@@ -330,6 +331,7 @@ fn test_groups_and_message_type_distribution() {
         post_frequency: PostFrequency::Poisson {
             lambda_per_step: None,
             lambda_per_hour: Some(10.0),
+            time_distribution: None,
         },
         availability: None,
         cohorts: Vec::new(),
@@ -345,6 +347,7 @@ fn test_groups_and_message_type_distribution() {
             public: 0.3,
             group: 0.4,
         }),
+        reaction_config: None,
         seed: 12345,
     };
 

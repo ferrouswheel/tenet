@@ -107,7 +107,21 @@ pub struct SimulationConfig {
     pub groups: Option<GroupsConfig>,
     #[serde(default)]
     pub message_type_weights: Option<MessageTypeWeights>,
+    #[serde(default)]
+    pub reaction_config: Option<ReactionConfig>,
     pub seed: u64,
+}
+
+/// Configuration for dynamic event generation (reactions)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionConfig {
+    /// Probability that receiving a message triggers a reply
+    #[serde(default)]
+    pub reply_probability: f64,
+
+    /// Delay before sending reply (in seconds)
+    #[serde(default)]
+    pub reply_delay_distribution: LatencyDistribution,
 }
 
 /// Configuration for groups in simulation
@@ -294,11 +308,42 @@ pub enum PostFrequency {
         lambda_per_step: Option<f64>,
         #[serde(default)]
         lambda_per_hour: Option<f64>,
+        /// Optional time distribution for event spacing
+        #[serde(default)]
+        time_distribution: Option<TimeDistribution>,
     },
     WeightedSchedule {
         weights: Vec<f64>,
         total_posts: usize,
     },
+}
+
+/// Distribution of event times within a time window
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TimeDistribution {
+    /// Events uniformly distributed across time window
+    Uniform,
+    /// Events clustered around certain times
+    Clustered {
+        /// Number of clusters
+        cluster_count: usize,
+        /// Cluster spread in seconds
+        cluster_spread: f64,
+    },
+    /// Bursty traffic - events come in bursts
+    Bursty {
+        /// Number of bursts
+        burst_count: usize,
+        /// Duration of each burst in seconds
+        burst_duration: f64,
+    },
+}
+
+impl Default for TimeDistribution {
+    fn default() -> Self {
+        TimeDistribution::Uniform
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
