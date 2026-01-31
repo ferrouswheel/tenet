@@ -216,9 +216,9 @@ async fn run_with_tui(
                         base_seconds_per_step,
                     )
                     .map_err(|err| err.to_string())?;
-                } else if rx.is_closed() {
-                    break;
                 }
+                // Don't break here - let the main rx.recv() handle loop exit
+                // to ensure we drain any pending progress updates
             }
             relay_log_line = relay_log_rx.recv() => {
                 if let Some(line) = relay_log_line {
@@ -236,9 +236,9 @@ async fn run_with_tui(
                         base_seconds_per_step,
                     )
                     .map_err(|err| err.to_string())?;
-                } else if rx.is_closed() {
-                    break;
                 }
+                // Don't break here - let the main rx.recv() handle loop exit
+                // to ensure we drain any pending progress updates
             }
             input_event = input_rx.recv() => {
                 if let Some(Event::Key(key)) = input_event {
