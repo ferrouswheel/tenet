@@ -1074,12 +1074,73 @@ impl EventBasedHarness {
                     tokio::task::yield_now().await;
                 }
                 TimeControlMode::RealTime { speed_factor } => {
-                    // Wait for real time to catch up
+                    // Wait for real time to catch up, checking for control commands periodically
                     while self.clock.simulated_time < next_time {
                         self.clock.update();
                         let wait_time = (next_time - self.clock.simulated_time) / speed_factor;
                         if wait_time > 0.001 {
-                            tokio::time::sleep(Duration::from_secs_f64(wait_time.min(0.1))).await;
+                            // Sleep in small chunks to allow responsive control command processing
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs_f64(wait_time.min(0.05))) => {
+                                    // Continue waiting
+                                }
+                                command = control_rx.recv() => {
+                                    if let Some(command) = command {
+                                        // Process control command immediately
+                                        match command {
+                                            SimulationControlCommand::SetTimeControlMode { mode } => {
+                                                self.clock.set_mode(mode);
+                                                self.log_event(format!("Time control mode changed to {:?}", mode));
+                                                // Mode changed - break out of realtime wait loop
+                                                break;
+                                            }
+                                            SimulationControlCommand::SetPaused { paused } => {
+                                                let mode = if paused {
+                                                    TimeControlMode::Paused
+                                                } else {
+                                                    TimeControlMode::RealTime { speed_factor: 1.0 }
+                                                };
+                                                self.clock.set_mode(mode);
+                                                if let Some(relay_control) = &self.relay_control {
+                                                    relay_control.set_paused(paused);
+                                                }
+                                                self.log_event(if paused {
+                                                    "Simulation paused".to_string()
+                                                } else {
+                                                    "Simulation resumed".to_string()
+                                                });
+                                                break;
+                                            }
+                                            SimulationControlCommand::AdjustSpeedFactor { delta } => {
+                                                if let TimeControlMode::RealTime { speed_factor } = self.clock.mode {
+                                                    let new_speed = (speed_factor + delta).max(0.1);
+                                                    self.clock.set_mode(TimeControlMode::RealTime {
+                                                        speed_factor: new_speed,
+                                                    });
+                                                    self.log_event(format!("Speed factor adjusted to {:.2}x", new_speed));
+                                                }
+                                            }
+                                            SimulationControlCommand::SetSpeedFactor { speed_factor } => {
+                                                self.clock.set_mode(TimeControlMode::RealTime { speed_factor });
+                                                self.log_event(format!("Speed factor set to {:.2}x", speed_factor));
+                                            }
+                                            SimulationControlCommand::Stop => {
+                                                self.log_event("Stop requested".to_string());
+                                                stop_requested = true;
+                                                break;
+                                            }
+                                            SimulationControlCommand::JumpToTime { time } => {
+                                                self.clock.jump_to(time);
+                                                self.log_event(format!("Jumped to time {:.2}s", time));
+                                                break;
+                                            }
+                                            _ => {
+                                                // Other commands not relevant for event-based simulation
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             break;
                         }
