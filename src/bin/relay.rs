@@ -23,7 +23,8 @@ async fn main() {
     };
 
     let state = RelayState::new(config);
-    state.start_peer_log_task();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    state.start_peer_log_task(shutdown_rx);
     let app = app(state);
 
     let bind = env::var("TENET_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
