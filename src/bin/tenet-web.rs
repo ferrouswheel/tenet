@@ -4,6 +4,7 @@
 //! connects to relays, and persists state in SQLite.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +50,7 @@ const SYNC_INTERVAL_SECS: u64 = 30;
 const WEB_HPKE_INFO: &[u8] = b"tenet-web";
 const WEB_PAYLOAD_AAD: &[u8] = b"tenet-web";
 const WS_CHANNEL_CAPACITY: usize = 256;
+const MAX_WS_CONNECTIONS: usize = 8;
 const MAX_ATTACHMENT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB per attachment
 
 struct Config {
@@ -111,6 +113,7 @@ struct AppState {
     keypair: StoredKeypair,
     relay_url: Option<String>,
     ws_tx: broadcast::Sender<WsEvent>,
+    ws_connection_count: Arc<AtomicUsize>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -182,11 +185,14 @@ async fn main() {
     // Create WebSocket broadcast channel
     let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
 
+    let ws_connection_count = Arc::new(AtomicUsize::new(0));
+
     let state: SharedState = Arc::new(Mutex::new(AppState {
         storage,
         keypair: keypair.clone(),
         relay_url: config.relay_url.clone(),
         ws_tx,
+        ws_connection_count,
     }));
 
     // Start background relay sync task
@@ -432,28 +438,38 @@ async fn send_direct_handler(
         return api_error(StatusCode::BAD_REQUEST, "body or attachments required");
     }
 
-    let st = state.lock().await;
-
-    // Look up recipient's public key
-    let peer = match st.storage.get_peer(&req.recipient_id) {
-        Ok(Some(p)) => p,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "recipient peer not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let recipient_enc_key = match peer.encryption_public_key.as_deref() {
-        Some(k) => k.to_string(),
-        None => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "recipient has no encryption key; cannot send encrypted message",
-            )
-        }
-    };
-
     let now = now_secs();
 
-    // Build encrypted envelope
+    // Short lock: extract data needed for envelope construction
+    let (keypair_id, signing_key, recipient_enc_key, relay_url) = {
+        let st = state.lock().await;
+
+        let peer = match st.storage.get_peer(&req.recipient_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "recipient peer not found"),
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+
+        let enc_key = match peer.encryption_public_key.as_deref() {
+            Some(k) => k.to_string(),
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "recipient has no encryption key; cannot send encrypted message",
+                )
+            }
+        };
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            enc_key,
+            st.relay_url.clone(),
+        )
+    };
+    // Lock released
+
+    // Build encrypted envelope (CPU-only, no lock needed)
     let content_key = generate_content_key();
     let mut nonce = [0u8; NONCE_SIZE];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -472,7 +488,7 @@ async fn send_direct_handler(
     };
 
     let envelope = match build_envelope_from_payload(
-        st.keypair.id.clone(),
+        keypair_id.clone(),
         req.recipient_id.clone(),
         None,
         None,
@@ -481,7 +497,7 @@ async fn send_direct_handler(
         MessageKind::Direct,
         None,
         payload,
-        &st.keypair.signing_private_key_hex,
+        &signing_key,
     ) {
         Ok(e) => e,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
@@ -489,8 +505,8 @@ async fn send_direct_handler(
 
     let msg_id = envelope.header.message_id.0.clone();
 
-    // Post to relay
-    let relay_delivered = if let Some(ref relay_url) = st.relay_url {
+    // Post to relay (blocking I/O, no lock held)
+    let relay_delivered = if let Some(ref relay_url) = relay_url {
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
@@ -502,40 +518,42 @@ async fn send_direct_handler(
         false
     };
 
-    // Persist to outbox and messages
-    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
-        message_id: msg_id.clone(),
-        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
-        sent_at: now,
-        delivered: false,
-    });
+    // Short lock: persist and broadcast
+    {
+        let st = state.lock().await;
 
-    let _ = st.storage.insert_message(&MessageRow {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        recipient_id: req.recipient_id.clone(),
-        message_kind: "direct".to_string(),
-        group_id: None,
-        body: Some(req.body.clone()),
-        timestamp: now,
-        received_at: now,
-        ttl_seconds: DEFAULT_TTL_SECONDS,
-        is_read: true,
-        raw_envelope: None,
-        reply_to: None,
-    });
+        let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+            message_id: msg_id.clone(),
+            envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+            sent_at: now,
+            delivered: false,
+        });
 
-    // Link attachments to message
-    link_attachments(&st.storage, &msg_id, &req.attachments);
+        let _ = st.storage.insert_message(&MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id.clone(),
+            recipient_id: req.recipient_id.clone(),
+            message_kind: "direct".to_string(),
+            group_id: None,
+            body: Some(req.body.clone()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: DEFAULT_TTL_SECONDS,
+            is_read: true,
+            raw_envelope: None,
+            reply_to: None,
+        });
 
-    // Broadcast to WebSocket clients
-    let _ = st.ws_tx.send(WsEvent::NewMessage {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        message_kind: "direct".to_string(),
-        body: Some(req.body.clone()),
-        timestamp: now,
-    });
+        link_attachments(&st.storage, &msg_id, &req.attachments);
+
+        let _ = st.ws_tx.send(WsEvent::NewMessage {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id,
+            message_kind: "direct".to_string(),
+            body: Some(req.body.clone()),
+            timestamp: now,
+        });
+    }
 
     let json = serde_json::json!({
         "message_id": msg_id,
@@ -562,14 +580,25 @@ async fn send_public_handler(
         return api_error(StatusCode::BAD_REQUEST, "body or attachments required");
     }
 
-    let st = state.lock().await;
     let now = now_secs();
 
+    // Short lock: extract identity data
+    let (keypair_id, signing_key, relay_url) = {
+        let st = state.lock().await;
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            st.relay_url.clone(),
+        )
+    };
+    // Lock released
+
+    // Build envelope (CPU-only, no lock needed)
     let mut salt = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
     let envelope = match build_plaintext_envelope(
-        st.keypair.id.as_str(),
+        &keypair_id,
         "*",
         None,
         None,
@@ -579,7 +608,7 @@ async fn send_public_handler(
         None,
         &req.body,
         salt,
-        &st.keypair.signing_private_key_hex,
+        &signing_key,
     ) {
         Ok(e) => e,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
@@ -587,8 +616,8 @@ async fn send_public_handler(
 
     let msg_id = envelope.header.message_id.0.clone();
 
-    // Post to relay
-    let relay_delivered = if let Some(ref relay_url) = st.relay_url {
+    // Post to relay (blocking I/O, no lock held)
+    let relay_delivered = if let Some(ref relay_url) = relay_url {
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
@@ -600,40 +629,42 @@ async fn send_public_handler(
         false
     };
 
-    // Persist
-    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
-        message_id: msg_id.clone(),
-        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
-        sent_at: now,
-        delivered: false,
-    });
+    // Short lock: persist and broadcast
+    {
+        let st = state.lock().await;
 
-    let _ = st.storage.insert_message(&MessageRow {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        recipient_id: "*".to_string(),
-        message_kind: "public".to_string(),
-        group_id: None,
-        body: Some(req.body.clone()),
-        timestamp: now,
-        received_at: now,
-        ttl_seconds: DEFAULT_TTL_SECONDS,
-        is_read: true,
-        raw_envelope: None,
-        reply_to: None,
-    });
+        let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+            message_id: msg_id.clone(),
+            envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+            sent_at: now,
+            delivered: false,
+        });
 
-    // Link attachments to message
-    link_attachments(&st.storage, &msg_id, &req.attachments);
+        let _ = st.storage.insert_message(&MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id.clone(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some(req.body.clone()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: DEFAULT_TTL_SECONDS,
+            is_read: true,
+            raw_envelope: None,
+            reply_to: None,
+        });
 
-    // Broadcast to WS
-    let _ = st.ws_tx.send(WsEvent::NewMessage {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        message_kind: "public".to_string(),
-        body: Some(req.body.clone()),
-        timestamp: now,
-    });
+        link_attachments(&st.storage, &msg_id, &req.attachments);
+
+        let _ = st.ws_tx.send(WsEvent::NewMessage {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id,
+            message_kind: "public".to_string(),
+            body: Some(req.body.clone()),
+            timestamp: now,
+        });
+    }
 
     let json = serde_json::json!({
         "message_id": msg_id,
@@ -661,21 +692,33 @@ async fn send_group_handler(
         return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
     }
 
-    let st = state.lock().await;
     let now = now_secs();
 
-    // Look up group key from storage
-    let group = match st.storage.get_group(&req.group_id) {
-        Ok(Some(g)) => g,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
+    // Short lock: extract group key and identity
+    let (keypair_id, signing_key, group_key, relay_url) = {
+        let st = state.lock().await;
 
-    let group_key: [u8; 32] = match group.group_key.try_into() {
-        Ok(k) => k,
-        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
-    };
+        let group = match st.storage.get_group(&req.group_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
 
+        let gk: [u8; 32] = match group.group_key.try_into() {
+            Ok(k) => k,
+            Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
+        };
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            gk,
+            st.relay_url.clone(),
+        )
+    };
+    // Lock released
+
+    // Build envelope (CPU-only, no lock needed)
     let aad = req.group_id.as_bytes();
     let payload =
         match tenet::protocol::build_group_message_payload(req.body.as_bytes(), &group_key, aad) {
@@ -684,7 +727,7 @@ async fn send_group_handler(
         };
 
     let envelope = match build_envelope_from_payload(
-        st.keypair.id.clone(),
+        keypair_id.clone(),
         "*".to_string(),
         None,
         None,
@@ -693,7 +736,7 @@ async fn send_group_handler(
         MessageKind::FriendGroup,
         Some(req.group_id.clone()),
         payload,
-        &st.keypair.signing_private_key_hex,
+        &signing_key,
     ) {
         Ok(e) => e,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
@@ -701,8 +744,8 @@ async fn send_group_handler(
 
     let msg_id = envelope.header.message_id.0.clone();
 
-    // Post to relay
-    let relay_delivered = if let Some(ref relay_url) = st.relay_url {
+    // Post to relay (blocking I/O, no lock held)
+    let relay_delivered = if let Some(ref relay_url) = relay_url {
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
@@ -714,40 +757,42 @@ async fn send_group_handler(
         false
     };
 
-    // Persist
-    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
-        message_id: msg_id.clone(),
-        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
-        sent_at: now,
-        delivered: false,
-    });
+    // Short lock: persist and broadcast
+    {
+        let st = state.lock().await;
 
-    let _ = st.storage.insert_message(&MessageRow {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        recipient_id: "*".to_string(),
-        message_kind: "friend_group".to_string(),
-        group_id: Some(req.group_id.clone()),
-        body: Some(req.body.clone()),
-        timestamp: now,
-        received_at: now,
-        ttl_seconds: DEFAULT_TTL_SECONDS,
-        is_read: true,
-        raw_envelope: None,
-        reply_to: None,
-    });
+        let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+            message_id: msg_id.clone(),
+            envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+            sent_at: now,
+            delivered: false,
+        });
 
-    // Link attachments to message
-    link_attachments(&st.storage, &msg_id, &req.attachments);
+        let _ = st.storage.insert_message(&MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id.clone(),
+            recipient_id: "*".to_string(),
+            message_kind: "friend_group".to_string(),
+            group_id: Some(req.group_id.clone()),
+            body: Some(req.body.clone()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: DEFAULT_TTL_SECONDS,
+            is_read: true,
+            raw_envelope: None,
+            reply_to: None,
+        });
 
-    // Broadcast to WS
-    let _ = st.ws_tx.send(WsEvent::NewMessage {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        message_kind: "friend_group".to_string(),
-        body: Some(req.body.clone()),
-        timestamp: now,
-    });
+        link_attachments(&st.storage, &msg_id, &req.attachments);
+
+        let _ = st.ws_tx.send(WsEvent::NewMessage {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id,
+            message_kind: "friend_group".to_string(),
+            body: Some(req.body.clone()),
+            timestamp: now,
+        });
+    }
 
     let json = serde_json::json!({
         "message_id": msg_id,
@@ -784,25 +829,25 @@ async fn mark_read_handler(
 // Peers API
 // ---------------------------------------------------------------------------
 
+/// Build the JSON representation of a peer.
+fn peer_to_json(p: &PeerRow) -> serde_json::Value {
+    serde_json::json!({
+        "peer_id": p.peer_id,
+        "display_name": p.display_name,
+        "signing_public_key": p.signing_public_key,
+        "encryption_public_key": p.encryption_public_key,
+        "added_at": p.added_at,
+        "is_friend": p.is_friend,
+        "last_seen_online": p.last_seen_online,
+        "online": p.online,
+    })
+}
+
 async fn list_peers_handler(State(state): State<SharedState>) -> Response {
     let st = state.lock().await;
     match st.storage.list_peers() {
         Ok(peers) => {
-            let json: Vec<serde_json::Value> = peers
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "peer_id": p.peer_id,
-                        "display_name": p.display_name,
-                        "signing_public_key": p.signing_public_key,
-                        "encryption_public_key": p.encryption_public_key,
-                        "added_at": p.added_at,
-                        "is_friend": p.is_friend,
-                        "last_seen_online": p.last_seen_online,
-                        "online": p.online,
-                    })
-                })
-                .collect();
+            let json: Vec<serde_json::Value> = peers.iter().map(peer_to_json).collect();
             (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -815,19 +860,7 @@ async fn get_peer_handler(
 ) -> Response {
     let st = state.lock().await;
     match st.storage.get_peer(&peer_id) {
-        Ok(Some(p)) => {
-            let json = serde_json::json!({
-                "peer_id": p.peer_id,
-                "display_name": p.display_name,
-                "signing_public_key": p.signing_public_key,
-                "encryption_public_key": p.encryption_public_key,
-                "added_at": p.added_at,
-                "is_friend": p.is_friend,
-                "last_seen_online": p.last_seen_online,
-                "online": p.online,
-            });
-            (StatusCode::OK, axum::Json(json)).into_response()
-        }
+        Ok(Some(p)) => (StatusCode::OK, axum::Json(peer_to_json(&p))).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "peer not found"),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -884,19 +917,7 @@ async fn add_peer_handler(
     };
 
     match st.storage.insert_peer(&peer_row) {
-        Ok(()) => {
-            let json = serde_json::json!({
-                "peer_id": peer_row.peer_id,
-                "display_name": peer_row.display_name,
-                "signing_public_key": peer_row.signing_public_key,
-                "encryption_public_key": peer_row.encryption_public_key,
-                "added_at": peer_row.added_at,
-                "is_friend": peer_row.is_friend,
-                "last_seen_online": peer_row.last_seen_online,
-                "online": peer_row.online,
-            });
-            (StatusCode::CREATED, axum::Json(json)).into_response()
-        }
+        Ok(()) => (StatusCode::CREATED, axum::Json(peer_to_json(&peer_row))).into_response(),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -981,89 +1002,96 @@ async fn create_group_handler(
         return api_error(StatusCode::BAD_REQUEST, "group_id cannot be empty");
     }
 
-    let st = state.lock().await;
     let now = now_secs();
 
     // Generate a new symmetric key for the group
     let mut group_key = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_key);
 
-    // Prepare group and member rows
-    let group_row = tenet::storage::GroupRow {
-        group_id: req.group_id.clone(),
-        group_key: group_key.to_vec(),
-        creator_id: st.keypair.id.clone(),
-        created_at: now,
-        key_version: 1,
-    };
+    // Short lock: insert group + members atomically, extract peer data for key distribution
+    let (keypair_id, signing_key, relay_url, all_members, member_enc_keys) = {
+        let st = state.lock().await;
 
-    // Add members to group (including creator)
-    let mut all_members = req.member_ids.clone();
-    if !all_members.contains(&st.keypair.id) {
-        all_members.push(st.keypair.id.clone());
-    }
-
-    let member_rows: Vec<tenet::storage::GroupMemberRow> = all_members
-        .iter()
-        .map(|member_id| tenet::storage::GroupMemberRow {
+        let group_row = tenet::storage::GroupRow {
             group_id: req.group_id.clone(),
-            peer_id: member_id.clone(),
-            joined_at: now,
-        })
-        .collect();
+            group_key: group_key.to_vec(),
+            creator_id: st.keypair.id.clone(),
+            created_at: now,
+            key_version: 1,
+        };
 
-    // Insert group and members atomically
-    if let Err(e) = st
-        .storage
-        .insert_group_with_members(&group_row, &member_rows)
-    {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
-
-    // Distribute group key to each member (except creator) via encrypted direct messages
-    let mut key_distribution_failed: Vec<String> = Vec::new();
-
-    for member_id in &req.member_ids {
-        if member_id == &st.keypair.id {
-            continue; // Skip creator
+        let mut all_members = req.member_ids.clone();
+        if !all_members.contains(&st.keypair.id) {
+            all_members.push(st.keypair.id.clone());
         }
 
-        // Look up member's public key
-        let peer = match st.storage.get_peer(member_id) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                eprintln!("peer not found during key distribution: {}", member_id);
-                key_distribution_failed.push(member_id.clone());
-                continue;
-            }
-            Err(e) => {
-                eprintln!("error fetching peer {}: {}", member_id, e);
-                key_distribution_failed.push(member_id.clone());
-                continue;
-            }
-        };
+        let member_rows: Vec<tenet::storage::GroupMemberRow> = all_members
+            .iter()
+            .map(|member_id| tenet::storage::GroupMemberRow {
+                group_id: req.group_id.clone(),
+                peer_id: member_id.clone(),
+                joined_at: now,
+            })
+            .collect();
 
-        let recipient_enc_key = match peer.encryption_public_key.as_deref() {
-            Some(k) => k.to_string(),
+        if let Err(e) = st
+            .storage
+            .insert_group_with_members(&group_row, &member_rows)
+        {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+
+        // Collect encryption keys for members we need to distribute to
+        let mut member_enc_keys: Vec<(String, Option<String>)> = Vec::new();
+        for member_id in &req.member_ids {
+            if member_id == &st.keypair.id {
+                continue;
+            }
+            let enc_key = st
+                .storage
+                .get_peer(member_id)
+                .ok()
+                .flatten()
+                .and_then(|p| p.encryption_public_key);
+            member_enc_keys.push((member_id.clone(), enc_key));
+        }
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            st.relay_url.clone(),
+            all_members,
+            member_enc_keys,
+        )
+    };
+    // Lock released
+
+    // Distribute group key to each member (crypto + I/O, no lock held)
+    let mut key_distribution_failed: Vec<String> = Vec::new();
+
+    for (member_id, enc_key) in &member_enc_keys {
+        let recipient_enc_key = match enc_key {
+            Some(k) => k.clone(),
             None => {
-                eprintln!("peer {} has no encryption key; skipping", member_id);
+                eprintln!(
+                    "peer {} not found or has no encryption key; skipping",
+                    member_id
+                );
                 key_distribution_failed.push(member_id.clone());
                 continue;
             }
         };
 
-        // Build a group key distribution message payload
         let key_distribution = serde_json::json!({
             "type": "group_key_distribution",
             "group_id": req.group_id,
             "group_key": hex::encode(group_key),
             "key_version": 1,
-            "creator_id": st.keypair.id,
+            "creator_id": keypair_id,
         });
 
         let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
 
-        // Encrypt the key distribution message
         let content_key = generate_content_key();
         let mut nonce = [0u8; NONCE_SIZE];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -1089,7 +1117,7 @@ async fn create_group_handler(
         };
 
         let envelope = match build_envelope_from_payload(
-            st.keypair.id.clone(),
+            keypair_id.clone(),
             member_id.clone(),
             None,
             None,
@@ -1098,7 +1126,7 @@ async fn create_group_handler(
             MessageKind::Direct,
             None,
             payload,
-            &st.keypair.signing_private_key_hex,
+            &signing_key,
         ) {
             Ok(e) => e,
             Err(e) => {
@@ -1108,27 +1136,24 @@ async fn create_group_handler(
             }
         };
 
-        // Post to relay
-        if let Some(ref relay_url) = st.relay_url {
+        if let Some(ref relay_url) = relay_url {
             if let Err(e) = post_to_relay(relay_url, &envelope) {
                 eprintln!("failed to distribute group key to {}: {}", member_id, e);
                 key_distribution_failed.push(member_id.clone());
             }
         } else {
-            // No relay configured, can't distribute key
             key_distribution_failed.push(member_id.clone());
         }
     }
 
     let mut json = serde_json::json!({
         "group_id": req.group_id,
-        "creator_id": st.keypair.id,
+        "creator_id": keypair_id,
         "created_at": now,
         "key_version": 1,
         "members": all_members,
     });
 
-    // Include key distribution failures if any
     if !key_distribution_failed.is_empty() {
         json.as_object_mut().unwrap().insert(
             "key_distribution_failed".to_string(),
@@ -1153,56 +1178,68 @@ async fn add_group_member_handler(
         return api_error(StatusCode::BAD_REQUEST, "peer_id cannot be empty");
     }
 
-    let st = state.lock().await;
     let now = now_secs();
 
-    // Check if group exists
-    let group = match st.storage.get_group(&group_id) {
-        Ok(Some(g)) => g,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
+    // Short lock: validate, insert member, extract data for key distribution
+    let (keypair_id, signing_key, relay_url, recipient_enc_key, group_key, key_version, creator_id) = {
+        let st = state.lock().await;
 
-    // Add member to database
-    let member_row = tenet::storage::GroupMemberRow {
-        group_id: group_id.clone(),
-        peer_id: req.peer_id.clone(),
-        joined_at: now,
-    };
+        let group = match st.storage.get_group(&group_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
 
-    if let Err(e) = st.storage.insert_group_member(&member_row) {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
+        let member_row = tenet::storage::GroupMemberRow {
+            group_id: group_id.clone(),
+            peer_id: req.peer_id.clone(),
+            joined_at: now,
+        };
 
-    // Send group key to new member via encrypted direct message
-    let peer = match st.storage.get_peer(&req.peer_id) {
-        Ok(Some(p)) => p,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "peer not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let recipient_enc_key = match peer.encryption_public_key.as_deref() {
-        Some(k) => k.to_string(),
-        None => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "peer has no encryption key; cannot distribute group key",
-            )
+        if let Err(e) = st.storage.insert_group_member(&member_row) {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
-    };
 
-    let group_key: [u8; 32] = match group.group_key.try_into() {
-        Ok(k) => k,
-        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
-    };
+        let peer = match st.storage.get_peer(&req.peer_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "peer not found"),
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
 
-    // Build a group key distribution message
+        let enc_key = match peer.encryption_public_key.as_deref() {
+            Some(k) => k.to_string(),
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "peer has no encryption key; cannot distribute group key",
+                )
+            }
+        };
+
+        let gk: [u8; 32] = match group.group_key.try_into() {
+            Ok(k) => k,
+            Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
+        };
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            st.relay_url.clone(),
+            enc_key,
+            gk,
+            group.key_version,
+            group.creator_id.clone(),
+        )
+    };
+    // Lock released
+
+    // Build key distribution envelope (crypto, no lock needed)
     let key_distribution = serde_json::json!({
         "type": "group_key_distribution",
         "group_id": group_id,
         "group_key": hex::encode(group_key),
-        "key_version": group.key_version,
-        "creator_id": group.creator_id,
+        "key_version": key_version,
+        "creator_id": creator_id,
     });
 
     let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
@@ -1225,7 +1262,7 @@ async fn add_group_member_handler(
     };
 
     let envelope = match build_envelope_from_payload(
-        st.keypair.id.clone(),
+        keypair_id,
         req.peer_id.clone(),
         None,
         None,
@@ -1234,14 +1271,14 @@ async fn add_group_member_handler(
         MessageKind::Direct,
         None,
         payload,
-        &st.keypair.signing_private_key_hex,
+        &signing_key,
     ) {
         Ok(e) => e,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
     };
 
-    // Post to relay
-    let relay_delivered = if let Some(ref relay_url) = st.relay_url {
+    // Post to relay (blocking I/O, no lock held)
+    let relay_delivered = if let Some(ref relay_url) = relay_url {
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
@@ -1421,16 +1458,25 @@ async fn react_handler(
         );
     }
 
-    let st = state.lock().await;
-
-    // Verify target message exists
-    if !st.storage.has_message(&message_id).unwrap_or(false) {
-        return api_error(StatusCode::NOT_FOUND, "message not found");
-    }
-
     let now = now_secs();
 
-    // Build a reaction message and send it as a public message
+    // Short lock: verify message exists, extract identity data
+    let (keypair_id, signing_key, relay_url) = {
+        let st = state.lock().await;
+
+        if !st.storage.has_message(&message_id).unwrap_or(false) {
+            return api_error(StatusCode::NOT_FOUND, "message not found");
+        }
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            st.relay_url.clone(),
+        )
+    };
+    // Lock released
+
+    // Build envelope (CPU-only, no lock needed)
     let reaction_payload = serde_json::json!({
         "target_message_id": message_id,
         "reaction": req.reaction,
@@ -1443,7 +1489,7 @@ async fn react_handler(
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
     let envelope = match build_plaintext_envelope(
-        st.keypair.id.as_str(),
+        &keypair_id,
         "*",
         None,
         None,
@@ -1453,27 +1499,28 @@ async fn react_handler(
         None,
         &body_str,
         salt,
-        &st.keypair.signing_private_key_hex,
+        &signing_key,
     ) {
         Ok(e) => e,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
     };
 
-    // Post to relay
-    if let Some(ref relay_url) = st.relay_url {
-        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
-        if let Ok(json_val) = serde_json::to_value(&envelope) {
-            let _ = ureq::post(&url).send_json(json_val);
+    // Post to relay (blocking I/O, no lock held)
+    if let Some(ref relay_url) = relay_url {
+        if let Err(e) = post_to_relay(relay_url, &envelope) {
+            eprintln!("failed to post reaction to relay: {}", e);
         }
     }
 
     let reaction_msg_id = envelope.header.message_id.0.clone();
 
-    // Store the reaction
+    // Short lock: persist reaction and count
+    let st = state.lock().await;
+
     let reaction_row = ReactionRow {
         message_id: reaction_msg_id.clone(),
         target_id: message_id.clone(),
-        sender_id: st.keypair.id.clone(),
+        sender_id: keypair_id,
         reaction: req.reaction.clone(),
         timestamp: now,
     };
@@ -1598,27 +1645,71 @@ async fn reply_handler(
         return api_error(StatusCode::BAD_REQUEST, "body or attachments required");
     }
 
-    let st = state.lock().await;
-
-    // Verify parent message exists and determine its kind
-    let parent = match st.storage.get_message(&parent_message_id) {
-        Ok(Some(m)) => m,
-        Ok(None) => return api_error(StatusCode::NOT_FOUND, "parent message not found"),
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
     let now = now_secs();
 
-    // Replies inherit the message_kind of the parent
-    let message_kind = parent.message_kind.as_str();
+    // Short lock: extract parent info, identity data, and optional group key
+    #[allow(clippy::type_complexity)]
+    let (keypair_id, signing_key, relay_url, message_kind, parent_group_id, group_key_opt): (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<[u8; 32]>,
+    ) = {
+        let st = state.lock().await;
 
-    // Build envelope based on parent message kind
+        let parent = match st.storage.get_message(&parent_message_id) {
+            Ok(Some(m)) => m,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "parent message not found"),
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+
+        let mk = parent.message_kind.clone();
+        let pgid = parent.group_id.clone();
+
+        let gk = if mk == "friend_group" {
+            let group_id = match pgid.as_deref() {
+                Some(gid) => gid,
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "parent group message has no group_id",
+                    )
+                }
+            };
+            let group = match st.storage.get_group(group_id) {
+                Ok(Some(g)) => g,
+                Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
+                Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            let key: [u8; 32] = match group.group_key.try_into() {
+                Ok(k) => k,
+                Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
+            };
+            Some(key)
+        } else {
+            None
+        };
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            st.relay_url.clone(),
+            mk,
+            pgid,
+            gk,
+        )
+    };
+    // Lock released
+
+    // Build envelope (CPU-only, no lock needed)
     let envelope = if message_kind == "public" {
         let mut salt = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
         match build_plaintext_envelope(
-            st.keypair.id.as_str(),
+            &keypair_id,
             "*",
             None,
             None,
@@ -1628,7 +1719,7 @@ async fn reply_handler(
             None,
             &req.body,
             salt,
-            &st.keypair.signing_private_key_hex,
+            &signing_key,
         ) {
             Ok(e) => e,
             Err(e) => {
@@ -1636,25 +1727,8 @@ async fn reply_handler(
             }
         }
     } else if message_kind == "friend_group" {
-        // For group replies, encrypt with group key
-        let group_id = match parent.group_id.as_deref() {
-            Some(gid) => gid,
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "parent group message has no group_id",
-                )
-            }
-        };
-        let group = match st.storage.get_group(group_id) {
-            Ok(Some(g)) => g,
-            Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
-            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        let group_key: [u8; 32] = match group.group_key.try_into() {
-            Ok(k) => k,
-            Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
-        };
+        let group_id = parent_group_id.as_deref().unwrap();
+        let group_key = group_key_opt.unwrap();
         let aad = group_id.as_bytes();
         let payload = match tenet::protocol::build_group_message_payload(
             req.body.as_bytes(),
@@ -1665,7 +1739,7 @@ async fn reply_handler(
             Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
         };
         match build_envelope_from_payload(
-            st.keypair.id.clone(),
+            keypair_id.clone(),
             "*".to_string(),
             None,
             None,
@@ -1674,7 +1748,7 @@ async fn reply_handler(
             MessageKind::FriendGroup,
             Some(group_id.to_string()),
             payload,
-            &st.keypair.signing_private_key_hex,
+            &signing_key,
         ) {
             Ok(e) => e,
             Err(e) => {
@@ -1688,55 +1762,63 @@ async fn reply_handler(
         );
     };
 
-    // Post to relay
-    if let Some(ref relay_url) = st.relay_url {
-        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
-        if let Ok(json_val) = serde_json::to_value(&envelope) {
-            let _ = ureq::post(&url).send_json(json_val);
+    // Post to relay (blocking I/O, no lock held)
+    let relay_delivered = if let Some(ref relay_url) = relay_url {
+        match post_to_relay(relay_url, &envelope) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("failed to post reply to relay: {}", e);
+                false
+            }
         }
-    }
+    } else {
+        false
+    };
 
     let msg_id = envelope.header.message_id.0.clone();
 
-    // Persist as message with reply_to set
-    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
-        message_id: msg_id.clone(),
-        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
-        sent_at: now,
-        delivered: false,
-    });
+    // Short lock: persist and broadcast
+    {
+        let st = state.lock().await;
 
-    let _ = st.storage.insert_message(&MessageRow {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        recipient_id: "*".to_string(),
-        message_kind: message_kind.to_string(),
-        group_id: parent.group_id.clone(),
-        body: Some(req.body.clone()),
-        timestamp: now,
-        received_at: now,
-        ttl_seconds: DEFAULT_TTL_SECONDS,
-        is_read: true,
-        raw_envelope: None,
-        reply_to: Some(parent_message_id.clone()),
-    });
+        let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+            message_id: msg_id.clone(),
+            envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+            sent_at: now,
+            delivered: false,
+        });
 
-    // Link attachments
-    link_attachments(&st.storage, &msg_id, &req.attachments);
+        let _ = st.storage.insert_message(&MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id.clone(),
+            recipient_id: "*".to_string(),
+            message_kind: message_kind.clone(),
+            group_id: parent_group_id,
+            body: Some(req.body.clone()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: DEFAULT_TTL_SECONDS,
+            is_read: true,
+            raw_envelope: None,
+            reply_to: Some(parent_message_id.clone()),
+        });
 
-    // Broadcast
-    let _ = st.ws_tx.send(WsEvent::NewMessage {
-        message_id: msg_id.clone(),
-        sender_id: st.keypair.id.clone(),
-        message_kind: message_kind.to_string(),
-        body: Some(req.body),
-        timestamp: now,
-    });
+        link_attachments(&st.storage, &msg_id, &req.attachments);
+
+        let _ = st.ws_tx.send(WsEvent::NewMessage {
+            message_id: msg_id.clone(),
+            sender_id: keypair_id,
+            message_kind,
+            body: Some(req.body),
+            timestamp: now,
+        });
+    }
 
     let json = serde_json::json!({
         "message_id": msg_id,
         "status": "sent",
         "reply_to": parent_message_id,
+        "relay_delivered": relay_delivered,
     });
     (StatusCode::CREATED, axum::Json(json)).into_response()
 }
@@ -1801,29 +1883,55 @@ async fn update_own_profile_handler(
     State(state): State<SharedState>,
     axum::Json(req): axum::Json<UpdateProfileRequest>,
 ) -> Response {
-    let st = state.lock().await;
     let now = now_secs();
 
-    let profile = ProfileRow {
-        user_id: st.keypair.id.clone(),
-        display_name: req.display_name.clone(),
-        bio: req.bio.clone(),
-        avatar_hash: req.avatar_hash.clone(),
-        public_fields: serde_json::to_string(&req.public_fields)
-            .unwrap_or_else(|_| "{}".to_string()),
-        friends_fields: serde_json::to_string(&req.friends_fields)
-            .unwrap_or_else(|_| "{}".to_string()),
-        updated_at: now,
+    // Short lock: persist profile and extract data for broadcasting
+    let (keypair_id, signing_key, relay_url, friend_enc_keys) = {
+        let st = state.lock().await;
+
+        let profile = ProfileRow {
+            user_id: st.keypair.id.clone(),
+            display_name: req.display_name.clone(),
+            bio: req.bio.clone(),
+            avatar_hash: req.avatar_hash.clone(),
+            public_fields: serde_json::to_string(&req.public_fields)
+                .unwrap_or_else(|_| "{}".to_string()),
+            friends_fields: serde_json::to_string(&req.friends_fields)
+                .unwrap_or_else(|_| "{}".to_string()),
+            updated_at: now,
+        };
+
+        if let Err(e) = st.storage.upsert_profile(&profile) {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+
+        // Collect friend encryption keys for profile distribution
+        let friends: Vec<(String, String)> = st
+            .storage
+            .list_peers()
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| p.is_friend)
+            .filter_map(|p| {
+                p.encryption_public_key
+                    .as_ref()
+                    .map(|k| (p.peer_id.clone(), k.clone()))
+            })
+            .collect();
+
+        (
+            st.keypair.id.clone(),
+            st.keypair.signing_private_key_hex.clone(),
+            st.relay_url.clone(),
+            friends,
+        )
     };
+    // Lock released
 
-    if let Err(e) = st.storage.upsert_profile(&profile) {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
-
-    // Broadcast public profile as a Public message
+    // Build and send public profile (crypto + I/O, no lock held)
     let public_profile = serde_json::json!({
         "type": "tenet.profile",
-        "user_id": st.keypair.id,
+        "user_id": keypair_id,
         "display_name": req.display_name,
         "bio": req.bio,
         "avatar_hash": req.avatar_hash,
@@ -1835,9 +1943,8 @@ async fn update_own_profile_handler(
     let mut salt = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
-    // Send public profile as a Public message
     if let Ok(envelope) = build_plaintext_envelope(
-        st.keypair.id.as_str(),
+        &keypair_id,
         "*",
         None,
         None,
@@ -1847,20 +1954,19 @@ async fn update_own_profile_handler(
         None,
         &body_str,
         salt,
-        &st.keypair.signing_private_key_hex,
+        &signing_key,
     ) {
-        if let Some(ref relay_url) = st.relay_url {
-            let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
-            if let Ok(json_val) = serde_json::to_value(&envelope) {
-                let _ = ureq::post(&url).send_json(json_val);
+        if let Some(ref relay_url) = relay_url {
+            if let Err(e) = post_to_relay(relay_url, &envelope) {
+                eprintln!("failed to post public profile to relay: {}", e);
             }
         }
     }
 
-    // Send friends-only profile to each friend via encrypted Direct messages
+    // Send friends-only profile to each friend (crypto + I/O, no lock held)
     let friends_profile = serde_json::json!({
         "type": "tenet.profile",
-        "user_id": st.keypair.id,
+        "user_id": keypair_id,
         "display_name": req.display_name,
         "bio": req.bio,
         "avatar_hash": req.avatar_hash,
@@ -1870,46 +1976,35 @@ async fn update_own_profile_handler(
     });
     let friends_body = serde_json::to_string(&friends_profile).unwrap_or_default();
 
-    if let Ok(peers) = st.storage.list_peers() {
-        for peer in &peers {
-            if !peer.is_friend {
-                continue;
-            }
-            let enc_key = match peer.encryption_public_key.as_deref() {
-                Some(k) => k.to_string(),
-                None => continue,
-            };
+    for (peer_id, enc_key) in &friend_enc_keys {
+        let content_key = generate_content_key();
+        let mut nonce = [0u8; NONCE_SIZE];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
 
-            let content_key = generate_content_key();
-            let mut nonce = [0u8; NONCE_SIZE];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-
-            if let Ok(payload) = build_encrypted_payload(
-                friends_body.as_bytes(),
-                &enc_key,
-                WEB_PAYLOAD_AAD,
-                WEB_HPKE_INFO,
-                &content_key,
-                &nonce,
+        if let Ok(payload) = build_encrypted_payload(
+            friends_body.as_bytes(),
+            enc_key,
+            WEB_PAYLOAD_AAD,
+            WEB_HPKE_INFO,
+            &content_key,
+            &nonce,
+            None,
+        ) {
+            if let Ok(envelope) = build_envelope_from_payload(
+                keypair_id.clone(),
+                peer_id.clone(),
                 None,
+                None,
+                now,
+                DEFAULT_TTL_SECONDS,
+                MessageKind::Direct,
+                None,
+                payload,
+                &signing_key,
             ) {
-                if let Ok(envelope) = build_envelope_from_payload(
-                    st.keypair.id.clone(),
-                    peer.peer_id.clone(),
-                    None,
-                    None,
-                    now,
-                    DEFAULT_TTL_SECONDS,
-                    MessageKind::Direct,
-                    None,
-                    payload,
-                    &st.keypair.signing_private_key_hex,
-                ) {
-                    if let Some(ref relay_url) = st.relay_url {
-                        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
-                        if let Ok(json_val) = serde_json::to_value(&envelope) {
-                            let _ = ureq::post(&url).send_json(json_val);
-                        }
+                if let Some(ref relay_url) = relay_url {
+                    if let Err(e) = post_to_relay(relay_url, &envelope) {
+                        eprintln!("failed to send friends profile to {}: {}", peer_id, e);
                     }
                 }
             }
@@ -1917,7 +2012,7 @@ async fn update_own_profile_handler(
     }
 
     let json = serde_json::json!({
-        "user_id": st.keypair.id,
+        "user_id": keypair_id,
         "display_name": req.display_name,
         "bio": req.bio,
         "avatar_hash": req.avatar_hash,
@@ -2042,15 +2137,35 @@ async fn get_conversation_handler(
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> Response {
+    // Check connection limit before upgrading
+    let ws_count = {
+        let st = state.lock().await;
+        st.ws_connection_count.clone()
+    };
+
+    let current = ws_count.load(Ordering::Relaxed);
+    if current >= MAX_WS_CONNECTIONS {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "too many WebSocket connections (max {})",
+                MAX_WS_CONNECTIONS
+            ),
+        );
+    }
+
     ws.on_upgrade(|socket| ws_connection(socket, state))
+        .into_response()
 }
 
 async fn ws_connection(mut socket: WebSocket, state: SharedState) {
-    // Subscribe to the broadcast channel
-    let mut rx = {
+    // Subscribe to the broadcast channel and increment connection count
+    let (mut rx, ws_count) = {
         let st = state.lock().await;
-        st.ws_tx.subscribe()
+        let count = st.ws_connection_count.clone();
+        count.fetch_add(1, Ordering::Relaxed);
+        (st.ws_tx.subscribe(), count)
     };
 
     loop {
@@ -2066,8 +2181,17 @@ async fn ws_connection(mut socket: WebSocket, state: SharedState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Client too slow, skip missed events
                         eprintln!("ws client lagged, skipped {n} events");
+                        // Notify client so it can refresh
+                        let lag_msg = serde_json::json!({
+                            "type": "events_missed",
+                            "count": n,
+                        });
+                        if let Ok(json) = serde_json::to_string(&lag_msg) {
+                            if socket.send(WsMessage::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -2084,6 +2208,9 @@ async fn ws_connection(mut socket: WebSocket, state: SharedState) {
             }
         }
     }
+
+    // Decrement connection count on disconnect
+    ws_count.fetch_sub(1, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
