@@ -786,10 +786,12 @@ async function loadFriendRequests() {
 }
 
 function updateFrBadge() {
-    const pending = friendRequests.filter(r => r.status === 'pending' && r.direction === 'incoming');
+    const pendingIncoming = friendRequests.filter(r => r.status === 'pending' && r.direction === 'incoming');
+    const pendingOutgoing = friendRequests.filter(r => r.status === 'pending' && r.direction === 'outgoing');
+    const totalPending = pendingIncoming.length + pendingOutgoing.length;
     const badge = document.getElementById('fr-pending-badge');
-    if (pending.length > 0) {
-        badge.textContent = pending.length;
+    if (totalPending > 0) {
+        badge.textContent = totalPending;
         badge.style.display = '';
     } else {
         badge.style.display = 'none';
