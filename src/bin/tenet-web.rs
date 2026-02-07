@@ -8,14 +8,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use axum_extra::extract::Multipart;
 use rust_embed::Embed;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex};
+
+use base64::Engine as _;
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
 use tenet::crypto::{generate_content_key, generate_keypair, StoredKeypair, NONCE_SIZE};
@@ -23,7 +27,10 @@ use tenet::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
     build_plaintext_envelope, decode_meta_payload, MessageKind, MetaMessage,
 };
-use tenet::storage::{db_path, IdentityRow, MessageRow, PeerRow, RelayRow, Storage};
+use tenet::storage::{
+    db_path, AttachmentRow, IdentityRow, MessageAttachmentRow, MessageRow, PeerRow, RelayRow,
+    Storage,
+};
 
 // ---------------------------------------------------------------------------
 // Embedded static assets
@@ -42,6 +49,7 @@ const SYNC_INTERVAL_SECS: u64 = 30;
 const WEB_HPKE_INFO: &[u8] = b"tenet-web";
 const WEB_PAYLOAD_AAD: &[u8] = b"tenet-web";
 const WS_CHANNEL_CAPACITY: usize = 256;
+const MAX_ATTACHMENT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB per attachment
 
 struct Config {
     bind_addr: String,
@@ -229,6 +237,16 @@ async fn main() {
             axum::routing::delete(remove_group_member_handler),
         )
         .route("/api/groups/:group_id/leave", post(leave_group_handler))
+        // Attachments API (Phase 7)
+        .route(
+            "/api/attachments",
+            post(upload_attachment_handler)
+                .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_SIZE as usize + 4096)),
+        )
+        .route(
+            "/api/attachments/:content_hash",
+            get(download_attachment_handler),
+        )
         // Conversations API (Phase 5)
         .route("/api/conversations", get(list_conversations_handler))
         .route("/api/conversations/:peer_id", get(get_conversation_handler))
@@ -291,6 +309,36 @@ struct ListMessagesQuery {
     limit: Option<u32>,
 }
 
+/// Build the JSON representation of a message including its attachments.
+fn message_to_json(m: &MessageRow, storage: &Storage) -> serde_json::Value {
+    let attachments = storage
+        .list_message_attachments(&m.message_id)
+        .unwrap_or_default();
+    let att_json: Vec<serde_json::Value> = attachments
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "content_hash": a.content_hash,
+                "filename": a.filename,
+                "position": a.position,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "message_id": m.message_id,
+        "sender_id": m.sender_id,
+        "recipient_id": m.recipient_id,
+        "message_kind": m.message_kind,
+        "group_id": m.group_id,
+        "body": m.body,
+        "timestamp": m.timestamp,
+        "received_at": m.received_at,
+        "is_read": m.is_read,
+        "attachments": att_json,
+    })
+}
+
 async fn list_messages_handler(
     State(state): State<SharedState>,
     Query(params): Query<ListMessagesQuery>,
@@ -307,19 +355,7 @@ async fn list_messages_handler(
         Ok(messages) => {
             let json: Vec<serde_json::Value> = messages
                 .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "message_id": m.message_id,
-                        "sender_id": m.sender_id,
-                        "recipient_id": m.recipient_id,
-                        "message_kind": m.message_kind,
-                        "group_id": m.group_id,
-                        "body": m.body,
-                        "timestamp": m.timestamp,
-                        "received_at": m.received_at,
-                        "is_read": m.is_read,
-                    })
-                })
+                .map(|m| message_to_json(m, &st.storage))
                 .collect();
             (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
         }
@@ -334,17 +370,7 @@ async fn get_message_handler(
     let st = state.lock().await;
     match st.storage.get_message(&message_id) {
         Ok(Some(m)) => {
-            let json = serde_json::json!({
-                "message_id": m.message_id,
-                "sender_id": m.sender_id,
-                "recipient_id": m.recipient_id,
-                "message_kind": m.message_kind,
-                "group_id": m.group_id,
-                "body": m.body,
-                "timestamp": m.timestamp,
-                "received_at": m.received_at,
-                "is_read": m.is_read,
-            });
+            let json = message_to_json(&m, &st.storage);
             (StatusCode::OK, axum::Json(json)).into_response()
         }
         Ok(None) => api_error(StatusCode::NOT_FOUND, "message not found"),
@@ -354,18 +380,27 @@ async fn get_message_handler(
 
 // -- Send direct message --
 
+/// Attachment reference included when sending a message.
+#[derive(Deserialize)]
+struct SendAttachmentRef {
+    content_hash: String,
+    filename: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct SendDirectRequest {
     recipient_id: String,
     body: String,
+    #[serde(default)]
+    attachments: Vec<SendAttachmentRef>,
 }
 
 async fn send_direct_handler(
     State(state): State<SharedState>,
     axum::Json(req): axum::Json<SendDirectRequest>,
 ) -> Response {
-    if req.body.trim().is_empty() {
-        return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
+    if req.body.trim().is_empty() && req.attachments.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "body or attachments required");
     }
 
     let st = state.lock().await;
@@ -455,6 +490,9 @@ async fn send_direct_handler(
         raw_envelope: None,
     });
 
+    // Link attachments to message
+    link_attachments(&st.storage, &msg_id, &req.attachments);
+
     // Broadcast to WebSocket clients
     let _ = st.ws_tx.send(WsEvent::NewMessage {
         message_id: msg_id.clone(),
@@ -476,14 +514,16 @@ async fn send_direct_handler(
 #[derive(Deserialize)]
 struct SendPublicRequest {
     body: String,
+    #[serde(default)]
+    attachments: Vec<SendAttachmentRef>,
 }
 
 async fn send_public_handler(
     State(state): State<SharedState>,
     axum::Json(req): axum::Json<SendPublicRequest>,
 ) -> Response {
-    if req.body.trim().is_empty() {
-        return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
+    if req.body.trim().is_empty() && req.attachments.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "body or attachments required");
     }
 
     let st = state.lock().await;
@@ -541,6 +581,9 @@ async fn send_public_handler(
         raw_envelope: None,
     });
 
+    // Link attachments to message
+    link_attachments(&st.storage, &msg_id, &req.attachments);
+
     // Broadcast to WS
     let _ = st.ws_tx.send(WsEvent::NewMessage {
         message_id: msg_id.clone(),
@@ -563,13 +606,15 @@ async fn send_public_handler(
 struct SendGroupRequest {
     group_id: String,
     body: String,
+    #[serde(default)]
+    attachments: Vec<SendAttachmentRef>,
 }
 
 async fn send_group_handler(
     State(state): State<SharedState>,
     axum::Json(req): axum::Json<SendGroupRequest>,
 ) -> Response {
-    if req.body.trim().is_empty() {
+    if req.body.trim().is_empty() && req.attachments.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
     }
 
@@ -642,6 +687,9 @@ async fn send_group_handler(
         is_read: true,
         raw_envelope: None,
     });
+
+    // Link attachments to message
+    link_attachments(&st.storage, &msg_id, &req.attachments);
 
     // Broadcast to WS
     let _ = st.ws_tx.send(WsEvent::NewMessage {
@@ -1165,6 +1213,103 @@ async fn leave_group_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Attachments API (Phase 7)
+// ---------------------------------------------------------------------------
+
+async fn upload_attachment_handler(
+    State(state): State<SharedState>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut content_type: Option<String> = None;
+    let mut filename: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            content_type = field
+                .content_type()
+                .map(|ct| ct.to_string())
+                .or_else(|| Some("application/octet-stream".to_string()));
+            filename = field.file_name().map(|f| f.to_string());
+            match field.bytes().await {
+                Ok(bytes) => {
+                    if bytes.len() as u64 > MAX_ATTACHMENT_SIZE {
+                        return api_error(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "attachment exceeds maximum size of {} bytes",
+                                MAX_ATTACHMENT_SIZE
+                            ),
+                        );
+                    }
+                    file_data = Some(bytes.to_vec());
+                }
+                Err(e) => {
+                    return api_error(StatusCode::BAD_REQUEST, format!("failed to read file: {e}"))
+                }
+            }
+        }
+    }
+
+    let data = match file_data {
+        Some(d) if !d.is_empty() => d,
+        _ => return api_error(StatusCode::BAD_REQUEST, "no file provided"),
+    };
+
+    let mime = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Compute content hash (SHA256, base64 URL-safe)
+    let digest = Sha256::digest(&data);
+    let content_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+
+    let now = now_secs();
+    let size = data.len() as u64;
+
+    let st = state.lock().await;
+    let row = AttachmentRow {
+        content_hash: content_hash.clone(),
+        content_type: mime.clone(),
+        size_bytes: size,
+        data,
+        created_at: now,
+    };
+
+    if let Err(e) = st.storage.insert_attachment(&row) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    let json = serde_json::json!({
+        "content_hash": content_hash,
+        "content_type": mime,
+        "size_bytes": size,
+        "filename": filename,
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+async fn download_attachment_handler(
+    State(state): State<SharedState>,
+    Path(content_hash): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.get_attachment(&content_hash) {
+        Ok(Some(att)) => {
+            let headers = [
+                (header::CONTENT_TYPE, att.content_type.as_str().to_string()),
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                ),
+            ];
+            (StatusCode::OK, headers, att.data).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "attachment not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Conversations API (Phase 5)
 // ---------------------------------------------------------------------------
 
@@ -1213,18 +1358,7 @@ async fn get_conversation_handler(
         Ok(messages) => {
             let json: Vec<serde_json::Value> = messages
                 .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "message_id": m.message_id,
-                        "sender_id": m.sender_id,
-                        "recipient_id": m.recipient_id,
-                        "message_kind": m.message_kind,
-                        "body": m.body,
-                        "timestamp": m.timestamp,
-                        "received_at": m.received_at,
-                        "is_read": m.is_read,
-                    })
-                })
+                .map(|m| message_to_json(m, &st.storage))
                 .collect();
             (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
         }
@@ -1519,6 +1653,18 @@ async fn announce_online(state: SharedState) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Link uploaded attachments to a message by inserting into message_attachments.
+fn link_attachments(storage: &Storage, message_id: &str, attachments: &[SendAttachmentRef]) {
+    for (i, att) in attachments.iter().enumerate() {
+        let _ = storage.insert_message_attachment(&MessageAttachmentRow {
+            message_id: message_id.to_string(),
+            content_hash: att.content_hash.clone(),
+            filename: att.filename.clone(),
+            position: i as u32,
+        });
+    }
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()

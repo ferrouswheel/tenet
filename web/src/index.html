@@ -53,8 +53,15 @@
             </div>
 
             <!-- Compose box -->
-            <div class="compose">
+            <div class="compose" id="compose-box">
                 <textarea id="compose-body" placeholder="Write a message..."></textarea>
+                <div class="compose-attachments">
+                    <div class="attachment-picker">
+                        <label for="attachment-input">Attach file</label>
+                        <input type="file" id="attachment-input" multiple onchange="handleFileSelect(this.files)" />
+                    </div>
+                    <div class="attachment-previews" id="attachment-previews"></div>
+                </div>
                 <div class="compose-actions">
                     <select id="compose-kind">
                         <option value="public">Public</option>
