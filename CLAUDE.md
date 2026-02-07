@@ -29,6 +29,21 @@ cargo fmt                      # Format code
 cargo clippy                   # Run linter
 ```
 
+## Web UI Build Process
+
+The web application UI is automatically built during `cargo build` via the `build.rs` script:
+
+1. Source files are in `web/src/`:
+   - `index.html` - HTML template with `{{STYLES}}` and `{{SCRIPTS}}` placeholders
+   - `styles.css` - CSS styles
+   - `app.js` - JavaScript application code
+
+2. The build script inlines CSS and JS into the HTML template and outputs `web/dist/index.html`
+
+3. The built file (`web/dist/index.html`) is excluded from git (see `.gitignore`)
+
+**Note:** You should NEVER edit `web/dist/index.html` directly. Edit the source files in `web/src/` instead, and the build script will regenerate the dist file automatically on the next build.
+
 ## Binary Targets
 
 ```bash
