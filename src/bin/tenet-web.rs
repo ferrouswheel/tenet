@@ -23,12 +23,12 @@ use tokio::sync::{broadcast, Mutex};
 
 use base64::Engine as _;
 
-use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
 use tenet::crypto::{generate_content_key, StoredKeypair, NONCE_SIZE};
 use tenet::identity::{resolve_identity, store_relay_for_identity};
 use tenet::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
-    build_plaintext_envelope, decode_meta_payload, MessageKind, MetaMessage,
+    build_plaintext_envelope, decode_meta_payload, decrypt_encrypted_payload, MessageKind,
+    MetaMessage,
 };
 use tenet::storage::{
     db_path, AttachmentRow, FriendRequestRow, MessageAttachmentRow, MessageRow, PeerRow,
@@ -1115,10 +1115,17 @@ async fn send_friend_request_handler(
                 &keypair.signing_private_key_hex,
             ) {
                 if let Err(e) = post_to_relay(relay, &envelope) {
-                    eprintln!("failed to send friend request to relay: {}", e);
+                    eprintln!(
+                        "friend-request: failed to send to relay for {}: {}",
+                        peer_id, e
+                    );
+                } else {
+                    eprintln!("friend-request: sent to {} via relay", peer_id);
                 }
             }
         }
+    } else {
+        eprintln!("friend-request: no relay configured, request stored locally only");
     }
 
     let json = serde_json::json!({
@@ -1240,7 +1247,12 @@ async fn accept_friend_request_handler(
                 &keypair.signing_private_key_hex,
             ) {
                 if let Err(e) = post_to_relay(relay, &envelope) {
-                    eprintln!("failed to send friend accept to relay: {}", e);
+                    eprintln!(
+                        "friend-accept: failed to send to relay for {}: {}",
+                        fr.from_peer_id, e
+                    );
+                } else {
+                    eprintln!("friend-accept: sent to {} via relay", fr.from_peer_id);
                 }
             }
         }
@@ -2703,65 +2715,48 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
         (st.keypair.clone(), relay_url, peers)
     };
 
-    // Build a RelayClient for fetching
-    let config = ClientConfig::new(
-        relay_url.clone(),
-        DEFAULT_TTL_SECONDS,
-        ClientEncryption::Encrypted {
-            hpke_info: WEB_HPKE_INFO.to_vec(),
-            payload_aad: WEB_PAYLOAD_AAD.to_vec(),
-        },
-    );
-    let mut client = RelayClient::new(keypair.clone(), config);
+    // Build a peer lookup map for signature verification and decryption
+    let peer_map: std::collections::HashMap<String, &PeerRow> =
+        peers.iter().map(|p| (p.peer_id.clone(), p)).collect();
 
-    // Register known peers so signature verification works
-    for peer in &peers {
-        if let Some(ref enc_key) = peer.encryption_public_key {
-            client.add_peer_with_encryption(
-                peer.peer_id.clone(),
-                peer.signing_public_key.clone(),
-                enc_key.clone(),
-            );
-        } else {
-            client.add_peer(peer.peer_id.clone(), peer.signing_public_key.clone());
-        }
-    }
-
-    // Fetch inbox from relay
-    let outcome = client.sync_inbox(None).map_err(|e| e.to_string())?;
-
-    // Fetch raw envelopes to check for Meta messages
+    // Fetch raw envelopes directly from the relay inbox (single fetch).
+    // The relay drains messages on fetch, so we must process everything here
+    // including meta messages from unknown senders (friend requests).
     let base = relay_url.trim_end_matches('/');
     let inbox_url = format!("{}/inbox/{}", base, keypair.id);
     let envelopes: Vec<tenet::protocol::Envelope> = ureq::get(&inbox_url)
         .call()
-        .ok()
-        .and_then(|response| response.into_json().ok())
-        .unwrap_or_default();
+        .map_err(|e| format!("relay fetch failed: {e}"))?
+        .into_json()
+        .map_err(|e| format!("deserialize inbox: {e}"))?;
 
-    // Process Meta messages for presence tracking
+    if envelopes.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("sync: fetched {} envelope(s) from relay", envelopes.len());
+
     let now = now_secs();
+    let mut stored_count = 0u32;
+
     for envelope in &envelopes {
+        // --- Meta messages: process from ALL senders (including unknown) ---
         if envelope.header.message_kind == MessageKind::Meta {
-            // Try to decode as Meta message
             if let Ok(meta_msg) = decode_meta_payload(&envelope.payload) {
                 match meta_msg {
                     MetaMessage::Online { peer_id, timestamp } => {
-                        // Update peer presence
                         let st = state.lock().await;
                         if let Ok(true) = st.storage.update_peer_online(&peer_id, true, timestamp) {
-                            // Broadcast peer_online event
                             let _ = st.ws_tx.send(WsEvent::PeerOnline {
                                 peer_id: peer_id.clone(),
                             });
-                            eprintln!("peer {} is now online", peer_id);
+                            eprintln!("sync: peer {} is now online", peer_id);
                         }
                     }
                     MetaMessage::Ack {
                         peer_id,
                         online_timestamp,
                     } => {
-                        // Update peer last_seen
                         let st = state.lock().await;
                         let _ = st
                             .storage
@@ -2773,21 +2768,26 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         encryption_public_key,
                         message,
                     } => {
+                        eprintln!("sync: received friend_request from {}", from_peer_id);
                         let st = state.lock().await;
-                        // Check if blocked
                         if st.storage.is_peer_blocked(&from_peer_id).unwrap_or(false) {
-                            eprintln!("ignoring friend request from blocked peer {}", from_peer_id);
+                            eprintln!(
+                                "sync: ignoring friend request from blocked peer {}",
+                                from_peer_id
+                            );
                             continue;
                         }
-                        // Check for duplicate pending
                         if st
                             .storage
                             .has_pending_request_from(&from_peer_id, &keypair.id)
                             .unwrap_or(false)
                         {
+                            eprintln!(
+                                "sync: duplicate friend request from {}, skipping",
+                                from_peer_id
+                            );
                             continue;
                         }
-                        let now_ts = now_secs();
                         let fr_row = FriendRequestRow {
                             id: 0,
                             from_peer_id: from_peer_id.clone(),
@@ -2797,16 +2797,27 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                             from_signing_key: signing_public_key,
                             from_encryption_key: encryption_public_key,
                             direction: "incoming".to_string(),
-                            created_at: now_ts,
-                            updated_at: now_ts,
+                            created_at: now,
+                            updated_at: now,
                         };
-                        if let Ok(request_id) = st.storage.insert_friend_request(&fr_row) {
-                            let _ = st.ws_tx.send(WsEvent::FriendRequestReceived {
-                                request_id,
-                                from_peer_id: from_peer_id.clone(),
-                                message,
-                            });
-                            eprintln!("received friend request from {}", from_peer_id);
+                        match st.storage.insert_friend_request(&fr_row) {
+                            Ok(request_id) => {
+                                let _ = st.ws_tx.send(WsEvent::FriendRequestReceived {
+                                    request_id,
+                                    from_peer_id: from_peer_id.clone(),
+                                    message: message.clone(),
+                                });
+                                eprintln!(
+                                    "sync: stored incoming friend request from {} (id={})",
+                                    from_peer_id, request_id
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "sync: failed to store friend request from {}: {}",
+                                    from_peer_id, e
+                                );
+                            }
                         }
                     }
                     MetaMessage::FriendAccept {
@@ -2814,8 +2825,8 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         signing_public_key,
                         encryption_public_key,
                     } => {
+                        eprintln!("sync: received friend_accept from {}", from_peer_id);
                         let st = state.lock().await;
-                        // Find the matching outgoing pending request
                         let requests = st
                             .storage
                             .list_friend_requests(Some("pending"), Some("outgoing"))
@@ -2825,15 +2836,12 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         {
                             let req_id = pending.id;
                             let _ = st.storage.update_friend_request_status(req_id, "accepted");
-
-                            // Add the accepting peer as a friend
-                            let now_ts = now_secs();
                             let peer_row = PeerRow {
                                 peer_id: from_peer_id.clone(),
                                 display_name: None,
                                 signing_public_key,
                                 encryption_public_key: Some(encryption_public_key),
-                                added_at: now_ts,
+                                added_at: now,
                                 is_friend: true,
                                 last_seen_online: None,
                                 online: false,
@@ -2843,56 +2851,88 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                 request_id: req_id,
                                 from_peer_id: from_peer_id.clone(),
                             });
-                            eprintln!("friend request accepted by {}", from_peer_id);
+                            eprintln!(
+                                "sync: friend request accepted by {} (id={})",
+                                from_peer_id, req_id
+                            );
+                        } else {
+                            eprintln!(
+                                "sync: received friend_accept from {} but no matching pending request",
+                                from_peer_id
+                            );
                         }
                     }
-                    _ => {} // Ignore other meta message types
+                    _ => {}
                 }
             }
+            continue; // Meta messages are not stored as regular messages
         }
-    }
 
-    if outcome.fetched == 0 {
-        return Ok(());
-    }
+        // --- Non-meta messages: verify signature using known peers ---
+        let sender_id = &envelope.header.sender_id;
+        let peer = match peer_map.get(sender_id) {
+            Some(p) => p,
+            None => {
+                eprintln!("sync: skipping message from unknown sender {}", sender_id);
+                continue;
+            }
+        };
 
-    // Build a map of message_id -> envelope for kind lookup
-    let envelope_map: std::collections::HashMap<String, &tenet::protocol::Envelope> = envelopes
-        .iter()
-        .map(|e| (e.header.message_id.0.clone(), e))
-        .collect();
-
-    // Store received messages in SQLite and broadcast via WebSocket
-    let st = state.lock().await;
-
-    for msg in &outcome.messages {
-        if st.storage.has_message(&msg.message_id).unwrap_or(true) {
+        if let Err(e) = envelope
+            .header
+            .verify_signature(envelope.version, &peer.signing_public_key)
+        {
+            eprintln!("sync: invalid signature from {}: {:?}", sender_id, e);
             continue;
         }
 
-        // Determine the actual message kind from the envelope
-        let (message_kind, group_id) = if let Some(env) = envelope_map.get(&msg.message_id) {
-            let kind_str = match env.header.message_kind {
-                MessageKind::Public => "public",
-                MessageKind::Direct => "direct",
-                MessageKind::FriendGroup => "friend_group",
-                MessageKind::Meta => "meta",
-                MessageKind::StoreForPeer => "store_for_peer",
-            };
-            (kind_str.to_string(), env.header.group_id.clone())
-        } else {
-            // Fallback if envelope not found
-            ("direct".to_string(), None)
+        // Decrypt body for Direct messages, pass through for others
+        let body = match envelope.header.message_kind {
+            MessageKind::Direct => {
+                match decrypt_encrypted_payload(
+                    &envelope.payload,
+                    &keypair.private_key_hex,
+                    WEB_PAYLOAD_AAD,
+                    WEB_HPKE_INFO,
+                ) {
+                    Ok(plaintext) => match String::from_utf8(plaintext) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            eprintln!("sync: utf-8 decode error from {}: {}", sender_id, e);
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("sync: decrypt error from {}: {}", sender_id, e);
+                        continue;
+                    }
+                }
+            }
+            _ => Some(envelope.payload.body.clone()),
         };
 
+        let message_id = envelope.header.message_id.0.clone();
+        let kind_str = match envelope.header.message_kind {
+            MessageKind::Public => "public",
+            MessageKind::Direct => "direct",
+            MessageKind::FriendGroup => "friend_group",
+            MessageKind::Meta => "meta",
+            MessageKind::StoreForPeer => "store_for_peer",
+        };
+
+        let st = state.lock().await;
+        if st.storage.has_message(&message_id).unwrap_or(true) {
+            continue;
+        }
+
         let row = MessageRow {
-            message_id: msg.message_id.clone(),
-            sender_id: msg.sender_id.clone(),
+            message_id: message_id.clone(),
+            sender_id: sender_id.clone(),
             recipient_id: keypair.id.clone(),
-            message_kind: message_kind.clone(),
-            group_id,
-            body: Some(msg.body.clone()),
-            timestamp: msg.timestamp,
+            message_kind: kind_str.to_string(),
+            group_id: envelope.header.group_id.clone(),
+            body,
+            timestamp: envelope.header.timestamp,
             received_at: now,
             ttl_seconds: DEFAULT_TTL_SECONDS,
             is_read: false,
@@ -2900,26 +2940,24 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
             reply_to: None,
         };
         if st.storage.insert_message(&row).is_ok() {
-            // Push to WebSocket clients
             let _ = st.ws_tx.send(WsEvent::NewMessage {
-                message_id: msg.message_id.clone(),
-                sender_id: msg.sender_id.clone(),
-                message_kind,
-                body: Some(msg.body.clone()),
-                timestamp: msg.timestamp,
+                message_id: message_id.clone(),
+                sender_id: sender_id.clone(),
+                message_kind: kind_str.to_string(),
+                body: row.body.clone(),
+                timestamp: envelope.header.timestamp,
             });
+            stored_count += 1;
         }
     }
 
-    // Update relay last_sync timestamp
-    let _ = st.storage.update_relay_last_sync(&relay_url, now);
+    {
+        let st = state.lock().await;
+        let _ = st.storage.update_relay_last_sync(&relay_url, now);
+    }
 
-    if !outcome.messages.is_empty() {
-        eprintln!(
-            "synced {} messages ({} errors)",
-            outcome.messages.len(),
-            outcome.errors.len()
-        );
+    if stored_count > 0 {
+        eprintln!("sync: stored {} message(s)", stored_count);
     }
 
     Ok(())
