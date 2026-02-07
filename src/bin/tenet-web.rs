@@ -1020,6 +1020,8 @@ async fn delete_peer_handler(
 struct SendFriendRequestPayload {
     peer_id: String,
     message: Option<String>,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize)]
@@ -1036,7 +1038,7 @@ async fn send_friend_request_handler(
         return api_error(StatusCode::BAD_REQUEST, "peer_id cannot be empty");
     }
 
-    let (keypair, relay_url) = {
+    let (keypair, relay_url, existing) = {
         let st = state.lock().await;
         let peer_id = req.peer_id.trim().to_string();
 
@@ -1049,46 +1051,65 @@ async fn send_friend_request_handler(
         }
 
         // Check if already friends
-        if let Ok(Some(existing)) = st.storage.get_peer(&peer_id) {
-            if existing.is_friend {
+        if let Ok(Some(peer)) = st.storage.get_peer(&peer_id) {
+            if peer.is_friend {
                 return api_error(StatusCode::CONFLICT, "already friends with this peer");
             }
         }
 
-        // Check for existing pending outgoing request
-        if st
+        // Check for existing outgoing request to this peer
+        let existing = st
             .storage
-            .has_pending_request_from(&st.keypair.id, &peer_id)
-            .unwrap_or(false)
-        {
-            return api_error(StatusCode::CONFLICT, "friend request already pending");
+            .find_request_between(&st.keypair.id, &peer_id)
+            .unwrap_or(None);
+
+        if let Some(ref ex) = existing {
+            if ex.status == "pending" && !req.force {
+                return api_error(StatusCode::CONFLICT, "friend request already pending");
+            }
         }
 
-        (st.keypair.clone(), st.relay_url.clone())
+        (st.keypair.clone(), st.relay_url.clone(), existing)
     };
 
     let peer_id = req.peer_id.trim().to_string();
     let now = now_secs();
 
-    // Create outgoing friend request record
-    let fr_row = FriendRequestRow {
-        id: 0,
-        from_peer_id: keypair.id.clone(),
-        to_peer_id: peer_id.clone(),
-        status: "pending".to_string(),
-        message: req.message.clone(),
-        from_signing_key: keypair.signing_public_key_hex.clone(),
-        from_encryption_key: keypair.public_key_hex.clone(),
-        direction: "outgoing".to_string(),
-        created_at: now,
-        updated_at: now,
-    };
-
+    // Either refresh existing or create new outgoing friend request
     let request_id = {
         let st = state.lock().await;
-        match st.storage.insert_friend_request(&fr_row) {
-            Ok(id) => id,
-            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        if let Some(ref ex) = existing {
+            // Refresh the existing request (reset to pending, update message)
+            if let Err(e) = st.storage.refresh_friend_request(
+                ex.id,
+                req.message.as_deref(),
+                &keypair.signing_public_key_hex,
+                &keypair.public_key_hex,
+            ) {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+            eprintln!(
+                "friend-request: resending to {} (refreshed id={})",
+                peer_id, ex.id
+            );
+            ex.id
+        } else {
+            let fr_row = FriendRequestRow {
+                id: 0,
+                from_peer_id: keypair.id.clone(),
+                to_peer_id: peer_id.clone(),
+                status: "pending".to_string(),
+                message: req.message.clone(),
+                from_signing_key: keypair.signing_public_key_hex.clone(),
+                from_encryption_key: keypair.public_key_hex.clone(),
+                direction: "outgoing".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            match st.storage.insert_friend_request(&fr_row) {
+                Ok(id) => id,
+                Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
         }
     };
 
@@ -2770,24 +2791,58 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                     } => {
                         eprintln!("sync: received friend_request from {}", from_peer_id);
                         let st = state.lock().await;
-                        if st.storage.is_peer_blocked(&from_peer_id).unwrap_or(false) {
-                            eprintln!(
-                                "sync: ignoring friend request from blocked peer {}",
-                                from_peer_id
-                            );
-                            continue;
-                        }
-                        if st
+
+                        // Check for existing request from this peer
+                        let existing = st
                             .storage
-                            .has_pending_request_from(&from_peer_id, &keypair.id)
-                            .unwrap_or(false)
-                        {
-                            eprintln!(
-                                "sync: duplicate friend request from {}, skipping",
-                                from_peer_id
-                            );
-                            continue;
+                            .find_request_between(&from_peer_id, &keypair.id)
+                            .unwrap_or(None);
+
+                        if let Some(ref ex) = existing {
+                            // If blocked or ignored, silently drop
+                            if ex.status == "blocked" || ex.status == "ignored" {
+                                eprintln!(
+                                    "sync: friend request from {} is {}, not resurfacing",
+                                    from_peer_id, ex.status
+                                );
+                                continue;
+                            }
+                            // If pending, refresh the existing record
+                            if ex.status == "pending" {
+                                if let Err(e) = st.storage.refresh_friend_request(
+                                    ex.id,
+                                    message.as_deref(),
+                                    &signing_public_key,
+                                    &encryption_public_key,
+                                ) {
+                                    eprintln!(
+                                        "sync: failed to refresh friend request from {}: {}",
+                                        from_peer_id, e
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "sync: refreshed existing friend request from {} (id={})",
+                                        from_peer_id, ex.id
+                                    );
+                                    let _ = st.ws_tx.send(WsEvent::FriendRequestReceived {
+                                        request_id: ex.id,
+                                        from_peer_id: from_peer_id.clone(),
+                                        message: message.clone(),
+                                    });
+                                }
+                                continue;
+                            }
+                            // If accepted, they are already friends — skip
+                            if ex.status == "accepted" {
+                                eprintln!(
+                                    "sync: friend request from {} already accepted, skipping",
+                                    from_peer_id
+                                );
+                                continue;
+                            }
                         }
+
+                        // No existing request — create a new one
                         let fr_row = FriendRequestRow {
                             id: 0,
                             from_peer_id: from_peer_id.clone(),

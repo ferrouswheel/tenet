@@ -732,7 +732,7 @@ function toggleAddFriendForm() {
     }
 }
 
-async function sendFriendRequest() {
+async function sendFriendRequest(force) {
     const peerId = document.getElementById('friend-peer-id').value.trim();
     const message = document.getElementById('friend-message').value.trim();
 
@@ -744,13 +744,20 @@ async function sendFriendRequest() {
     try {
         const payload = { peer_id: peerId };
         if (message) payload.message = message;
+        if (force) payload.force = true;
 
         await apiPost('/api/friend-requests', payload);
         showToast('Friend request sent');
         toggleAddFriendForm();
         await loadFriendRequests();
     } catch (e) {
-        showToast('Failed to send request: ' + e.message);
+        if (e.message && e.message.includes('already pending')) {
+            if (confirm('A friend request to this peer is already pending. Resend it?')) {
+                await sendFriendRequest(true);
+            }
+        } else {
+            showToast('Failed to send request: ' + e.message);
+        }
     }
 }
 

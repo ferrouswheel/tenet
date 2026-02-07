@@ -1490,6 +1490,61 @@ impl Storage {
         Ok(count > 0)
     }
 
+    /// Find an existing friend request between two peers (any status).
+    pub fn find_request_between(
+        &self,
+        from_peer_id: &str,
+        to_peer_id: &str,
+    ) -> Result<Option<FriendRequestRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_peer_id, to_peer_id, status, message, from_signing_key,
+                    from_encryption_key, direction, created_at, updated_at
+             FROM friend_requests
+             WHERE from_peer_id = ?1 AND to_peer_id = ?2
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![from_peer_id, to_peer_id], |row| {
+                Ok(FriendRequestRow {
+                    id: row.get(0)?,
+                    from_peer_id: row.get(1)?,
+                    to_peer_id: row.get(2)?,
+                    status: row.get(3)?,
+                    message: row.get(4)?,
+                    from_signing_key: row.get(5)?,
+                    from_encryption_key: row.get(6)?,
+                    direction: row.get(7)?,
+                    created_at: row.get::<_, i64>(8)? as u64,
+                    updated_at: row.get::<_, i64>(9)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Update the message and timestamps on an existing friend request,
+    /// resetting it to pending.
+    pub fn refresh_friend_request(
+        &self,
+        id: i64,
+        message: Option<&str>,
+        signing_key: &str,
+        encryption_key: &str,
+    ) -> Result<(), StorageError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.conn.execute(
+            "UPDATE friend_requests
+             SET message = ?1, from_signing_key = ?2, from_encryption_key = ?3,
+                 updated_at = ?4, status = 'pending'
+             WHERE id = ?5",
+            params![message, signing_key, encryption_key, now as i64, id],
+        )?;
+        Ok(())
+    }
+
     /// Check if a peer is blocked (has a blocked friend request).
     pub fn is_peer_blocked(&self, peer_id: &str) -> Result<bool, StorageError> {
         let count: i64 = self.conn.query_row(
