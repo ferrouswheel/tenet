@@ -18,6 +18,8 @@ A protocol concept for a peer-to-peer social network and a Rust reference implem
 cargo build
 ```
 
+The build process includes an automatic step that generates the web UI's `index.html` file. The `build.rs` script reads source files from `web/src/` (index.html template, styles.css, app.js) and inlines them into a single `web/dist/index.html` file. This happens automatically during `cargo build` and requires no manual intervention.
+
 ## Run
 
 Run the CLI:

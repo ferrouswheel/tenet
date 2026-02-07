@@ -15,6 +15,7 @@ build/
 develop-eggs/
 dist/
 !web/dist/
+web/dist/index.html
 eggs/
 lib/
 lib64/
