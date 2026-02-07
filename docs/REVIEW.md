@@ -20,7 +20,10 @@ five include enough detail that they can be implemented directly.
 
 ## Improvement suggestions (ranked)
 
-### 1. Extract a relay-posting helper and report failures to the caller
+> **Status Update:** Suggestions #1, #2, #6, and #8 have been implemented as of 2025-02-07.
+> See commit 1359e3e for details.
+
+### 1. Extract a relay-posting helper and report failures to the caller ✅ IMPLEMENTED
 
 **Problem.** Every handler that sends a message to a relay repeats the same
 pattern and silently discards errors:
@@ -82,7 +85,7 @@ fn post_to_relay(relay_url: &str, envelope: &Envelope) -> Result<(), String> {
 
 ---
 
-### 2. Wrap group creation and key distribution in a transaction
+### 2. Wrap group creation and key distribution in a transaction ✅ IMPLEMENTED
 
 **Problem.** `create_group_handler` (line 864) performs three sequential
 database operations — insert group, insert members, then distribute the group
@@ -392,7 +395,7 @@ binary's private items.
 
 ---
 
-### 6. Validate hex-encoded public keys on the add-peer endpoint
+### 6. Validate hex-encoded public keys on the add-peer endpoint ✅ IMPLEMENTED
 
 **Problem.** `add_peer_handler` (line 746) validates that `peer_id` and
 `signing_public_key` are non-empty strings, but does not check that they are
@@ -452,7 +455,7 @@ be to use a connection pool or `RwLock` for the storage layer.
 
 ---
 
-### 8. Improve the relay sync loop with backoff and correct message-kind inference
+### 8. Improve the relay sync loop with backoff and correct message-kind inference ✅ IMPLEMENTED
 
 **Problem A — No backoff.** `relay_sync_loop` (line 1320) polls the relay
 every 30 seconds regardless of whether the relay is reachable. If the relay is
@@ -526,15 +529,15 @@ changed to `0.0.0.0`.
 
 ## Summary table
 
-| Rank | Suggestion | Category | Effort |
-|------|-----------|----------|--------|
-| 1 | Extract relay-posting helper and report failures | Robustness | Low |
-| 2 | Wrap group creation + key distribution in a transaction | Robustness / Security | Medium |
-| 3 | Extract `tenet-web.rs` into modules | Understandability | Medium |
-| 4 | Avoid holding Mutex across blocking I/O | Robustness | Medium |
-| 5 | Add integration tests for web API | Robustness | Medium |
-| 6 | Validate hex-encoded keys on add-peer | Security | Low |
-| 7 | Replace single `Arc<Mutex>` with finer-grained sharing | Robustness | Medium |
-| 8 | Relay sync: add backoff + fix message-kind inference | Robustness | Low–Medium |
-| 9 | Derive JSON serialization instead of manual `json!({})` | Understandability | Low |
-| 10 | Harden WebSocket against slow/malicious clients | Security | Low |
+| Rank | Suggestion | Category | Effort | Status |
+|------|-----------|----------|--------|--------|
+| 1 | Extract relay-posting helper and report failures | Robustness | Low | ✅ Done |
+| 2 | Wrap group creation + key distribution in a transaction | Robustness / Security | Medium | ✅ Done |
+| 3 | Extract `tenet-web.rs` into modules | Understandability | Medium | Pending |
+| 4 | Avoid holding Mutex across blocking I/O | Robustness | Medium | Pending |
+| 5 | Add integration tests for web API | Robustness | Medium | Pending |
+| 6 | Validate hex-encoded keys on add-peer | Security | Low | ✅ Done |
+| 7 | Replace single `Arc<Mutex>` with finer-grained sharing | Robustness | Medium | Pending |
+| 8 | Relay sync: add backoff + fix message-kind inference | Robustness | Low–Medium | ✅ Done |
+| 9 | Derive JSON serialization instead of manual `json!({})` | Understandability | Low | Pending |
+| 10 | Harden WebSocket against slow/malicious clients | Security | Low | Pending |
