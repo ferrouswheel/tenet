@@ -24,14 +24,15 @@ use tokio::sync::{broadcast, Mutex};
 use base64::Engine as _;
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
-use tenet::crypto::{generate_content_key, generate_keypair, StoredKeypair, NONCE_SIZE};
+use tenet::crypto::{generate_content_key, StoredKeypair, NONCE_SIZE};
+use tenet::identity::{resolve_identity, store_relay_for_identity};
 use tenet::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
     build_plaintext_envelope, decode_meta_payload, MessageKind, MetaMessage,
 };
 use tenet::storage::{
-    db_path, AttachmentRow, IdentityRow, MessageAttachmentRow, MessageRow, PeerRow, ProfileRow,
-    ReactionRow, RelayRow, Storage,
+    db_path, AttachmentRow, MessageAttachmentRow, MessageRow, PeerRow, ProfileRow, ReactionRow,
+    Storage,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,12 +76,17 @@ struct Cli {
     /// Relay server URL for fetching and posting messages [env: TENET_RELAY_URL]
     #[arg(long, short = 'r')]
     relay_url: Option<String>,
+
+    /// Identity to use (short ID prefix) [env: TENET_IDENTITY]
+    #[arg(long, short = 'i')]
+    identity: Option<String>,
 }
 
 struct Config {
     bind_addr: String,
     data_dir: PathBuf,
     relay_url: Option<String>,
+    identity: Option<String>,
 }
 
 impl Config {
@@ -103,10 +109,15 @@ impl Config {
             .relay_url
             .or_else(|| std::env::var("TENET_RELAY_URL").ok());
 
+        let identity = cli
+            .identity
+            .or_else(|| std::env::var("TENET_IDENTITY").ok());
+
         Self {
             bind_addr,
             data_dir,
             relay_url,
+            identity,
         }
     }
 }
@@ -168,64 +179,35 @@ async fn main() {
     eprintln!("tenet-web starting");
     eprintln!("  data directory: {}", config.data_dir.display());
 
-    // Ensure data directory exists
-    std::fs::create_dir_all(&config.data_dir).expect("failed to create data directory");
+    // Resolve identity (handles migration, creation, and selection)
+    let resolved = resolve_identity(&config.data_dir, config.identity.as_deref())
+        .expect("failed to resolve identity");
 
-    // Open SQLite database
-    let db = db_path(&config.data_dir);
-    eprintln!("  database: {}", db.display());
-    let storage = Storage::open(&db).expect("failed to open database");
+    let keypair = resolved.keypair;
+    let storage = resolved.storage;
 
-    // Run JSON-to-SQLite migration if legacy files exist
-    if config.data_dir.join("identity.json").exists() {
-        match storage.migrate_from_json(&config.data_dir) {
-            Ok(report) => {
-                if !report.is_empty() {
-                    eprintln!(
-                        "migrated legacy data: identity={}, peers={}, inbox={}, outbox={}",
-                        report.identity_migrated,
-                        report.peers_migrated,
-                        report.inbox_migrated,
-                        report.outbox_migrated
-                    );
-                }
-            }
-            Err(e) => eprintln!("migration warning: {e}"),
-        }
+    if resolved.newly_created {
+        eprintln!(
+            "  identities: 1 available (newly created), using: {}",
+            keypair.id
+        );
+    } else {
+        eprintln!(
+            "  identities: {} available, using: {}",
+            resolved.total_identities, keypair.id
+        );
+    }
+    eprintln!("  database: {}", db_path(&resolved.identity_dir).display());
+
+    // Resolve relay URL: CLI/env > stored in identity DB > none
+    let relay_url = config.relay_url.or(resolved.stored_relay_url);
+
+    // Store relay URL in identity's database if provided via CLI/env
+    if let Some(ref url) = relay_url {
+        let _ = store_relay_for_identity(&storage, url);
     }
 
-    // Load or generate identity
-    let keypair = match storage.get_identity().expect("failed to read identity") {
-        Some(row) => {
-            eprintln!("  identity: {}", row.id);
-            row.to_stored_keypair()
-        }
-        None => {
-            let kp = generate_keypair();
-            let row = IdentityRow::from(&kp);
-            storage
-                .insert_identity(&row)
-                .expect("failed to store identity");
-            eprintln!("  identity: {} (newly generated)", kp.id);
-            kp
-        }
-    };
-
-    // Store relay URL in database if provided
-    if let Some(ref url) = config.relay_url {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _ = storage.insert_relay(&RelayRow {
-            url: url.clone(),
-            added_at: now,
-            last_sync: None,
-            enabled: true,
-        });
-    }
-
-    match &config.relay_url {
+    match &relay_url {
         Some(url) => eprintln!("  relay: {}", url),
         None => eprintln!("  relay: none configured (messages will be local-only)"),
     }
@@ -239,14 +221,14 @@ async fn main() {
     let state: SharedState = Arc::new(Mutex::new(AppState {
         storage,
         keypair: keypair.clone(),
-        relay_url: config.relay_url.clone(),
+        relay_url: relay_url.clone(),
         ws_tx,
         ws_connection_count,
         relay_connected: Arc::clone(&relay_connected),
     }));
 
     // Start background relay sync task
-    if config.relay_url.is_some() {
+    if relay_url.is_some() {
         // Attempt an initial connectivity check before starting the server
         let check_state = Arc::clone(&state);
         match sync_once(&check_state).await {
@@ -350,7 +332,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .expect("failed to bind");
-    eprintln!("tenet-web listening on {}", config.bind_addr);
+    eprintln!("tenet-web listening on http://{}", config.bind_addr);
 
     axum::serve(listener, app).await.expect("server error");
 }
