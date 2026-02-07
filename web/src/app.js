@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 let myPeerId = '';
 let currentFilter = '';
-let currentView = 'timeline'; // 'timeline', 'conversations', 'conversation-detail'
+let currentView = 'timeline'; // 'timeline', 'conversations', 'conversation-detail', 'post-detail'
 let messages = [];
 let oldestTimestamp = null;
 let ws = null;
@@ -12,6 +12,7 @@ let conversations = [];
 let currentConversationPeerId = null;
 let conversationMessages = [];
 let conversationOldestTimestamp = null;
+let currentPostId = null;
 const PAGE_SIZE = 50;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +74,14 @@ function renderMessage(m) {
     const unreadClass = m.is_read ? '' : ' unread';
     const kindClass = m.message_kind || 'direct';
 
-    return `<div class="message${unreadClass}" data-id="${m.message_id}" onclick="markRead('${m.message_id}')">
+    // Make public messages clickable to view detail
+    const isPublic = m.message_kind === 'public';
+    const clickableClass = isPublic ? ' clickable' : '';
+    const onclick = isPublic
+        ? `onclick="showPostDetail('${m.message_id}')"`
+        : `onclick="markRead('${m.message_id}')"`;
+
+    return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
         <div class="msg-header">
             <span class="msg-badge ${kindClass}">${kindClass}</span>
             <span class="${senderClass}" title="${m.sender_id}">${senderLabel}</span>
@@ -161,6 +169,7 @@ function showTimelineView() {
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('conversations-list').style.display = 'none';
     document.getElementById('conversation-detail').classList.remove('visible');
+    document.getElementById('post-detail').classList.remove('visible');
     document.getElementById('compose-kind').value = currentFilter || 'public';
     updateComposeOptions();
 }
@@ -171,6 +180,7 @@ function showConversationsView() {
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('conversations-list').style.display = '';
     document.getElementById('conversation-detail').classList.remove('visible');
+    document.getElementById('post-detail').classList.remove('visible');
     loadConversations();
 }
 
@@ -182,6 +192,7 @@ function showConversationDetail(peerId) {
     document.getElementById('load-more').style.display = 'none';
     document.getElementById('conversations-list').style.display = 'none';
     document.getElementById('conversation-detail').classList.add('visible');
+    document.getElementById('post-detail').classList.remove('visible');
 
     const peer = peers.find(p => p.peer_id === peerId);
     const peerName = peer?.display_name || peerId.substring(0, 12) + '...';
@@ -196,6 +207,60 @@ function backToConversations() {
     currentView = 'conversations';
     currentConversationPeerId = null;
     showConversationsView();
+}
+
+// ---------------------------------------------------------------------------
+// Post detail view
+// ---------------------------------------------------------------------------
+async function showPostDetail(messageId) {
+    currentView = 'post-detail';
+    currentPostId = messageId;
+
+    document.getElementById('timeline').style.display = 'none';
+    document.getElementById('load-more').style.display = 'none';
+    document.getElementById('conversations-list').style.display = 'none';
+    document.getElementById('conversation-detail').classList.remove('visible');
+    document.getElementById('post-detail').classList.add('visible');
+
+    try {
+        const post = await apiGet(`/api/messages/${messageId}`);
+        renderPostDetail(post);
+        // Mark as read when viewing
+        if (!post.is_read) {
+            await apiPost(`/api/messages/${messageId}/read`, {});
+        }
+    } catch (e) {
+        showToast('Failed to load post');
+        console.error(e);
+    }
+}
+
+function renderPostDetail(post) {
+    const el = document.getElementById('post-detail-content');
+    const isSelf = post.sender_id === myPeerId;
+    const senderLabel = isSelf ? 'You' : post.sender_id.substring(0, 12) + '...';
+    const senderClass = isSelf ? 'post-sender self' : 'post-sender';
+    const timestamp = new Date(post.timestamp * 1000).toLocaleString();
+
+    el.innerHTML = `
+        <div class="${senderClass}" title="${post.sender_id}">${escapeHtml(senderLabel)}</div>
+        <div class="post-time">${timestamp}</div>
+        <div class="post-body">${escapeHtml(post.body || '')}</div>
+    `;
+}
+
+function backToPublicFeed() {
+    currentView = 'timeline';
+    currentPostId = null;
+    // Set filter to public to return to public feed
+    currentFilter = 'public';
+
+    // Update active filter button
+    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+    document.querySelector('.filters button[data-kind="public"]').classList.add('active');
+
+    showTimelineView();
+    loadMessages(false);
 }
 
 function updateComposeOptions() {
