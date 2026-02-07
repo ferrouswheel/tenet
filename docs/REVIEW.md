@@ -20,8 +20,11 @@ five include enough detail that they can be implemented directly.
 
 ## Improvement suggestions (ranked)
 
-> **Status Update:** Suggestions #1, #2, #6, and #8 have been implemented as of 2025-02-07.
-> See commit 1359e3e for details.
+> **Status Update (round 1):** Suggestions #1, #2, #6, and #8 were implemented as of 2025-02-07 (commit 1359e3e).
+>
+> **Status Update (round 2):** Suggestions #4, #9, and #10 have been implemented. Fixed regressions where
+> `react_handler`, `reply_handler`, and `update_own_profile_handler` were not using the `post_to_relay` helper
+> from suggestion #1. Suggestions #3, #5, and #7 are deferred (see notes below).
 
 ### 1. Extract a relay-posting helper and report failures to the caller ✅ IMPLEMENTED
 
@@ -163,7 +166,7 @@ pub fn insert_group_with_members(
 
 ---
 
-### 3. Extract the 1 500-line `tenet-web.rs` into modules
+### 3. Extract the 1 500-line `tenet-web.rs` into modules — DEFERRED
 
 **Problem.** `src/bin/tenet-web.rs` is 1 529 lines in a single file. It
 contains configuration, shared state types, all API handlers (messages, peers,
@@ -227,9 +230,15 @@ coupling low.
 4. Move `src/bin/tenet-web.rs` to use the new modules for its router setup.
 5. Verify with `cargo build --bin tenet-web` and `cargo test`.
 
+> **Deferred.** The file has grown to ~2 400 lines. This refactoring is still
+> valuable but carries risk without integration tests (suggestion #5). Module
+> extraction should be done *after* test coverage exists so regressions can be
+> caught automatically. It is also a purely organisational change that does not
+> affect correctness or security.
+
 ---
 
-### 4. Avoid holding the `Mutex` across blocking I/O in handlers
+### 4. Avoid holding the `Mutex` across blocking I/O in handlers ✅ IMPLEMENTED
 
 **Problem.** Most handlers acquire `state.lock().await` at the top and hold it
 for the entire function body, including synchronous `ureq` HTTP calls to the
@@ -314,7 +323,7 @@ already just do a DB query and return, so the lock duration is fine there.
 
 ---
 
-### 5. Add integration tests for the web API endpoints
+### 5. Add integration tests for the web API endpoints — DEFERRED
 
 **Problem.** The storage layer has thorough unit tests (lines 1105–1521 of
 `storage.rs`), but the 1 529-line web server has zero test coverage. None of
@@ -393,6 +402,11 @@ module can be placed inside `src/bin/tenet-web.rs` itself as a `#[cfg(test)]
 mod tests { ... }` block, since test modules in binaries can access the
 binary's private items.
 
+> **Deferred.** This is the highest-value remaining item and should be tackled
+> next. It can be done with an inline `#[cfg(test)] mod tests` block in the
+> binary without needing module extraction first. Deferred only because the
+> scope of this review pass focused on correctness and concurrency fixes.
+
 ---
 
 ### 6. Validate hex-encoded public keys on the add-peer endpoint ✅ IMPLEMENTED
@@ -426,7 +440,7 @@ Return a 400 error with the validation message if it fails.
 
 ---
 
-### 7. Replace `Arc<Mutex<AppState>>` with finer-grained sharing
+### 7. Replace `Arc<Mutex<AppState>>` with finer-grained sharing — DEFERRED
 
 **Problem.** The entire `AppState` (storage handle, keypair, relay URL, WS
 sender) is behind a single `Arc<Mutex<…>>`. Every handler — even read-only
@@ -452,6 +466,12 @@ struct AppState {
 With this, the keypair, relay URL, and WS sender can be accessed without any
 lock, and only storage operations take the mutex. A future improvement would
 be to use a connection pool or `RwLock` for the storage layer.
+
+> **Deferred.** With suggestion #4 now implemented (handlers release the mutex
+> before blocking I/O), the single-mutex bottleneck is significantly reduced.
+> The remaining lock contention is limited to short DB reads/writes which are
+> fast. This architectural change is still worthwhile but is lower priority
+> now and should be done alongside integration tests (#5) to catch regressions.
 
 ---
 
@@ -481,7 +501,7 @@ matching on message ID or timestamp.
 
 ---
 
-### 9. Avoid duplicating JSON serialization logic for row types
+### 9. Avoid duplicating JSON serialization logic for row types ✅ IMPLEMENTED
 
 **Problem.** Every handler manually constructs `serde_json::json!({…})` objects
 from row fields. For instance, the `PeerRow` serialization pattern appears
@@ -501,7 +521,7 @@ eliminates the manual `json!({})` construction entirely.
 
 ---
 
-### 10. Harden the WebSocket connection against slow or malicious clients
+### 10. Harden the WebSocket connection against slow or malicious clients ✅ IMPLEMENTED
 
 **Problem.** The WebSocket handler (line 1243) subscribes each client to the
 broadcast channel with a fixed capacity of 256. If a client reads slowly, it
@@ -533,11 +553,11 @@ changed to `0.0.0.0`.
 |------|-----------|----------|--------|--------|
 | 1 | Extract relay-posting helper and report failures | Robustness | Low | ✅ Done |
 | 2 | Wrap group creation + key distribution in a transaction | Robustness / Security | Medium | ✅ Done |
-| 3 | Extract `tenet-web.rs` into modules | Understandability | Medium | Pending |
-| 4 | Avoid holding Mutex across blocking I/O | Robustness | Medium | Pending |
-| 5 | Add integration tests for web API | Robustness | Medium | Pending |
+| 3 | Extract `tenet-web.rs` into modules | Understandability | Medium | Deferred (needs #5 first) |
+| 4 | Avoid holding Mutex across blocking I/O | Robustness | Medium | ✅ Done |
+| 5 | Add integration tests for web API | Robustness | Medium | Deferred (next priority) |
 | 6 | Validate hex-encoded keys on add-peer | Security | Low | ✅ Done |
-| 7 | Replace single `Arc<Mutex>` with finer-grained sharing | Robustness | Medium | Pending |
+| 7 | Replace single `Arc<Mutex>` with finer-grained sharing | Robustness | Medium | Deferred (#4 reduces urgency) |
 | 8 | Relay sync: add backoff + fix message-kind inference | Robustness | Low–Medium | ✅ Done |
-| 9 | Derive JSON serialization instead of manual `json!({})` | Understandability | Low | Pending |
-| 10 | Harden WebSocket against slow/malicious clients | Security | Low | Pending |
+| 9 | Deduplicate JSON serialization with helper functions | Understandability | Low | ✅ Done |
+| 10 | Harden WebSocket against slow/malicious clients | Security | Low | ✅ Done |
