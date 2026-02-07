@@ -165,7 +165,7 @@ database instead of JSON files.
 
 ---
 
-## Phase 1 — Foundation
+## Phase 1 — Foundation ✅ COMPLETE
 
 **Goal**: A working web server binary that serves a minimal SPA, connects to
 the tenet network as a peer, and persists state in SQLite.
@@ -210,7 +210,7 @@ the tenet network as a peer, and persists state in SQLite.
 
 ---
 
-## Phase 2 — Core API & Timeline
+## Phase 2 — Core API & Timeline ✅ COMPLETE
 
 **Goal**: REST API endpoints for reading and composing messages, plus a
 timeline view in the SPA.

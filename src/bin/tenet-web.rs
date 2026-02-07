@@ -1,22 +1,28 @@
 //! tenet-web: Web server binary that acts as a full tenet peer.
 //!
-//! Serves a minimal SPA, connects to relays, and persists state in SQLite.
+//! Serves an embedded SPA, provides REST API + WebSocket for messages,
+//! connects to relays, and persists state in SQLite.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use rust_embed::Embed;
-use tokio::sync::Mutex;
+use serde::Deserialize;
+use tokio::sync::{broadcast, Mutex};
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
-use tenet::crypto::{generate_keypair, StoredKeypair};
-use tenet::storage::{db_path, IdentityRow, RelayRow, Storage};
+use tenet::crypto::{generate_content_key, generate_keypair, StoredKeypair, NONCE_SIZE};
+use tenet::protocol::{
+    build_encrypted_payload, build_envelope_from_payload, build_plaintext_envelope, MessageKind,
+};
+use tenet::storage::{db_path, IdentityRow, MessageRow, RelayRow, Storage};
 
 // ---------------------------------------------------------------------------
 // Embedded static assets
@@ -34,6 +40,7 @@ const DEFAULT_TTL_SECONDS: u64 = 3600;
 const SYNC_INTERVAL_SECS: u64 = 30;
 const WEB_HPKE_INFO: &[u8] = b"tenet-web";
 const WEB_PAYLOAD_AAD: &[u8] = b"tenet-web";
+const WS_CHANNEL_CAPACITY: usize = 256;
 
 struct Config {
     bind_addr: String,
@@ -61,6 +68,32 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket event types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum WsEvent {
+    NewMessage {
+        message_id: String,
+        sender_id: String,
+        message_kind: String,
+        body: Option<String>,
+        timestamp: u64,
+    },
+    PeerOnline {
+        peer_id: String,
+    },
+    PeerOffline {
+        peer_id: String,
+    },
+    MessageRead {
+        message_id: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Shared application state
 // ---------------------------------------------------------------------------
 
@@ -68,6 +101,7 @@ struct AppState {
     storage: Storage,
     keypair: StoredKeypair,
     relay_url: Option<String>,
+    ws_tx: broadcast::Sender<WsEvent>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -136,10 +170,14 @@ async fn main() {
         });
     }
 
+    // Create WebSocket broadcast channel
+    let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
+
     let state: SharedState = Arc::new(Mutex::new(AppState {
         storage,
         keypair: keypair.clone(),
         relay_url: config.relay_url.clone(),
+        ws_tx,
     }));
 
     // Start background relay sync task
@@ -152,7 +190,18 @@ async fn main() {
 
     // Build Axum router
     let app = Router::new()
+        // Health
         .route("/api/health", get(health_handler))
+        // Messages API (Phase 2)
+        .route("/api/messages", get(list_messages_handler))
+        .route("/api/messages/:message_id", get(get_message_handler))
+        .route("/api/messages/direct", post(send_direct_handler))
+        .route("/api/messages/public", post(send_public_handler))
+        .route("/api/messages/group", post(send_group_handler))
+        .route("/api/messages/:message_id/read", post(mark_read_handler))
+        // WebSocket (Phase 2)
+        .route("/api/ws", get(ws_handler))
+        // Static fallback
         .fallback(get(static_handler))
         .with_state(state);
 
@@ -165,7 +214,16 @@ async fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// API error helper
+// ---------------------------------------------------------------------------
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
+    let body = serde_json::json!({ "error": message.into() });
+    (status, axum::Json(body)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Health handler
 // ---------------------------------------------------------------------------
 
 async fn health_handler(State(state): State<SharedState>) -> impl IntoResponse {
@@ -187,6 +245,461 @@ async fn health_handler(State(state): State<SharedState>) -> impl IntoResponse {
     });
     (StatusCode::OK, axum::Json(body))
 }
+
+// ---------------------------------------------------------------------------
+// Messages API
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ListMessagesQuery {
+    kind: Option<String>,
+    group: Option<String>,
+    before: Option<u64>,
+    limit: Option<u32>,
+}
+
+async fn list_messages_handler(
+    State(state): State<SharedState>,
+    Query(params): Query<ListMessagesQuery>,
+) -> Response {
+    let st = state.lock().await;
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    match st.storage.list_messages(
+        params.kind.as_deref(),
+        params.group.as_deref(),
+        params.before,
+        limit,
+    ) {
+        Ok(messages) => {
+            let json: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "message_id": m.message_id,
+                        "sender_id": m.sender_id,
+                        "recipient_id": m.recipient_id,
+                        "message_kind": m.message_kind,
+                        "group_id": m.group_id,
+                        "body": m.body,
+                        "timestamp": m.timestamp,
+                        "received_at": m.received_at,
+                        "is_read": m.is_read,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn get_message_handler(
+    State(state): State<SharedState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.get_message(&message_id) {
+        Ok(Some(m)) => {
+            let json = serde_json::json!({
+                "message_id": m.message_id,
+                "sender_id": m.sender_id,
+                "recipient_id": m.recipient_id,
+                "message_kind": m.message_kind,
+                "group_id": m.group_id,
+                "body": m.body,
+                "timestamp": m.timestamp,
+                "received_at": m.received_at,
+                "is_read": m.is_read,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "message not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// -- Send direct message --
+
+#[derive(Deserialize)]
+struct SendDirectRequest {
+    recipient_id: String,
+    body: String,
+}
+
+async fn send_direct_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<SendDirectRequest>,
+) -> Response {
+    if req.body.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
+    }
+
+    let st = state.lock().await;
+
+    // Look up recipient's public key
+    let peer = match st.storage.get_peer(&req.recipient_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "recipient peer not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let recipient_enc_key = match peer.encryption_public_key.as_deref() {
+        Some(k) => k.to_string(),
+        None => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "recipient has no encryption key; cannot send encrypted message",
+            )
+        }
+    };
+
+    let now = now_secs();
+
+    // Build encrypted envelope
+    let content_key = generate_content_key();
+    let mut nonce = [0u8; NONCE_SIZE];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+    let payload = match build_encrypted_payload(
+        req.body.as_bytes(),
+        &recipient_enc_key,
+        WEB_PAYLOAD_AAD,
+        WEB_HPKE_INFO,
+        &content_key,
+        &nonce,
+        None,
+    ) {
+        Ok(p) => p,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
+    };
+
+    let envelope = match build_envelope_from_payload(
+        st.keypair.id.clone(),
+        req.recipient_id.clone(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Direct,
+        None,
+        payload,
+        &st.keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
+    };
+
+    // Post to relay
+    if let Some(ref relay_url) = st.relay_url {
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    let msg_id = envelope.header.message_id.0.clone();
+
+    // Persist to outbox and messages
+    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+        message_id: msg_id.clone(),
+        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+        sent_at: now,
+        delivered: false,
+    });
+
+    let _ = st.storage.insert_message(&MessageRow {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        recipient_id: req.recipient_id.clone(),
+        message_kind: "direct".to_string(),
+        group_id: None,
+        body: Some(req.body.clone()),
+        timestamp: now,
+        received_at: now,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        is_read: true,
+        raw_envelope: None,
+    });
+
+    // Broadcast to WebSocket clients
+    let _ = st.ws_tx.send(WsEvent::NewMessage {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        message_kind: "direct".to_string(),
+        body: Some(req.body),
+        timestamp: now,
+    });
+
+    let json = serde_json::json!({
+        "message_id": msg_id,
+        "status": "sent",
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+// -- Send public message --
+
+#[derive(Deserialize)]
+struct SendPublicRequest {
+    body: String,
+}
+
+async fn send_public_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<SendPublicRequest>,
+) -> Response {
+    if req.body.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
+    }
+
+    let st = state.lock().await;
+    let now = now_secs();
+
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+
+    let envelope = match build_plaintext_envelope(
+        st.keypair.id.as_str(),
+        "*",
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Public,
+        None,
+        &req.body,
+        salt,
+        &st.keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
+    };
+
+    // Post to relay
+    if let Some(ref relay_url) = st.relay_url {
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    let msg_id = envelope.header.message_id.0.clone();
+
+    // Persist
+    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+        message_id: msg_id.clone(),
+        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+        sent_at: now,
+        delivered: false,
+    });
+
+    let _ = st.storage.insert_message(&MessageRow {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        recipient_id: "*".to_string(),
+        message_kind: "public".to_string(),
+        group_id: None,
+        body: Some(req.body.clone()),
+        timestamp: now,
+        received_at: now,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        is_read: true,
+        raw_envelope: None,
+    });
+
+    // Broadcast to WS
+    let _ = st.ws_tx.send(WsEvent::NewMessage {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        message_kind: "public".to_string(),
+        body: Some(req.body),
+        timestamp: now,
+    });
+
+    let json = serde_json::json!({
+        "message_id": msg_id,
+        "status": "sent",
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+// -- Send group message --
+
+#[derive(Deserialize)]
+struct SendGroupRequest {
+    group_id: String,
+    body: String,
+}
+
+async fn send_group_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<SendGroupRequest>,
+) -> Response {
+    if req.body.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "body cannot be empty");
+    }
+
+    let st = state.lock().await;
+    let now = now_secs();
+
+    // Look up group key from storage
+    let group = match st.storage.get_group(&req.group_id) {
+        Ok(Some(g)) => g,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let group_key: [u8; 32] = match group.group_key.try_into() {
+        Ok(k) => k,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
+    };
+
+    let aad = req.group_id.as_bytes();
+    let payload =
+        match tenet::protocol::build_group_message_payload(req.body.as_bytes(), &group_key, aad) {
+            Ok(p) => p,
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
+        };
+
+    let envelope = match build_envelope_from_payload(
+        st.keypair.id.clone(),
+        "*".to_string(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::FriendGroup,
+        Some(req.group_id.clone()),
+        payload,
+        &st.keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
+    };
+
+    // Post to relay
+    if let Some(ref relay_url) = st.relay_url {
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    let msg_id = envelope.header.message_id.0.clone();
+
+    // Persist
+    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+        message_id: msg_id.clone(),
+        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+        sent_at: now,
+        delivered: false,
+    });
+
+    let _ = st.storage.insert_message(&MessageRow {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        recipient_id: "*".to_string(),
+        message_kind: "friend_group".to_string(),
+        group_id: Some(req.group_id.clone()),
+        body: Some(req.body.clone()),
+        timestamp: now,
+        received_at: now,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        is_read: true,
+        raw_envelope: None,
+    });
+
+    // Broadcast to WS
+    let _ = st.ws_tx.send(WsEvent::NewMessage {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        message_kind: "friend_group".to_string(),
+        body: Some(req.body),
+        timestamp: now,
+    });
+
+    let json = serde_json::json!({
+        "message_id": msg_id,
+        "status": "sent",
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+// -- Mark message as read --
+
+async fn mark_read_handler(
+    State(state): State<SharedState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.mark_message_read(&message_id) {
+        Ok(true) => {
+            let _ = st.ws_tx.send(WsEvent::MessageRead {
+                message_id: message_id.clone(),
+            });
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"status": "ok"})),
+            )
+                .into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "message not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket handler
+// ---------------------------------------------------------------------------
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
+    ws.on_upgrade(|socket| ws_connection(socket, state))
+}
+
+async fn ws_connection(mut socket: WebSocket, state: SharedState) {
+    // Subscribe to the broadcast channel
+    let mut rx = {
+        let st = state.lock().await;
+        st.ws_tx.subscribe()
+    };
+
+    loop {
+        tokio::select! {
+            // Forward broadcast events to the WebSocket client
+            result = rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if socket.send(WsMessage::Text(json)).await.is_err() {
+                                break; // client disconnected
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Client too slow, skip missed events
+                        eprintln!("ws client lagged, skipped {n} events");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // Handle incoming messages from the client (for future use)
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(WsMessage::Ping(data))) => {
+                        let _ = socket.send(WsMessage::Pong(data)).await;
+                    }
+                    _ => {} // ignore other client messages for now
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static asset handler
+// ---------------------------------------------------------------------------
 
 async fn static_handler(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
@@ -276,20 +789,16 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
         return Ok(());
     }
 
-    // Store received messages in SQLite
+    // Store received messages in SQLite and broadcast via WebSocket
     let st = state.lock().await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = now_secs();
 
     for msg in &outcome.messages {
-        // Check if message already stored
         if st.storage.has_message(&msg.message_id).unwrap_or(true) {
             continue;
         }
 
-        let row = tenet::storage::MessageRow {
+        let row = MessageRow {
             message_id: msg.message_id.clone(),
             sender_id: msg.sender_id.clone(),
             recipient_id: keypair.id.clone(),
@@ -302,7 +811,16 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
             is_read: false,
             raw_envelope: None,
         };
-        let _ = st.storage.insert_message(&row);
+        if st.storage.insert_message(&row).is_ok() {
+            // Push to WebSocket clients
+            let _ = st.ws_tx.send(WsEvent::NewMessage {
+                message_id: msg.message_id.clone(),
+                sender_id: msg.sender_id.clone(),
+                message_kind: "direct".to_string(),
+                body: Some(msg.body.clone()),
+                timestamp: msg.timestamp,
+            });
+        }
     }
 
     // Update relay last_sync timestamp
@@ -317,4 +835,15 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
