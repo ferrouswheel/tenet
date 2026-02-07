@@ -301,6 +301,17 @@ pub enum MetaMessage {
         peer_id: String,
         since_timestamp: u64,
     },
+    FriendRequest {
+        peer_id: String,
+        signing_public_key: String,
+        encryption_public_key: String,
+        message: Option<String>,
+    },
+    FriendAccept {
+        peer_id: String,
+        signing_public_key: String,
+        encryption_public_key: String,
+    },
 }
 
 #[derive(Debug)]

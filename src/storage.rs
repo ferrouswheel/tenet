@@ -221,6 +221,23 @@ pub struct ProfileRow {
     pub updated_at: u64,
 }
 
+/// Friend request row stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequestRow {
+    pub id: i64,
+    pub from_peer_id: String,
+    pub to_peer_id: String,
+    /// "pending", "accepted", "ignored", "blocked"
+    pub status: String,
+    pub message: Option<String>,
+    pub from_signing_key: String,
+    pub from_encryption_key: String,
+    /// "incoming" or "outgoing" from the local peer's perspective
+    pub direction: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Storage handle
 // ---------------------------------------------------------------------------
@@ -349,6 +366,25 @@ impl Storage {
                 timestamp       INTEGER NOT NULL,
                 PRIMARY KEY (target_id, sender_id)
             );
+
+            -- Friend Requests
+            CREATE TABLE IF NOT EXISTS friend_requests (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_peer_id        TEXT NOT NULL,
+                to_peer_id          TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                message             TEXT,
+                from_signing_key    TEXT NOT NULL,
+                from_encryption_key TEXT NOT NULL,
+                direction           TEXT NOT NULL,
+                created_at          INTEGER NOT NULL,
+                updated_at          INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_friend_requests_to
+                ON friend_requests(to_peer_id, status);
+            CREATE INDEX IF NOT EXISTS idx_friend_requests_from
+                ON friend_requests(from_peer_id, status);
 
             -- Profiles (Phase 10)
             CREATE TABLE IF NOT EXISTS profiles (
@@ -1317,6 +1353,152 @@ impl Storage {
         }
         self.upsert_profile(row)?;
         Ok(true)
+    }
+
+    // -----------------------------------------------------------------------
+    // Friend Requests CRUD
+    // -----------------------------------------------------------------------
+
+    pub fn insert_friend_request(&self, row: &FriendRequestRow) -> Result<i64, StorageError> {
+        self.conn.execute(
+            "INSERT INTO friend_requests
+             (from_peer_id, to_peer_id, status, message, from_signing_key,
+              from_encryption_key, direction, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                row.from_peer_id,
+                row.to_peer_id,
+                row.status,
+                row.message,
+                row.from_signing_key,
+                row.from_encryption_key,
+                row.direction,
+                row.created_at as i64,
+                row.updated_at as i64,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_friend_request(&self, id: i64) -> Result<Option<FriendRequestRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_peer_id, to_peer_id, status, message, from_signing_key,
+                    from_encryption_key, direction, created_at, updated_at
+             FROM friend_requests WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id], |row| {
+                Ok(FriendRequestRow {
+                    id: row.get(0)?,
+                    from_peer_id: row.get(1)?,
+                    to_peer_id: row.get(2)?,
+                    status: row.get(3)?,
+                    message: row.get(4)?,
+                    from_signing_key: row.get(5)?,
+                    from_encryption_key: row.get(6)?,
+                    direction: row.get(7)?,
+                    created_at: row.get::<_, i64>(8)? as u64,
+                    updated_at: row.get::<_, i64>(9)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_friend_requests(
+        &self,
+        status_filter: Option<&str>,
+        direction_filter: Option<&str>,
+    ) -> Result<Vec<FriendRequestRow>, StorageError> {
+        let base = "SELECT id, from_peer_id, to_peer_id, status, message, from_signing_key,
+                           from_encryption_key, direction, created_at, updated_at
+                    FROM friend_requests";
+        let mut conditions = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(status) = status_filter {
+            conditions.push(format!("status = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(status.to_string()));
+        }
+        if let Some(direction) = direction_filter {
+            conditions.push(format!("direction = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(direction.to_string()));
+        }
+
+        let query = if conditions.is_empty() {
+            format!("{} ORDER BY created_at DESC", base)
+        } else {
+            format!(
+                "{} WHERE {} ORDER BY created_at DESC",
+                base,
+                conditions.join(" AND ")
+            )
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(FriendRequestRow {
+                id: row.get(0)?,
+                from_peer_id: row.get(1)?,
+                to_peer_id: row.get(2)?,
+                status: row.get(3)?,
+                message: row.get(4)?,
+                from_signing_key: row.get(5)?,
+                from_encryption_key: row.get(6)?,
+                direction: row.get(7)?,
+                created_at: row.get::<_, i64>(8)? as u64,
+                updated_at: row.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn update_friend_request_status(
+        &self,
+        id: i64,
+        status: &str,
+    ) -> Result<bool, StorageError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let affected = self.conn.execute(
+            "UPDATE friend_requests SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now as i64, id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Check if there is a pending friend request from a specific peer.
+    pub fn has_pending_request_from(
+        &self,
+        from_peer_id: &str,
+        to_peer_id: &str,
+    ) -> Result<bool, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM friend_requests
+             WHERE from_peer_id = ?1 AND to_peer_id = ?2 AND status = 'pending'",
+            params![from_peer_id, to_peer_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Check if a peer is blocked (has a blocked friend request).
+    pub fn is_peer_blocked(&self, peer_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM friend_requests
+             WHERE from_peer_id = ?1 AND status = 'blocked'",
+            params![peer_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     // -----------------------------------------------------------------------

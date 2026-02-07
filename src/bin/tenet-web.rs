@@ -31,8 +31,8 @@ use tenet::protocol::{
     build_plaintext_envelope, decode_meta_payload, MessageKind, MetaMessage,
 };
 use tenet::storage::{
-    db_path, AttachmentRow, MessageAttachmentRow, MessageRow, PeerRow, ProfileRow, ReactionRow,
-    Storage,
+    db_path, AttachmentRow, FriendRequestRow, MessageAttachmentRow, MessageRow, PeerRow,
+    ProfileRow, ReactionRow, Storage,
 };
 
 // ---------------------------------------------------------------------------
@@ -149,6 +149,15 @@ enum WsEvent {
     RelayStatus {
         connected: bool,
         relay_url: Option<String>,
+    },
+    FriendRequestReceived {
+        request_id: i64,
+        from_peer_id: String,
+        message: Option<String>,
+    },
+    FriendRequestAccepted {
+        request_id: i64,
+        from_peer_id: String,
     },
 }
 
@@ -320,6 +329,23 @@ async fn main() {
             get(get_own_profile_handler).put(update_own_profile_handler),
         )
         .route("/api/peers/:peer_id/profile", get(get_peer_profile_handler))
+        // Friend Requests API
+        .route(
+            "/api/friend-requests",
+            get(list_friend_requests_handler).post(send_friend_request_handler),
+        )
+        .route(
+            "/api/friend-requests/:id/accept",
+            post(accept_friend_request_handler),
+        )
+        .route(
+            "/api/friend-requests/:id/ignore",
+            post(ignore_friend_request_handler),
+        )
+        .route(
+            "/api/friend-requests/:id/block",
+            post(block_friend_request_handler),
+        )
         // Conversations API (Phase 5)
         .route("/api/conversations", get(list_conversations_handler))
         .route("/api/conversations/:peer_id", get(get_conversation_handler))
@@ -984,6 +1010,307 @@ async fn delete_peer_handler(
         Ok(false) => api_error(StatusCode::NOT_FOUND, "peer not found"),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Friend Requests API
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SendFriendRequestPayload {
+    peer_id: String,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListFriendRequestsQuery {
+    status: Option<String>,
+    direction: Option<String>,
+}
+
+async fn send_friend_request_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<SendFriendRequestPayload>,
+) -> Response {
+    if req.peer_id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "peer_id cannot be empty");
+    }
+
+    let (keypair, relay_url) = {
+        let st = state.lock().await;
+        let peer_id = req.peer_id.trim().to_string();
+
+        // Cannot send friend request to self
+        if peer_id == st.keypair.id {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "cannot send friend request to yourself",
+            );
+        }
+
+        // Check if already friends
+        if let Ok(Some(existing)) = st.storage.get_peer(&peer_id) {
+            if existing.is_friend {
+                return api_error(StatusCode::CONFLICT, "already friends with this peer");
+            }
+        }
+
+        // Check for existing pending outgoing request
+        if st
+            .storage
+            .has_pending_request_from(&st.keypair.id, &peer_id)
+            .unwrap_or(false)
+        {
+            return api_error(StatusCode::CONFLICT, "friend request already pending");
+        }
+
+        (st.keypair.clone(), st.relay_url.clone())
+    };
+
+    let peer_id = req.peer_id.trim().to_string();
+    let now = now_secs();
+
+    // Create outgoing friend request record
+    let fr_row = FriendRequestRow {
+        id: 0,
+        from_peer_id: keypair.id.clone(),
+        to_peer_id: peer_id.clone(),
+        status: "pending".to_string(),
+        message: req.message.clone(),
+        from_signing_key: keypair.signing_public_key_hex.clone(),
+        from_encryption_key: keypair.public_key_hex.clone(),
+        direction: "outgoing".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let request_id = {
+        let st = state.lock().await;
+        match st.storage.insert_friend_request(&fr_row) {
+            Ok(id) => id,
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+
+    // Send the friend request as a Meta message via relay
+    if let Some(ref relay) = relay_url {
+        let meta_msg = MetaMessage::FriendRequest {
+            peer_id: keypair.id.clone(),
+            signing_public_key: keypair.signing_public_key_hex.clone(),
+            encryption_public_key: keypair.public_key_hex.clone(),
+            message: req.message.clone(),
+        };
+
+        if let Ok(payload) = build_meta_payload(&meta_msg) {
+            if let Ok(envelope) = build_envelope_from_payload(
+                keypair.id.clone(),
+                peer_id.clone(),
+                None,
+                None,
+                now,
+                DEFAULT_TTL_SECONDS,
+                MessageKind::Meta,
+                None,
+                payload,
+                &keypair.signing_private_key_hex,
+            ) {
+                if let Err(e) = post_to_relay(relay, &envelope) {
+                    eprintln!("failed to send friend request to relay: {}", e);
+                }
+            }
+        }
+    }
+
+    let json = serde_json::json!({
+        "id": request_id,
+        "from_peer_id": keypair.id,
+        "to_peer_id": peer_id,
+        "status": "pending",
+        "message": req.message,
+        "direction": "outgoing",
+        "created_at": now,
+        "updated_at": now,
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+async fn list_friend_requests_handler(
+    State(state): State<SharedState>,
+    Query(query): Query<ListFriendRequestsQuery>,
+) -> Response {
+    let st = state.lock().await;
+    match st
+        .storage
+        .list_friend_requests(query.status.as_deref(), query.direction.as_deref())
+    {
+        Ok(requests) => {
+            let json: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "from_peer_id": r.from_peer_id,
+                        "to_peer_id": r.to_peer_id,
+                        "status": r.status,
+                        "message": r.message,
+                        "direction": r.direction,
+                        "created_at": r.created_at,
+                        "updated_at": r.updated_at,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn accept_friend_request_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<i64>,
+) -> Response {
+    let (keypair, relay_url) = {
+        let st = state.lock().await;
+        (st.keypair.clone(), st.relay_url.clone())
+    };
+
+    let st = state.lock().await;
+
+    // Get the friend request
+    let fr = match st.storage.get_friend_request(id) {
+        Ok(Some(fr)) => fr,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "friend request not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    if fr.status != "pending" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("friend request is already {}", fr.status),
+        );
+    }
+
+    if fr.direction != "incoming" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "can only accept incoming friend requests",
+        );
+    }
+
+    // Update request status
+    if let Err(e) = st.storage.update_friend_request_status(id, "accepted") {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    // Add the requester as a friend with their keys
+    let now = now_secs();
+    let peer_row = PeerRow {
+        peer_id: fr.from_peer_id.clone(),
+        display_name: None,
+        signing_public_key: fr.from_signing_key.clone(),
+        encryption_public_key: Some(fr.from_encryption_key.clone()),
+        added_at: now,
+        is_friend: true,
+        last_seen_online: None,
+        online: false,
+    };
+    if let Err(e) = st.storage.insert_peer(&peer_row) {
+        eprintln!("failed to add peer from friend request: {}", e);
+    }
+
+    // Send FriendAccept meta message via relay
+    if let Some(ref relay) = relay_url {
+        let meta_msg = MetaMessage::FriendAccept {
+            peer_id: keypair.id.clone(),
+            signing_public_key: keypair.signing_public_key_hex.clone(),
+            encryption_public_key: keypair.public_key_hex.clone(),
+        };
+
+        if let Ok(payload) = build_meta_payload(&meta_msg) {
+            if let Ok(envelope) = build_envelope_from_payload(
+                keypair.id.clone(),
+                fr.from_peer_id.clone(),
+                None,
+                None,
+                now,
+                DEFAULT_TTL_SECONDS,
+                MessageKind::Meta,
+                None,
+                payload,
+                &keypair.signing_private_key_hex,
+            ) {
+                if let Err(e) = post_to_relay(relay, &envelope) {
+                    eprintln!("failed to send friend accept to relay: {}", e);
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "accepted", "id": id})),
+    )
+        .into_response()
+}
+
+async fn ignore_friend_request_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<i64>,
+) -> Response {
+    let st = state.lock().await;
+
+    let fr = match st.storage.get_friend_request(id) {
+        Ok(Some(fr)) => fr,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "friend request not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    if fr.status != "pending" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("friend request is already {}", fr.status),
+        );
+    }
+
+    if let Err(e) = st.storage.update_friend_request_status(id, "ignored") {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "ignored", "id": id})),
+    )
+        .into_response()
+}
+
+async fn block_friend_request_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<i64>,
+) -> Response {
+    let st = state.lock().await;
+
+    let fr = match st.storage.get_friend_request(id) {
+        Ok(Some(fr)) => fr,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "friend request not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    if fr.direction != "incoming" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "can only block incoming friend requests",
+        );
+    }
+
+    if let Err(e) = st.storage.update_friend_request_status(id, "blocked") {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "blocked", "id": id})),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,7 +2767,86 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                             .storage
                             .update_peer_online(&peer_id, true, online_timestamp);
                     }
-                    _ => {} // Ignore other meta message types for now
+                    MetaMessage::FriendRequest {
+                        peer_id: from_peer_id,
+                        signing_public_key,
+                        encryption_public_key,
+                        message,
+                    } => {
+                        let st = state.lock().await;
+                        // Check if blocked
+                        if st.storage.is_peer_blocked(&from_peer_id).unwrap_or(false) {
+                            eprintln!("ignoring friend request from blocked peer {}", from_peer_id);
+                            continue;
+                        }
+                        // Check for duplicate pending
+                        if st
+                            .storage
+                            .has_pending_request_from(&from_peer_id, &keypair.id)
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let now_ts = now_secs();
+                        let fr_row = FriendRequestRow {
+                            id: 0,
+                            from_peer_id: from_peer_id.clone(),
+                            to_peer_id: keypair.id.clone(),
+                            status: "pending".to_string(),
+                            message: message.clone(),
+                            from_signing_key: signing_public_key,
+                            from_encryption_key: encryption_public_key,
+                            direction: "incoming".to_string(),
+                            created_at: now_ts,
+                            updated_at: now_ts,
+                        };
+                        if let Ok(request_id) = st.storage.insert_friend_request(&fr_row) {
+                            let _ = st.ws_tx.send(WsEvent::FriendRequestReceived {
+                                request_id,
+                                from_peer_id: from_peer_id.clone(),
+                                message,
+                            });
+                            eprintln!("received friend request from {}", from_peer_id);
+                        }
+                    }
+                    MetaMessage::FriendAccept {
+                        peer_id: from_peer_id,
+                        signing_public_key,
+                        encryption_public_key,
+                    } => {
+                        let st = state.lock().await;
+                        // Find the matching outgoing pending request
+                        let requests = st
+                            .storage
+                            .list_friend_requests(Some("pending"), Some("outgoing"))
+                            .unwrap_or_default();
+                        if let Some(pending) =
+                            requests.iter().find(|r| r.to_peer_id == from_peer_id)
+                        {
+                            let req_id = pending.id;
+                            let _ = st.storage.update_friend_request_status(req_id, "accepted");
+
+                            // Add the accepting peer as a friend
+                            let now_ts = now_secs();
+                            let peer_row = PeerRow {
+                                peer_id: from_peer_id.clone(),
+                                display_name: None,
+                                signing_public_key,
+                                encryption_public_key: Some(encryption_public_key),
+                                added_at: now_ts,
+                                is_friend: true,
+                                last_seen_online: None,
+                                online: false,
+                            };
+                            let _ = st.storage.insert_peer(&peer_row);
+                            let _ = st.ws_tx.send(WsEvent::FriendRequestAccepted {
+                                request_id: req_id,
+                                from_peer_id: from_peer_id.clone(),
+                            });
+                            eprintln!("friend request accepted by {}", from_peer_id);
+                        }
+                    }
+                    _ => {} // Ignore other meta message types
                 }
             }
         }
