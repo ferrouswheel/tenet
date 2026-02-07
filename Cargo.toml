@@ -22,6 +22,10 @@ path = "src/bin/toy_ui.rs"
 name = "tenet-relay"
 path = "src/bin/relay.rs"
 
+[[bin]]
+name = "tenet-web"
+path = "src/bin/tenet-web.rs"
+
 [dependencies]
 base64 = "0.22"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
@@ -40,4 +44,8 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.8"
+rust-embed = "8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tower-http = { version = "0.5", features = ["set-header"] }
+mime_guess = "2"
 ureq = { version = "2.10", features = ["json", "tls"] }

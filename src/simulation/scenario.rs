@@ -152,8 +152,7 @@ where
     use super::{EventBasedHarness, NetworkConditions};
     use crate::simulation::planned_sends_to_events;
 
-    let (base_url, shutdown_tx, relay_control) =
-        start_relay(relay_config_override).await;
+    let (base_url, shutdown_tx, relay_control) = start_relay(relay_config_override).await;
 
     let inputs = build_simulation_inputs(&scenario.simulation);
     let duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
@@ -198,8 +197,7 @@ where
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         harness.log_event(format!(
             "Message events from {:.0}s to {:.0}s",
-            first.time,
-            last.time
+            first.time, last.time
         ));
     }
     for event in events {
@@ -210,7 +208,10 @@ where
     let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
     let (online_events, _node_cohorts) =
         build_online_events(&scenario.simulation, 0.0, duration_seconds, &mut rng);
-    harness.log_event(format!("Scheduling {} online/offline events", online_events.len()));
+    harness.log_event(format!(
+        "Scheduling {} online/offline events",
+        online_events.len()
+    ));
     for event in online_events {
         harness.schedule_event(event.time, event.event);
     }
