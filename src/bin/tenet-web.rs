@@ -229,6 +229,9 @@ async fn main() {
             axum::routing::delete(remove_group_member_handler),
         )
         .route("/api/groups/:group_id/leave", post(leave_group_handler))
+        // Conversations API (Phase 5)
+        .route("/api/conversations", get(list_conversations_handler))
+        .route("/api/conversations/:peer_id", get(get_conversation_handler))
         // WebSocket (Phase 2)
         .route("/api/ws", get(ws_handler))
         // Static fallback
@@ -1157,6 +1160,74 @@ async fn leave_group_handler(
             (StatusCode::OK, axum::Json(json)).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "not a member of this group"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversations API (Phase 5)
+// ---------------------------------------------------------------------------
+
+async fn list_conversations_handler(State(state): State<SharedState>) -> Response {
+    let st = state.lock().await;
+    match st.storage.list_conversations(&st.keypair.id) {
+        Ok(conversations) => {
+            // Enrich with peer display names
+            let json: Vec<serde_json::Value> = conversations
+                .iter()
+                .map(|c| {
+                    let peer = st.storage.get_peer(&c.peer_id).ok().flatten();
+                    serde_json::json!({
+                        "peer_id": c.peer_id,
+                        "display_name": peer.as_ref().and_then(|p| p.display_name.clone()),
+                        "last_timestamp": c.last_timestamp,
+                        "last_message": c.last_message,
+                        "unread_count": c.unread_count,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConversationQuery {
+    before: Option<u64>,
+    limit: Option<u32>,
+}
+
+async fn get_conversation_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+    Query(params): Query<ConversationQuery>,
+) -> Response {
+    let st = state.lock().await;
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    match st
+        .storage
+        .list_conversation_messages(&st.keypair.id, &peer_id, params.before, limit)
+    {
+        Ok(messages) => {
+            let json: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "message_id": m.message_id,
+                        "sender_id": m.sender_id,
+                        "recipient_id": m.recipient_id,
+                        "message_kind": m.message_kind,
+                        "body": m.body,
+                        "timestamp": m.timestamp,
+                        "received_at": m.received_at,
+                        "is_read": m.is_read,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

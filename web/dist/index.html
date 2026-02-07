@@ -317,6 +317,80 @@
         }
         .empty .icon { font-size: 2rem; margin-bottom: 0.5rem; }
 
+        /* Conversations view */
+        .conversation-item {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.5rem;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .conversation-item:hover { border-color: #3a3d47; }
+        .conversation-item.unread { border-left: 3px solid #5566cc; }
+        .conversation-item .conv-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.3rem;
+        }
+        .conversation-item .conv-peer {
+            font-size: 0.9rem;
+            color: #e0e0e0;
+            font-weight: 500;
+        }
+        .conversation-item .conv-time {
+            font-size: 0.75rem;
+            color: #666;
+        }
+        .conversation-item .conv-preview {
+            font-size: 0.85rem;
+            color: #888;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .conversation-item .unread-badge {
+            background: #5566cc;
+            color: #fff;
+            font-size: 0.7rem;
+            padding: 0.1rem 0.4rem;
+            border-radius: 10px;
+            margin-left: 0.5rem;
+        }
+
+        /* Conversation detail view */
+        .conversation-detail {
+            display: none;
+        }
+        .conversation-detail.visible { display: block; }
+        .conversation-back {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .conversation-back button {
+            background: #2a2d37;
+            border: none;
+            color: #aaa;
+            padding: 0.3rem 0.6rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .conversation-back button:hover { background: #3a3d47; color: #ddd; }
+        .conversation-back .peer-name {
+            font-size: 1rem;
+            color: #e0e0e0;
+            font-weight: 500;
+        }
+
         /* Toast notification */
         .toast {
             position: fixed;
@@ -378,6 +452,7 @@
                 <button data-kind="public">Public</button>
                 <button data-kind="direct">Direct</button>
                 <button data-kind="friend_group">Groups</button>
+                <button data-view="conversations">Conversations</button>
             </div>
 
             <!-- Compose box -->
@@ -393,6 +468,21 @@
 
             <!-- Timeline -->
             <div id="timeline"></div>
+
+            <!-- Conversations list -->
+            <div id="conversations-list" style="display:none;"></div>
+
+            <!-- Conversation detail -->
+            <div id="conversation-detail" class="conversation-detail">
+                <div class="conversation-back">
+                    <button onclick="backToConversations()">&#8592; Back</button>
+                    <span class="peer-name" id="conversation-peer-name"></span>
+                </div>
+                <div id="conversation-messages"></div>
+                <div id="conversation-load-more" class="load-more" style="display:none;">
+                    <button onclick="loadMoreConversationMessages()">Load older messages</button>
+                </div>
+            </div>
 
             <!-- Load more / empty -->
             <div id="load-more" class="load-more" style="display:none;">
@@ -414,10 +504,15 @@
     // ---------------------------------------------------------------------------
     let myPeerId = '';
     let currentFilter = '';
+    let currentView = 'timeline'; // 'timeline', 'conversations', 'conversation-detail'
     let messages = [];
     let oldestTimestamp = null;
     let ws = null;
     let peers = [];
+    let conversations = [];
+    let currentConversationPeerId = null;
+    let conversationMessages = [];
+    let conversationOldestTimestamp = null;
     const PAGE_SIZE = 50;
 
     // ---------------------------------------------------------------------------
@@ -541,17 +636,173 @@
     }
 
     // ---------------------------------------------------------------------------
-    // Filter
+    // Filter & View Switching
     // ---------------------------------------------------------------------------
     document.querySelectorAll('.filters button').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            currentFilter = btn.dataset.kind;
-            oldestTimestamp = null;
-            loadMessages(false);
+
+            if (btn.dataset.view === 'conversations') {
+                currentView = 'conversations';
+                showConversationsView();
+            } else {
+                currentView = 'timeline';
+                currentFilter = btn.dataset.kind;
+                oldestTimestamp = null;
+                showTimelineView();
+                loadMessages(false);
+            }
         });
     });
+
+    function showTimelineView() {
+        document.getElementById('timeline').style.display = '';
+        document.getElementById('load-more').style.display = '';
+        document.getElementById('empty-state').style.display = 'none';
+        document.getElementById('conversations-list').style.display = 'none';
+        document.getElementById('conversation-detail').classList.remove('visible');
+        document.getElementById('compose-kind').value = currentFilter || 'public';
+        updateComposeOptions();
+    }
+
+    function showConversationsView() {
+        document.getElementById('timeline').style.display = 'none';
+        document.getElementById('load-more').style.display = 'none';
+        document.getElementById('empty-state').style.display = 'none';
+        document.getElementById('conversations-list').style.display = '';
+        document.getElementById('conversation-detail').classList.remove('visible');
+        loadConversations();
+    }
+
+    function showConversationDetail(peerId) {
+        currentView = 'conversation-detail';
+        currentConversationPeerId = peerId;
+        conversationOldestTimestamp = null;
+        document.getElementById('timeline').style.display = 'none';
+        document.getElementById('load-more').style.display = 'none';
+        document.getElementById('conversations-list').style.display = 'none';
+        document.getElementById('conversation-detail').classList.add('visible');
+
+        const peer = peers.find(p => p.peer_id === peerId);
+        const peerName = peer?.display_name || peerId.substring(0, 12) + '...';
+        document.getElementById('conversation-peer-name').textContent = peerName;
+
+        document.getElementById('compose-kind').value = 'direct';
+        updateComposeOptions();
+        loadConversationMessages(peerId, false);
+    }
+
+    function backToConversations() {
+        currentView = 'conversations';
+        currentConversationPeerId = null;
+        showConversationsView();
+    }
+
+    function updateComposeOptions() {
+        const select = document.getElementById('compose-kind');
+        select.innerHTML = '';
+
+        if (currentView === 'conversation-detail') {
+            // In conversation detail, only show direct message option
+            const opt = document.createElement('option');
+            opt.value = 'direct';
+            opt.textContent = 'Direct to ' + (peers.find(p => p.peer_id === currentConversationPeerId)?.display_name || 'peer');
+            select.appendChild(opt);
+        } else if (currentFilter === 'friend_group') {
+            const opt = document.createElement('option');
+            opt.value = 'group';
+            opt.textContent = 'Group';
+            select.appendChild(opt);
+        } else {
+            const opt = document.createElement('option');
+            opt.value = 'public';
+            opt.textContent = 'Public';
+            select.appendChild(opt);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Conversations
+    // ---------------------------------------------------------------------------
+    async function loadConversations() {
+        try {
+            conversations = await apiGet('/api/conversations');
+            renderConversationsList();
+        } catch (e) {
+            showToast('Failed to load conversations');
+            console.error(e);
+        }
+    }
+
+    function renderConversationsList() {
+        const el = document.getElementById('conversations-list');
+        if (conversations.length === 0) {
+            el.innerHTML = '<div class="empty"><div class="icon">&#128172;</div><div>No conversations yet</div></div>';
+            return;
+        }
+
+        el.innerHTML = conversations.map(c => {
+            const displayName = c.display_name || c.peer_id.substring(0, 12) + '...';
+            const preview = c.last_message ? escapeHtml(c.last_message.substring(0, 60)) : 'No messages yet';
+            const unreadClass = c.unread_count > 0 ? 'unread' : '';
+            const unreadBadge = c.unread_count > 0 ? `<span class="unread-badge">${c.unread_count}</span>` : '';
+
+            return `<div class="conversation-item ${unreadClass}" onclick="showConversationDetail('${c.peer_id}')">
+                <div class="conv-header">
+                    <span class="conv-peer">${escapeHtml(displayName)}</span>
+                    <div>
+                        ${unreadBadge}
+                        <span class="conv-time">${timeAgo(c.last_timestamp)}</span>
+                    </div>
+                </div>
+                <div class="conv-preview">${preview}</div>
+            </div>`;
+        }).join('');
+    }
+
+    async function loadConversationMessages(peerId, append) {
+        let url = `/api/conversations/${encodeURIComponent(peerId)}?limit=${PAGE_SIZE}`;
+        if (append && conversationOldestTimestamp) {
+            url += `&before=${conversationOldestTimestamp}`;
+        }
+
+        try {
+            const data = await apiGet(url);
+            if (append) {
+                conversationMessages = conversationMessages.concat(data);
+            } else {
+                conversationMessages = data;
+            }
+            if (conversationMessages.length > 0) {
+                conversationOldestTimestamp = conversationMessages[conversationMessages.length - 1].timestamp;
+            }
+            renderConversationMessages();
+        } catch (e) {
+            showToast('Failed to load conversation');
+            console.error(e);
+        }
+    }
+
+    function renderConversationMessages() {
+        const el = document.getElementById('conversation-messages');
+        const loadMoreEl = document.getElementById('conversation-load-more');
+
+        if (conversationMessages.length === 0) {
+            el.innerHTML = '<div class="empty"><div class="icon">&#128172;</div><div>No messages yet</div></div>';
+            loadMoreEl.style.display = 'none';
+            return;
+        }
+
+        el.innerHTML = conversationMessages.map(renderMessage).join('');
+        loadMoreEl.style.display = conversationMessages.length >= PAGE_SIZE ? '' : 'none';
+    }
+
+    function loadMoreConversationMessages() {
+        if (currentConversationPeerId) {
+            loadConversationMessages(currentConversationPeerId, true);
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // Compose & send
@@ -570,6 +821,9 @@
             if (kind === 'public') {
                 endpoint = '/api/messages/public';
                 payload = { body };
+            } else if (kind === 'direct' && currentConversationPeerId) {
+                endpoint = '/api/messages/direct';
+                payload = { recipient_id: currentConversationPeerId, body };
             } else {
                 showToast('Unsupported message kind for compose');
                 btn.disabled = false;
@@ -578,6 +832,11 @@
             await apiPost(endpoint, payload);
             document.getElementById('compose-body').value = '';
             showToast('Message sent');
+
+            // Reload conversation messages if in conversation detail view
+            if (currentView === 'conversation-detail' && currentConversationPeerId) {
+                loadConversationMessages(currentConversationPeerId, false);
+            }
         } catch (e) {
             showToast('Send failed: ' + e.message);
         } finally {
@@ -629,7 +888,7 @@
             const displayName = p.display_name || p.peer_id.substring(0, 12) + '...';
             const onlineClass = p.online ? 'online' : '';
             const lastSeen = p.last_seen_online ? timeAgo(p.last_seen_online) : 'never';
-            return `<div class="friend-item" data-peer-id="${p.peer_id}">
+            return `<div class="friend-item" data-peer-id="${p.peer_id}" onclick="openConversationWithPeer('${p.peer_id}')">
                 <span class="online-dot ${onlineClass}"></span>
                 <div class="friend-info">
                     <div class="friend-name" title="${p.peer_id}">${escapeHtml(displayName)}</div>
@@ -637,6 +896,13 @@
                 </div>
             </div>`;
         }).join('');
+    }
+
+    function openConversationWithPeer(peerId) {
+        // Switch to conversations view and open this specific conversation
+        document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+        document.querySelector('.filters button[data-view="conversations"]').classList.add('active');
+        showConversationDetail(peerId);
     }
 
     function toggleAddFriendForm() {
@@ -714,12 +980,24 @@
             };
             // Avoid duplicates
             if (!messages.find(m => m.message_id === msg.message_id)) {
-                if (matchesFilter) {
+                if (matchesFilter && currentView === 'timeline') {
                     messages.unshift(msg);
                     renderTimeline();
                 }
                 if (event.sender_id !== myPeerId) {
                     showToast('New message from ' + event.sender_id.substring(0, 12) + '...');
+                }
+            }
+
+            // If it's a direct message, refresh conversations list or conversation detail
+            if (event.message_kind === 'direct') {
+                if (currentView === 'conversations') {
+                    loadConversations();
+                } else if (currentView === 'conversation-detail') {
+                    const otherPeerId = event.sender_id === myPeerId ? msg.recipient_id : event.sender_id;
+                    if (otherPeerId === currentConversationPeerId) {
+                        loadConversationMessages(currentConversationPeerId, false);
+                    }
                 }
             }
         } else if (event.type === 'message_read') {
