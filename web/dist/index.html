@@ -10,82 +10,508 @@
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: #0f1117;
             color: #e0e0e0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
             min-height: 100vh;
         }
-        .container {
-            text-align: center;
-            max-width: 480px;
-            padding: 2rem;
+
+        /* Header */
+        .header {
+            background: #1a1d27;
+            border-bottom: 1px solid #2a2d37;
+            padding: 0.75rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
-        h1 {
-            font-size: 2.5rem;
-            margin-bottom: 0.5rem;
+        .header h1 { font-size: 1.25rem; color: #fff; }
+        .header .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            display: inline-block; margin-right: 6px;
+        }
+        .header .status-dot.ok { background: #4caf50; }
+        .header .status-dot.err { background: #f44336; }
+        .header .peer-id {
+            font-size: 0.75rem; color: #888;
+            max-width: 200px; overflow: hidden; text-overflow: ellipsis;
+        }
+
+        /* Layout */
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 1rem;
+        }
+
+        /* Filter tabs */
+        .filters {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+        }
+        .filters button {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            color: #aaa;
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .filters button:hover { border-color: #555; color: #ddd; }
+        .filters button.active {
+            background: #2a2d47;
+            border-color: #5566cc;
             color: #fff;
         }
-        .subtitle {
-            color: #888;
-            margin-bottom: 2rem;
-        }
-        .status {
-            padding: 1rem;
-            border-radius: 8px;
+
+        /* Compose box */
+        .compose {
             background: #1a1d27;
-            margin-bottom: 1rem;
+            border: 1px solid #2a2d37;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
         }
-        .status .label {
+        .compose textarea {
+            width: 100%;
+            background: #0f1117;
+            border: 1px solid #2a2d37;
+            color: #e0e0e0;
+            border-radius: 6px;
+            padding: 0.6rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            resize: vertical;
+            min-height: 60px;
+        }
+        .compose textarea:focus { outline: none; border-color: #5566cc; }
+        .compose .compose-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 0.5rem;
+        }
+        .compose select {
+            background: #0f1117;
+            border: 1px solid #2a2d37;
+            color: #e0e0e0;
+            border-radius: 4px;
+            padding: 0.3rem 0.5rem;
+            font-size: 0.8rem;
+        }
+        .compose button {
+            background: #5566cc;
+            border: none;
+            color: #fff;
+            padding: 0.4rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
             font-size: 0.85rem;
-            color: #888;
-            margin-bottom: 0.25rem;
         }
-        .status .value {
-            font-size: 1.1rem;
-            word-break: break-all;
+        .compose button:hover { background: #6677dd; }
+        .compose button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Messages */
+        .message {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.5rem;
+            transition: border-color 0.2s;
         }
-        .status .value.ok { color: #4caf50; }
-        .status .value.error { color: #f44336; }
-        .status .value.loading { color: #ff9800; }
-        #identity-section { display: none; }
+        .message:hover { border-color: #3a3d47; }
+        .message.unread { border-left: 3px solid #5566cc; }
+        .message .msg-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.4rem;
+        }
+        .message .msg-badge {
+            font-size: 0.7rem;
+            padding: 0.1rem 0.4rem;
+            border-radius: 4px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .msg-badge.public { background: #1a3a2a; color: #4caf50; }
+        .msg-badge.direct { background: #1a2a3a; color: #42a5f5; }
+        .msg-badge.friend_group { background: #3a2a1a; color: #ff9800; }
+        .msg-badge.meta { background: #2a2a2a; color: #888; }
+        .message .msg-sender {
+            font-size: 0.8rem;
+            color: #aaa;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 160px;
+        }
+        .message .msg-sender.self { color: #5566cc; }
+        .message .msg-time {
+            font-size: 0.75rem;
+            color: #666;
+            margin-left: auto;
+        }
+        .message .msg-body {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        /* Load more */
+        .load-more {
+            text-align: center;
+            padding: 1rem;
+        }
+        .load-more button {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            color: #aaa;
+            padding: 0.5rem 1.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        .load-more button:hover { border-color: #555; color: #ddd; }
+
+        /* Empty state */
+        .empty {
+            text-align: center;
+            color: #666;
+            padding: 3rem 1rem;
+        }
+        .empty .icon { font-size: 2rem; margin-bottom: 0.5rem; }
+
+        /* Toast notification */
+        .toast {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            background: #2a2d47;
+            border: 1px solid #5566cc;
+            color: #e0e0e0;
+            padding: 0.6rem 1rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: all 0.3s;
+            pointer-events: none;
+            z-index: 200;
+        }
+        .toast.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Tenet</h1>
-        <p class="subtitle">Decentralized peer-to-peer social network</p>
+    <div class="header">
+        <div style="display:flex;align-items:center;gap:0.75rem;">
+            <h1>Tenet</h1>
+            <span class="status-dot" id="status-dot"></span>
+        </div>
+        <div class="peer-id" id="peer-id" title=""></div>
+    </div>
 
-        <div class="status">
-            <div class="label">API Status</div>
-            <div class="value loading" id="api-status">Connecting...</div>
+    <div class="container">
+        <!-- Filter tabs -->
+        <div class="filters">
+            <button class="active" data-kind="">All</button>
+            <button data-kind="public">Public</button>
+            <button data-kind="direct">Direct</button>
+            <button data-kind="friend_group">Groups</button>
         </div>
 
-        <div id="identity-section" class="status">
-            <div class="label">Peer ID</div>
-            <div class="value" id="peer-id"></div>
+        <!-- Compose box -->
+        <div class="compose">
+            <textarea id="compose-body" placeholder="Write a message..."></textarea>
+            <div class="compose-actions">
+                <select id="compose-kind">
+                    <option value="public">Public</option>
+                </select>
+                <button id="compose-send" onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+
+        <!-- Timeline -->
+        <div id="timeline"></div>
+
+        <!-- Load more / empty -->
+        <div id="load-more" class="load-more" style="display:none;">
+            <button onclick="loadMore()">Load older messages</button>
+        </div>
+        <div id="empty-state" class="empty" style="display:none;">
+            <div class="icon">&#128172;</div>
+            <div>No messages yet</div>
         </div>
     </div>
 
-    <script>
-        async function checkHealth() {
-            const el = document.getElementById('api-status');
-            try {
-                const res = await fetch('/api/health');
-                const data = await res.json();
-                el.textContent = 'Connected';
-                el.className = 'value ok';
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
 
-                if (data.peer_id) {
-                    document.getElementById('identity-section').style.display = 'block';
-                    document.getElementById('peer-id').textContent = data.peer_id;
-                }
-            } catch (e) {
-                el.textContent = 'Disconnected';
-                el.className = 'value error';
-            }
+    <script>
+    // ---------------------------------------------------------------------------
+    // State
+    // ---------------------------------------------------------------------------
+    let myPeerId = '';
+    let currentFilter = '';
+    let messages = [];
+    let oldestTimestamp = null;
+    let ws = null;
+    const PAGE_SIZE = 50;
+
+    // ---------------------------------------------------------------------------
+    // API helpers
+    // ---------------------------------------------------------------------------
+    async function apiGet(path) {
+        const res = await fetch(path);
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+    }
+    async function apiPost(path, body) {
+        const res = await fetch(path, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: 'request failed' }));
+            throw new Error(err.error || 'request failed');
         }
-        checkHealth();
-        setInterval(checkHealth, 10000);
+        return res.json();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Toast
+    // ---------------------------------------------------------------------------
+    let toastTimer = null;
+    function showToast(msg) {
+        const el = document.getElementById('toast');
+        el.textContent = msg;
+        el.classList.add('visible');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => el.classList.remove('visible'), 3000);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Time formatting
+    // ---------------------------------------------------------------------------
+    function timeAgo(ts) {
+        const diff = Math.floor(Date.now() / 1000) - ts;
+        if (diff < 60) return 'just now';
+        if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+        if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+        return new Date(ts * 1000).toLocaleDateString();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Render
+    // ---------------------------------------------------------------------------
+    function renderMessage(m) {
+        const isSelf = m.sender_id === myPeerId;
+        const senderLabel = isSelf ? 'You' : m.sender_id.substring(0, 12) + '...';
+        const senderClass = isSelf ? 'msg-sender self' : 'msg-sender';
+        const unreadClass = m.is_read ? '' : ' unread';
+        const kindClass = m.message_kind || 'direct';
+
+        return `<div class="message${unreadClass}" data-id="${m.message_id}" onclick="markRead('${m.message_id}')">
+            <div class="msg-header">
+                <span class="msg-badge ${kindClass}">${kindClass}</span>
+                <span class="${senderClass}" title="${m.sender_id}">${senderLabel}</span>
+                <span class="msg-time">${timeAgo(m.timestamp)}</span>
+            </div>
+            <div class="msg-body">${escapeHtml(m.body || '')}</div>
+        </div>`;
+    }
+
+    function escapeHtml(text) {
+        const el = document.createElement('div');
+        el.textContent = text;
+        return el.innerHTML;
+    }
+
+    function renderTimeline() {
+        const el = document.getElementById('timeline');
+        const empty = document.getElementById('empty-state');
+        const loadMoreEl = document.getElementById('load-more');
+
+        if (messages.length === 0) {
+            el.innerHTML = '';
+            empty.style.display = '';
+            loadMoreEl.style.display = 'none';
+            return;
+        }
+
+        empty.style.display = 'none';
+        el.innerHTML = messages.map(renderMessage).join('');
+        loadMoreEl.style.display = messages.length >= PAGE_SIZE ? '' : 'none';
+    }
+
+    // ---------------------------------------------------------------------------
+    // Data loading
+    // ---------------------------------------------------------------------------
+    async function loadMessages(append) {
+        let url = `/api/messages?limit=${PAGE_SIZE}`;
+        if (currentFilter) url += `&kind=${currentFilter}`;
+        if (append && oldestTimestamp) url += `&before=${oldestTimestamp}`;
+
+        try {
+            const data = await apiGet(url);
+            if (append) {
+                messages = messages.concat(data);
+            } else {
+                messages = data;
+            }
+            if (messages.length > 0) {
+                oldestTimestamp = messages[messages.length - 1].timestamp;
+            }
+            renderTimeline();
+        } catch (e) {
+            showToast('Failed to load messages');
+        }
+    }
+
+    function loadMore() {
+        loadMessages(true);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filter
+    // ---------------------------------------------------------------------------
+    document.querySelectorAll('.filters button').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentFilter = btn.dataset.kind;
+            oldestTimestamp = null;
+            loadMessages(false);
+        });
+    });
+
+    // ---------------------------------------------------------------------------
+    // Compose & send
+    // ---------------------------------------------------------------------------
+    async function sendMessage() {
+        const body = document.getElementById('compose-body').value.trim();
+        if (!body) return;
+
+        const kind = document.getElementById('compose-kind').value;
+        const btn = document.getElementById('compose-send');
+        btn.disabled = true;
+
+        try {
+            let endpoint;
+            let payload;
+            if (kind === 'public') {
+                endpoint = '/api/messages/public';
+                payload = { body };
+            } else {
+                showToast('Unsupported message kind for compose');
+                btn.disabled = false;
+                return;
+            }
+            await apiPost(endpoint, payload);
+            document.getElementById('compose-body').value = '';
+            showToast('Message sent');
+        } catch (e) {
+            showToast('Send failed: ' + e.message);
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // Send on Ctrl+Enter / Cmd+Enter
+    document.getElementById('compose-body').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+
+    // ---------------------------------------------------------------------------
+    // Mark as read
+    // ---------------------------------------------------------------------------
+    async function markRead(messageId) {
+        const el = document.querySelector(`.message[data-id="${messageId}"]`);
+        if (el && el.classList.contains('unread')) {
+            el.classList.remove('unread');
+            try {
+                await apiPost(`/api/messages/${messageId}/read`, {});
+            } catch (_) {}
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // WebSocket
+    // ---------------------------------------------------------------------------
+    function connectWs() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/api/ws`);
+
+        ws.onmessage = (e) => {
+            try {
+                const event = JSON.parse(e.data);
+                handleWsEvent(event);
+            } catch (_) {}
+        };
+
+        ws.onclose = () => {
+            setTimeout(connectWs, 3000);
+        };
+        ws.onerror = () => {
+            ws.close();
+        };
+    }
+
+    function handleWsEvent(event) {
+        if (event.type === 'new_message') {
+            // Prepend to timeline if it matches current filter
+            const matchesFilter = !currentFilter || event.message_kind === currentFilter;
+            const msg = {
+                message_id: event.message_id,
+                sender_id: event.sender_id,
+                message_kind: event.message_kind,
+                body: event.body,
+                timestamp: event.timestamp,
+                is_read: event.sender_id === myPeerId,
+            };
+            // Avoid duplicates
+            if (!messages.find(m => m.message_id === msg.message_id)) {
+                if (matchesFilter) {
+                    messages.unshift(msg);
+                    renderTimeline();
+                }
+                if (event.sender_id !== myPeerId) {
+                    showToast('New message from ' + event.sender_id.substring(0, 12) + '...');
+                }
+            }
+        } else if (event.type === 'message_read') {
+            const el = document.querySelector(`.message[data-id="${event.message_id}"]`);
+            if (el) el.classList.remove('unread');
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Init
+    // ---------------------------------------------------------------------------
+    async function init() {
+        try {
+            const health = await apiGet('/api/health');
+            myPeerId = health.peer_id || '';
+            document.getElementById('status-dot').classList.add('ok');
+            const pidEl = document.getElementById('peer-id');
+            pidEl.textContent = myPeerId.substring(0, 16) + '...';
+            pidEl.title = myPeerId;
+        } catch (_) {
+            document.getElementById('status-dot').classList.add('err');
+        }
+
+        await loadMessages(false);
+        connectWs();
+    }
+
+    init();
     </script>
 </body>
 </html>

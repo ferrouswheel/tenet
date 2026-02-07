@@ -29,7 +29,7 @@ path = "src/bin/tenet-web.rs"
 [dependencies]
 base64 = "0.22"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 crossterm = "0.27"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
