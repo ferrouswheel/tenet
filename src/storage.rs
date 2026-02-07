@@ -772,6 +772,41 @@ impl Storage {
         Ok(())
     }
 
+    /// Insert a group and its members atomically within a transaction.
+    /// This ensures that if any member insertion fails, the entire operation is rolled back.
+    pub fn insert_group_with_members(
+        &self,
+        group: &GroupRow,
+        members: &[GroupMemberRow],
+    ) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Insert group
+        tx.execute(
+            "INSERT OR REPLACE INTO groups (group_id, group_key, creator_id, created_at, key_version)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                group.group_id,
+                group.group_key,
+                group.creator_id,
+                group.created_at as i64,
+                group.key_version as i64,
+            ],
+        )?;
+
+        // Insert all members
+        for member in members {
+            tx.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
+                 VALUES (?1, ?2, ?3)",
+                params![member.group_id, member.peer_id, member.joined_at as i64],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_group(&self, group_id: &str) -> Result<Option<GroupRow>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT group_id, group_key, creator_id, created_at, key_version
