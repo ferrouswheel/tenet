@@ -167,6 +167,15 @@ pub struct RelayRow {
     pub enabled: bool,
 }
 
+/// Conversation summary for the conversations list view (Phase 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub peer_id: String,
+    pub last_timestamp: u64,
+    pub last_message: Option<String>,
+    pub unread_count: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Storage handle
 // ---------------------------------------------------------------------------
@@ -531,6 +540,114 @@ impl Storage {
             params![message_id],
         )?;
         Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Conversations (Phase 5)
+    // -----------------------------------------------------------------------
+
+    /// List all direct message conversations grouped by peer.
+    /// Returns one entry per peer with the most recent message details.
+    pub fn list_conversations(
+        &self,
+        identity_id: &str,
+    ) -> Result<Vec<ConversationSummary>, StorageError> {
+        let sql = "
+            SELECT
+                CASE
+                    WHEN sender_id = ?1 THEN recipient_id
+                    ELSE sender_id
+                END as peer_id,
+                MAX(timestamp) as last_timestamp,
+                (SELECT body FROM messages m2
+                 WHERE message_kind = 'direct'
+                   AND ((m2.sender_id = ?1 AND m2.recipient_id = peer_id)
+                     OR (m2.sender_id = peer_id AND m2.recipient_id = ?1))
+                 ORDER BY timestamp DESC LIMIT 1) as last_message,
+                (SELECT COUNT(*) FROM messages m3
+                 WHERE message_kind = 'direct'
+                   AND m3.sender_id = peer_id
+                   AND m3.recipient_id = ?1
+                   AND is_read = 0) as unread_count
+            FROM messages
+            WHERE message_kind = 'direct'
+              AND (sender_id = ?1 OR recipient_id = ?1)
+            GROUP BY peer_id
+            ORDER BY last_timestamp DESC
+        ";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![identity_id], |row| {
+            Ok(ConversationSummary {
+                peer_id: row.get(0)?,
+                last_timestamp: row.get::<_, i64>(1)? as u64,
+                last_message: row.get(2)?,
+                unread_count: row.get::<_, i64>(3)? as u32,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List all messages in a conversation with a specific peer.
+    pub fn list_conversation_messages(
+        &self,
+        identity_id: &str,
+        peer_id: &str,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MessageRow>, StorageError> {
+        let mut sql = String::from(
+            "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope
+             FROM messages
+             WHERE message_kind = 'direct'
+               AND ((sender_id = ?1 AND recipient_id = ?2)
+                 OR (sender_id = ?2 AND recipient_id = ?1))",
+        );
+
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(identity_id.to_string()),
+            Box::new(peer_id.to_string()),
+        ];
+
+        if let Some(b) = before {
+            sql.push_str(" AND timestamp < ?");
+            bind_values.push(Box::new(b as i64));
+        }
+
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        bind_values.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok(MessageRow {
+                message_id: row.get(0)?,
+                sender_id: row.get(1)?,
+                recipient_id: row.get(2)?,
+                message_kind: row.get(3)?,
+                group_id: row.get(4)?,
+                body: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+                received_at: row.get::<_, i64>(7)? as u64,
+                ttl_seconds: row.get::<_, i64>(8)? as u64,
+                is_read: row.get::<_, i32>(9)? != 0,
+                raw_envelope: row.get(10)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
