@@ -728,38 +728,181 @@ function toggleAddFriendForm() {
     form.classList.toggle('visible');
     if (!form.classList.contains('visible')) {
         document.getElementById('friend-peer-id').value = '';
-        document.getElementById('friend-display-name').value = '';
-        document.getElementById('friend-signing-key').value = '';
-        document.getElementById('friend-enc-key').value = '';
+        document.getElementById('friend-message').value = '';
     }
 }
 
-async function addFriend() {
+async function sendFriendRequest() {
     const peerId = document.getElementById('friend-peer-id').value.trim();
-    const displayName = document.getElementById('friend-display-name').value.trim();
-    const signingKey = document.getElementById('friend-signing-key').value.trim();
-    const encKey = document.getElementById('friend-enc-key').value.trim();
+    const message = document.getElementById('friend-message').value.trim();
 
-    if (!peerId || !signingKey) {
-        showToast('Peer ID and Signing Key are required');
+    if (!peerId) {
+        showToast('Peer ID is required');
         return;
     }
 
     try {
-        const payload = {
-            peer_id: peerId,
-            signing_public_key: signingKey,
-        };
-        if (displayName) payload.display_name = displayName;
-        if (encKey) payload.encryption_public_key = encKey;
+        const payload = { peer_id: peerId };
+        if (message) payload.message = message;
 
-        await apiPost('/api/peers', payload);
-        showToast('Friend added successfully');
+        await apiPost('/api/friend-requests', payload);
+        showToast('Friend request sent');
         toggleAddFriendForm();
+        await loadFriendRequests();
+    } catch (e) {
+        showToast('Failed to send request: ' + e.message);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Friend Requests
+// ---------------------------------------------------------------------------
+let friendRequests = [];
+let currentFrTab = 'pending';
+
+function toggleFriendRequests() {
+    const content = document.getElementById('friend-requests-content');
+    content.classList.toggle('visible');
+    if (content.classList.contains('visible')) {
+        loadFriendRequests();
+    }
+}
+
+function switchFrTab(tab) {
+    currentFrTab = tab;
+    document.querySelectorAll('.fr-tab').forEach(b => b.classList.remove('active'));
+    document.querySelector(`.fr-tab[data-fr-tab="${tab}"]`).classList.add('active');
+    renderFriendRequests();
+}
+
+async function loadFriendRequests() {
+    try {
+        friendRequests = await apiGet('/api/friend-requests');
+        updateFrBadge();
+        renderFriendRequests();
+    } catch (e) {
+        console.error('Failed to load friend requests:', e);
+    }
+}
+
+function updateFrBadge() {
+    const pending = friendRequests.filter(r => r.status === 'pending' && r.direction === 'incoming');
+    const badge = document.getElementById('fr-pending-badge');
+    if (pending.length > 0) {
+        badge.textContent = pending.length;
+        badge.style.display = '';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+function renderFriendRequests() {
+    const el = document.getElementById('friend-requests-list');
+    const showHidden = document.getElementById('fr-show-hidden').checked;
+
+    let filtered;
+    if (currentFrTab === 'pending') {
+        filtered = friendRequests.filter(r => r.status === 'pending');
+    } else {
+        // History: accepted + optionally blocked/ignored
+        filtered = friendRequests.filter(r => {
+            if (r.status === 'accepted') return true;
+            if (showHidden && (r.status === 'blocked' || r.status === 'ignored')) return true;
+            return false;
+        });
+    }
+
+    if (filtered.length === 0) {
+        const msg = currentFrTab === 'pending' ? 'No pending requests' : 'No request history';
+        el.innerHTML = '<div class="fr-empty">' + msg + '</div>';
+        return;
+    }
+
+    el.innerHTML = filtered.map(r => {
+        const isIncoming = r.direction === 'incoming';
+        const otherPeerId = isIncoming ? r.from_peer_id : r.to_peer_id;
+        const shortId = otherPeerId.substring(0, 12) + '...';
+        const dirLabel = isIncoming ? 'From' : 'To';
+        const messageHtml = r.message
+            ? '<div class="fr-message">' + escapeHtml(r.message) + '</div>'
+            : '';
+        const timeStr = timeAgo(r.created_at);
+
+        let statusHtml = '';
+        if (r.status === 'pending' && isIncoming) {
+            statusHtml = '<div class="fr-actions">'
+                + '<button class="fr-accept" onclick="acceptFriendRequest(' + r.id + ')">Accept</button>'
+                + '<button class="fr-ignore" onclick="ignoreFriendRequest(' + r.id + ')">Ignore</button>'
+                + '<button class="fr-block" onclick="blockFriendRequest(' + r.id + ')">Block</button>'
+                + '</div>';
+        } else if (r.status === 'pending' && !isIncoming) {
+            statusHtml = '<div class="fr-status pending">Pending</div>';
+        } else {
+            statusHtml = '<div class="fr-status ' + r.status + '">' + r.status.charAt(0).toUpperCase() + r.status.slice(1) + '</div>';
+        }
+
+        return '<div class="fr-item" data-status="' + r.status + '">'
+            + '<div class="fr-item-header">'
+            + '<span class="fr-direction">' + dirLabel + '</span> '
+            + '<span class="fr-peer" title="' + escapeHtml(otherPeerId) + '">' + escapeHtml(shortId) + '</span>'
+            + '<span class="fr-time">' + timeStr + '</span>'
+            + '</div>'
+            + messageHtml
+            + statusHtml
+            + '</div>';
+    }).join('');
+}
+
+async function acceptFriendRequest(id) {
+    try {
+        await apiPost('/api/friend-requests/' + id + '/accept', {});
+        showToast('Friend request accepted');
+        await loadFriendRequests();
         await loadPeers();
     } catch (e) {
-        showToast('Failed to add friend: ' + e.message);
+        showToast('Failed to accept: ' + e.message);
     }
+}
+
+async function ignoreFriendRequest(id) {
+    try {
+        await apiPost('/api/friend-requests/' + id + '/ignore', {});
+        showToast('Friend request ignored');
+        await loadFriendRequests();
+    } catch (e) {
+        showToast('Failed to ignore: ' + e.message);
+    }
+}
+
+async function blockFriendRequest(id) {
+    try {
+        await apiPost('/api/friend-requests/' + id + '/block', {});
+        showToast('Peer blocked');
+        await loadFriendRequests();
+    } catch (e) {
+        showToast('Failed to block: ' + e.message);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copy Peer ID
+// ---------------------------------------------------------------------------
+function copyPeerId() {
+    if (!myPeerId) return;
+    navigator.clipboard.writeText(myPeerId).then(() => {
+        showToast('Peer ID copied to clipboard');
+    }).catch(() => {
+        // Fallback for non-HTTPS contexts
+        const ta = document.createElement('textarea');
+        ta.value = myPeerId;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('Peer ID copied to clipboard');
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +982,13 @@ function handleWsEvent(event) {
             peer.last_seen_online = Math.floor(Date.now() / 1000);
             renderFriendsList();
         }
+    } else if (event.type === 'friend_request_received') {
+        showToast('New friend request from ' + event.from_peer_id.substring(0, 12) + '...');
+        loadFriendRequests();
+    } else if (event.type === 'friend_request_accepted') {
+        showToast('Friend request accepted by ' + event.from_peer_id.substring(0, 12) + '...');
+        loadFriendRequests();
+        loadPeers();
     } else if (event.type === 'relay_status') {
         updateRelayBanner(event.connected, event.relay_url);
         if (event.connected && relayConnected === false) {
@@ -982,6 +1132,10 @@ function showMyProfile() {
     document.getElementById('profile-edit').classList.add('visible');
     document.getElementById('compose-box').style.display = 'none';
 
+    // Show peer ID
+    const editPeerId = document.getElementById('profile-edit-peer-id');
+    if (editPeerId) editPeerId.textContent = myPeerId;
+
     // Pre-fill form
     document.getElementById('profile-display-name').value = (myProfile && myProfile.display_name) || '';
     document.getElementById('profile-bio').value = (myProfile && myProfile.bio) || '';
@@ -1077,6 +1231,11 @@ function renderPeerProfile(profile, peerId) {
         ? `<div style="margin-top:1rem;"><button class="btn-primary" style="background:#5566cc;border:none;color:#fff;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-size:0.85rem;" onclick="backFromProfile();openConversationWithPeer('${peerId}')">Send Message</button></div>`
         : '';
 
+    const peerIdCopyHtml = `<div class="profile-view-id-row">
+        <code class="profile-view-id-full">${escapeHtml(peerId)}</code>
+        <button class="copy-btn" onclick="navigator.clipboard.writeText('${escapeHtml(peerId)}').then(()=>showToast('Peer ID copied'))">Copy</button>
+    </div>`;
+
     el.innerHTML = `
         <div class="profile-view-header">
             ${avatarHtml}
@@ -1085,6 +1244,7 @@ function renderPeerProfile(profile, peerId) {
                 <div class="profile-view-id">${escapeHtml(peerId)}</div>
             </div>
         </div>
+        ${peerIdCopyHtml}
         ${bioHtml}
         ${fieldsHtml}
         ${actionHtml}
@@ -1136,8 +1296,13 @@ async function init() {
         document.getElementById('status-dot').classList.add('err');
     }
 
+    // Display full peer ID in sidebar
+    const peerIdFull = document.getElementById('peer-id-full');
+    if (peerIdFull) peerIdFull.textContent = myPeerId;
+
     await loadPeers();
     await loadMyProfile();
+    await loadFriendRequests();
     await loadMessages(false);
     connectWs();
 }
