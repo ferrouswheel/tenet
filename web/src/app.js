@@ -19,6 +19,7 @@ let repliesOldestTimestamp = null;
 let myProfile = null;
 let viewingProfileId = null;
 let previousView = 'timeline';
+let relayConnected = null; // null = unknown, true/false = status
 const PAGE_SIZE = 50;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
 
@@ -58,6 +59,29 @@ async function apiPut(path, body) {
         throw new Error(err.error || 'request failed');
     }
     return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Relay status banner
+// ---------------------------------------------------------------------------
+function updateRelayBanner(connected, relayUrl) {
+    const banner = document.getElementById('relay-banner');
+    const text = document.getElementById('relay-banner-text');
+    if (connected === null) {
+        // No relay configured
+        banner.style.display = 'none';
+        return;
+    }
+    if (connected) {
+        banner.style.display = 'none';
+        banner.classList.add('connected');
+    } else {
+        banner.style.display = '';
+        banner.classList.remove('connected');
+        const target = relayUrl || 'relay';
+        text.textContent = 'Relay unavailable \u2014 messages cannot be sent or received. Retrying connection to ' + target + '...';
+    }
+    relayConnected = connected;
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +839,13 @@ function handleWsEvent(event) {
             peer.last_seen_online = Math.floor(Date.now() / 1000);
             renderFriendsList();
         }
+    } else if (event.type === 'relay_status') {
+        updateRelayBanner(event.connected, event.relay_url);
+        if (event.connected && relayConnected === false) {
+            showToast('Relay reconnected');
+        } else if (!event.connected && relayConnected !== false) {
+            showToast('Relay disconnected');
+        }
     }
 }
 
@@ -1096,6 +1127,11 @@ async function init() {
         const pidEl = document.getElementById('peer-id');
         pidEl.textContent = myPeerId.substring(0, 16) + '...';
         pidEl.title = myPeerId;
+
+        // Show relay status from health check
+        if (health.relay && health.relay !== 'none') {
+            updateRelayBanner(health.relay_connected, health.relay);
+        }
     } catch (_) {
         document.getElementById('status-dot').classList.add('err');
     }

@@ -50,3 +50,4 @@ tower-http = { version = "0.5", features = ["set-header"] }
 mime_guess = "2"
 ureq = { version = "2.10", features = ["json", "tls"] }
 axum-extra = { version = "0.9", features = ["multipart"] }
+clap = { version = "4", features = ["derive"] }

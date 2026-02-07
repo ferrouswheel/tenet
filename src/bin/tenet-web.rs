@@ -4,7 +4,7 @@
 //! connects to relays, and persists state in SQLite.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use axum_extra::extract::Multipart;
+use clap::Parser;
 use rust_embed::Embed;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -53,6 +54,29 @@ const WS_CHANNEL_CAPACITY: usize = 256;
 const MAX_WS_CONNECTIONS: usize = 8;
 const MAX_ATTACHMENT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB per attachment
 
+/// Web server for the Tenet peer-to-peer social network.
+///
+/// Serves an embedded SPA, provides REST API + WebSocket for messages,
+/// connects to relays, and persists state in SQLite.
+///
+/// Configuration can be set via CLI arguments or environment variables.
+/// CLI arguments take precedence over environment variables.
+#[derive(Parser, Debug)]
+#[command(name = "tenet-web", version, about)]
+struct Cli {
+    /// HTTP server bind address [env: TENET_WEB_BIND] [default: 127.0.0.1:3000]
+    #[arg(long, short = 'b')]
+    bind: Option<String>,
+
+    /// Data directory for identity and database [env: TENET_HOME] [default: ~/.tenet]
+    #[arg(long, short = 'd')]
+    data_dir: Option<PathBuf>,
+
+    /// Relay server URL for fetching and posting messages [env: TENET_RELAY_URL]
+    #[arg(long, short = 'r')]
+    relay_url: Option<String>,
+}
+
 struct Config {
     bind_addr: String,
     data_dir: PathBuf,
@@ -60,20 +84,29 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        let data_dir = std::env::var("TENET_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
+    fn from_cli_and_env(cli: Cli) -> Self {
+        let data_dir = cli
+            .data_dir
+            .or_else(|| std::env::var("TENET_HOME").ok().map(PathBuf::from))
+            .unwrap_or_else(|| {
                 std::env::var("HOME")
                     .map(|h| PathBuf::from(h).join(".tenet"))
                     .unwrap_or_else(|_| PathBuf::from(".tenet"))
             });
 
+        let bind_addr = cli
+            .bind
+            .or_else(|| std::env::var("TENET_WEB_BIND").ok())
+            .unwrap_or_else(|| "127.0.0.1:3000".to_string());
+
+        let relay_url = cli
+            .relay_url
+            .or_else(|| std::env::var("TENET_RELAY_URL").ok());
+
         Self {
-            bind_addr: std::env::var("TENET_WEB_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:3000".to_string()),
+            bind_addr,
             data_dir,
-            relay_url: std::env::var("TENET_RELAY_URL").ok(),
+            relay_url,
         }
     }
 }
@@ -102,6 +135,10 @@ enum WsEvent {
     MessageRead {
         message_id: String,
     },
+    RelayStatus {
+        connected: bool,
+        relay_url: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +151,7 @@ struct AppState {
     relay_url: Option<String>,
     ws_tx: broadcast::Sender<WsEvent>,
     ws_connection_count: Arc<AtomicUsize>,
+    relay_connected: Arc<AtomicBool>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -124,13 +162,18 @@ type SharedState = Arc<Mutex<AppState>>;
 
 #[tokio::main]
 async fn main() {
-    let config = Config::from_env();
+    let cli = Cli::parse();
+    let config = Config::from_cli_and_env(cli);
+
+    eprintln!("tenet-web starting");
+    eprintln!("  data directory: {}", config.data_dir.display());
 
     // Ensure data directory exists
     std::fs::create_dir_all(&config.data_dir).expect("failed to create data directory");
 
     // Open SQLite database
     let db = db_path(&config.data_dir);
+    eprintln!("  database: {}", db.display());
     let storage = Storage::open(&db).expect("failed to open database");
 
     // Run JSON-to-SQLite migration if legacy files exist
@@ -154,7 +197,7 @@ async fn main() {
     // Load or generate identity
     let keypair = match storage.get_identity().expect("failed to read identity") {
         Some(row) => {
-            eprintln!("loaded identity: {}", row.id);
+            eprintln!("  identity: {}", row.id);
             row.to_stored_keypair()
         }
         None => {
@@ -163,7 +206,7 @@ async fn main() {
             storage
                 .insert_identity(&row)
                 .expect("failed to store identity");
-            eprintln!("generated new identity: {}", kp.id);
+            eprintln!("  identity: {} (newly generated)", kp.id);
             kp
         }
     };
@@ -182,10 +225,16 @@ async fn main() {
         });
     }
 
+    match &config.relay_url {
+        Some(url) => eprintln!("  relay: {}", url),
+        None => eprintln!("  relay: none configured (messages will be local-only)"),
+    }
+
     // Create WebSocket broadcast channel
     let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
 
     let ws_connection_count = Arc::new(AtomicUsize::new(0));
+    let relay_connected = Arc::new(AtomicBool::new(false));
 
     let state: SharedState = Arc::new(Mutex::new(AppState {
         storage,
@@ -193,10 +242,25 @@ async fn main() {
         relay_url: config.relay_url.clone(),
         ws_tx,
         ws_connection_count,
+        relay_connected: Arc::clone(&relay_connected),
     }));
 
     // Start background relay sync task
     if config.relay_url.is_some() {
+        // Attempt an initial connectivity check before starting the server
+        let check_state = Arc::clone(&state);
+        match sync_once(&check_state).await {
+            Ok(()) => {
+                relay_connected.store(true, Ordering::Relaxed);
+                eprintln!("  relay status: connected");
+            }
+            Err(e) => {
+                eprintln!("  WARNING: relay is unreachable: {}", e);
+                eprintln!("  The web UI will show the relay as unavailable.");
+                eprintln!("  Background sync will retry with exponential backoff.");
+            }
+        }
+
         let sync_state = Arc::clone(&state);
         tokio::spawn(async move {
             relay_sync_loop(sync_state).await;
@@ -306,7 +370,8 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
 
 async fn health_handler(State(state): State<SharedState>) -> impl IntoResponse {
     let state = state.lock().await;
-    let relay_status = state.relay_url.as_deref().unwrap_or("none");
+    let relay_url = state.relay_url.as_deref().unwrap_or("none");
+    let relay_connected = state.relay_connected.load(Ordering::Relaxed);
     let peer_count = state.storage.list_peers().unwrap_or_default().len();
     let message_count = state
         .storage
@@ -317,7 +382,8 @@ async fn health_handler(State(state): State<SharedState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "peer_id": state.keypair.id,
-        "relay": relay_status,
+        "relay": relay_url,
+        "relay_connected": relay_connected,
         "peers": peer_count,
         "has_messages": message_count > 0,
     });
@@ -2268,16 +2334,49 @@ async fn relay_sync_loop(state: SharedState) {
 
         match sync_once(&state).await {
             Ok(()) => {
+                let was_disconnected = consecutive_failures > 0;
                 consecutive_failures = 0;
+
+                let st = state.lock().await;
+                let was_connected = st.relay_connected.swap(true, Ordering::Relaxed);
+                if !was_connected || was_disconnected {
+                    let relay_url = st.relay_url.clone();
+                    eprintln!(
+                        "relay connected: {}",
+                        relay_url.as_deref().unwrap_or("unknown")
+                    );
+                    let _ = st.ws_tx.send(WsEvent::RelayStatus {
+                        connected: true,
+                        relay_url,
+                    });
+                }
             }
             Err(e) => {
                 consecutive_failures += 1;
-                eprintln!(
-                    "relay sync error (attempt {}, next retry in {}s): {}",
-                    consecutive_failures,
-                    SYNC_INTERVAL_SECS * 2u64.pow(consecutive_failures).min(MAX_BACKOFF_SECS),
-                    e
-                );
+                let next_retry_secs =
+                    (SYNC_INTERVAL_SECS * 2u64.pow(consecutive_failures)).min(MAX_BACKOFF_SECS);
+
+                let st = state.lock().await;
+                let was_connected = st.relay_connected.swap(false, Ordering::Relaxed);
+                if was_connected || consecutive_failures == 1 {
+                    let relay_url = st.relay_url.clone();
+                    eprintln!(
+                        "relay disconnected: {} (attempt {}, next retry in {}s): {}",
+                        relay_url.as_deref().unwrap_or("unknown"),
+                        consecutive_failures,
+                        next_retry_secs,
+                        e
+                    );
+                    let _ = st.ws_tx.send(WsEvent::RelayStatus {
+                        connected: false,
+                        relay_url,
+                    });
+                } else {
+                    eprintln!(
+                        "relay sync error (attempt {}, next retry in {}s): {}",
+                        consecutive_failures, next_retry_secs, e
+                    );
+                }
             }
         }
     }

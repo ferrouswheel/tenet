@@ -30,6 +30,24 @@ body {
     max-width: 200px; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* Relay status banner */
+.relay-banner {
+    background: #3a2a10;
+    border-bottom: 1px solid #6b4f1f;
+    color: #f0c040;
+    padding: 0.5rem 1.5rem;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.relay-banner-icon { font-size: 1rem; }
+.relay-banner.connected {
+    background: #1a3a1a;
+    border-bottom-color: #2a5a2a;
+    color: #4caf50;
+}
+
 /* Layout */
 .container {
     display: flex;
