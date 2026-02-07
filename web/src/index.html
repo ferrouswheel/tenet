@@ -20,6 +20,15 @@
     <div class="container">
         <!-- Sidebar -->
         <div class="sidebar">
+            <!-- My profile (Phase 10) -->
+            <div class="profile-card" id="my-profile-card" onclick="showMyProfile()">
+                <div class="profile-avatar" id="my-profile-avatar"></div>
+                <div class="profile-info">
+                    <div class="profile-name" id="my-profile-name">Me</div>
+                    <div class="profile-bio" id="my-profile-bio"></div>
+                </div>
+            </div>
+
             <!-- Friends list -->
             <div class="friends-panel">
                 <h2>Friends</h2>
@@ -94,6 +103,46 @@
                     <button onclick="backToPublicFeed()">&#8592; Back to Feed</button>
                 </div>
                 <div id="post-detail-content"></div>
+                <!-- Reply compose (Phase 9) -->
+                <div class="reply-compose" id="reply-compose">
+                    <textarea id="reply-body" placeholder="Write a reply..."></textarea>
+                    <div class="reply-compose-actions">
+                        <button onclick="sendReply()">Reply</button>
+                    </div>
+                </div>
+                <!-- Replies list (Phase 9) -->
+                <div id="post-replies"></div>
+                <div id="replies-load-more" class="load-more" style="display:none;">
+                    <button onclick="loadMoreReplies()">Load more replies</button>
+                </div>
+            </div>
+
+            <!-- Profile view (Phase 10) -->
+            <div id="profile-view" class="profile-view">
+                <div class="profile-view-back">
+                    <button onclick="backFromProfile()">&#8592; Back</button>
+                </div>
+                <div id="profile-view-content"></div>
+            </div>
+
+            <!-- Profile edit (Phase 10) -->
+            <div id="profile-edit" class="profile-edit">
+                <div class="profile-edit-back">
+                    <button onclick="backFromProfile()">&#8592; Back</button>
+                    <span>Edit Profile</span>
+                </div>
+                <div class="profile-edit-form">
+                    <label>Display Name</label>
+                    <input type="text" id="profile-display-name" placeholder="Your name" />
+                    <label>Bio</label>
+                    <textarea id="profile-bio" placeholder="Tell us about yourself..." rows="3"></textarea>
+                    <label>Avatar (upload an image first)</label>
+                    <input type="text" id="profile-avatar-hash" placeholder="Attachment content hash" />
+                    <div class="form-actions">
+                        <button class="btn-secondary" onclick="backFromProfile()">Cancel</button>
+                        <button class="btn-primary" onclick="saveProfile()">Save</button>
+                    </div>
+                </div>
             </div>
 
             <!-- Load more / empty -->

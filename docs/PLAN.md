@@ -411,7 +411,7 @@ GET    /api/attachments/:content_hash    -- download attachment
 
 ---
 
-## Phase 8 — Reactions (Upvote / Downvote)
+## Phase 8 — Reactions (Upvote / Downvote) [DONE]
 
 **Goal**: Allow reacting to public posts with upvotes and downvotes.
 
@@ -459,7 +459,7 @@ GET    /api/messages/:message_id/reactions
 
 ---
 
-## Phase 9 — Replies (Threads)
+## Phase 9 — Replies (Threads) [DONE]
 
 **Goal**: Support threaded replies on public and group posts.
 
@@ -500,7 +500,7 @@ POST   /api/messages/:message_id/reply   { body }
 
 ---
 
-## Phase 10 — User Profiles
+## Phase 10 — User Profiles [DONE]
 
 **Goal**: Editable user profiles with separate public and friends-only variants.
 

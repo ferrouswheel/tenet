@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 let myPeerId = '';
 let currentFilter = '';
-let currentView = 'timeline'; // 'timeline', 'conversations', 'conversation-detail', 'post-detail'
+let currentView = 'timeline'; // 'timeline', 'conversations', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
 let messages = [];
 let oldestTimestamp = null;
 let ws = null;
@@ -14,6 +14,11 @@ let conversationMessages = [];
 let conversationOldestTimestamp = null;
 let currentPostId = null;
 let pendingAttachments = []; // { file, previewUrl }
+let currentPostReplies = [];
+let repliesOldestTimestamp = null;
+let myProfile = null;
+let viewingProfileId = null;
+let previousView = 'timeline';
 const PAGE_SIZE = 50;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
 
@@ -40,6 +45,18 @@ async function apiPost(path, body) {
 async function apiDelete(path) {
     const res = await fetch(path, { method: 'DELETE' });
     if (!res.ok) throw new Error(await res.text());
+    return res.json();
+}
+async function apiPut(path, body) {
+    const res = await fetch(path, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'request failed' }));
+        throw new Error(err.error || 'request failed');
+    }
     return res.json();
 }
 
@@ -71,29 +88,110 @@ function timeAgo(ts) {
 // ---------------------------------------------------------------------------
 function renderMessage(m) {
     const isSelf = m.sender_id === myPeerId;
-    const senderLabel = isSelf ? 'You' : m.sender_id.substring(0, 12) + '...';
+    const peer = peers.find(p => p.peer_id === m.sender_id);
+    const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : m.sender_id.substring(0, 12) + '...';
     const senderClass = isSelf ? 'msg-sender self' : 'msg-sender';
     const unreadClass = m.is_read ? '' : ' unread';
     const kindClass = m.message_kind || 'direct';
 
     // Make public messages clickable to view detail
     const isPublic = m.message_kind === 'public';
-    const clickableClass = isPublic ? ' clickable' : '';
-    const onclick = isPublic
+    const isReplyToSomething = !!m.reply_to;
+    const clickableClass = (isPublic && !isReplyToSomething) ? ' clickable' : '';
+    const onclick = (isPublic && !isReplyToSomething)
         ? `onclick="showPostDetail('${m.message_id}')"`
         : `onclick="markRead('${m.message_id}')"`;
 
     const attachmentsHtml = renderAttachments(m.attachments);
+    const reactionsHtml = renderReactions(m);
+    const replyCountHtml = renderReplyCount(m);
 
     return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
         <div class="msg-header">
             <span class="msg-badge ${kindClass}">${kindClass}</span>
-            <span class="${senderClass}" title="${m.sender_id}">${senderLabel}</span>
+            <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${senderLabel}</span>
             <span class="msg-time">${timeAgo(m.timestamp)}</span>
         </div>
         <div class="msg-body">${escapeHtml(m.body || '')}</div>
         ${attachmentsHtml}
+        ${reactionsHtml}
+        ${replyCountHtml}
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Reactions (Phase 8)
+// ---------------------------------------------------------------------------
+function renderReactions(m) {
+    const upvotes = m.upvotes || 0;
+    const downvotes = m.downvotes || 0;
+    const myReaction = m.my_reaction || null;
+
+    return `<div class="msg-reactions" onclick="event.stopPropagation()">
+        <button class="reaction-btn${myReaction === 'upvote' ? ' active' : ''}"
+                onclick="event.stopPropagation();toggleReaction('${m.message_id}','upvote')">
+            &#9650; <span class="count">${upvotes}</span>
+        </button>
+        <button class="reaction-btn${myReaction === 'downvote' ? ' active' : ''}"
+                onclick="event.stopPropagation();toggleReaction('${m.message_id}','downvote')">
+            &#9660; <span class="count">${downvotes}</span>
+        </button>
+    </div>`;
+}
+
+async function toggleReaction(messageId, reaction) {
+    try {
+        // Check current reaction
+        const reactionsData = await apiGet(`/api/messages/${encodeURIComponent(messageId)}/reactions`);
+        const myReaction = reactionsData.my_reaction;
+
+        let result;
+        if (myReaction === reaction) {
+            // Remove existing reaction
+            result = await apiDelete(`/api/messages/${encodeURIComponent(messageId)}/react`);
+        } else {
+            // Set new reaction
+            result = await apiPost(`/api/messages/${encodeURIComponent(messageId)}/react`, { reaction });
+        }
+
+        // Update the message in our local arrays
+        updateMessageReactions(messageId, result.upvotes || 0, result.downvotes || 0,
+            myReaction === reaction ? null : reaction);
+    } catch (e) {
+        showToast('Reaction failed: ' + e.message);
+    }
+}
+
+function updateMessageReactions(messageId, upvotes, downvotes, myReaction) {
+    // Update in messages array
+    const msg = messages.find(m => m.message_id === messageId);
+    if (msg) {
+        msg.upvotes = upvotes;
+        msg.downvotes = downvotes;
+        msg.my_reaction = myReaction;
+    }
+    // Update in conversation messages
+    const convMsg = conversationMessages.find(m => m.message_id === messageId);
+    if (convMsg) {
+        convMsg.upvotes = upvotes;
+        convMsg.downvotes = downvotes;
+        convMsg.my_reaction = myReaction;
+    }
+    // Re-render the specific message reactions in place
+    const el = document.querySelector(`.message[data-id="${messageId}"] .msg-reactions`);
+    if (el) {
+        el.outerHTML = renderReactions({ message_id: messageId, upvotes, downvotes, my_reaction: myReaction });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reply count indicator (Phase 9)
+// ---------------------------------------------------------------------------
+function renderReplyCount(m) {
+    const count = m.reply_count || 0;
+    if (count === 0 || m.reply_to) return '';
+    const label = count === 1 ? '1 reply' : count + ' replies';
+    return `<div class="msg-reply-count" onclick="event.stopPropagation();showPostDetail('${m.message_id}')">${label}</div>`;
 }
 
 function renderAttachments(attachments) {
@@ -186,24 +284,28 @@ document.querySelectorAll('.filters button').forEach(btn => {
     });
 });
 
-function showTimelineView() {
-    document.getElementById('timeline').style.display = '';
-    document.getElementById('load-more').style.display = '';
+function hideAllViews() {
+    document.getElementById('timeline').style.display = 'none';
+    document.getElementById('load-more').style.display = 'none';
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('conversations-list').style.display = 'none';
     document.getElementById('conversation-detail').classList.remove('visible');
     document.getElementById('post-detail').classList.remove('visible');
+    document.getElementById('profile-view').classList.remove('visible');
+    document.getElementById('profile-edit').classList.remove('visible');
+}
+
+function showTimelineView() {
+    hideAllViews();
+    document.getElementById('timeline').style.display = '';
+    document.getElementById('load-more').style.display = '';
     document.getElementById('compose-kind').value = currentFilter || 'public';
     updateComposeOptions();
 }
 
 function showConversationsView() {
-    document.getElementById('timeline').style.display = 'none';
-    document.getElementById('load-more').style.display = 'none';
-    document.getElementById('empty-state').style.display = 'none';
+    hideAllViews();
     document.getElementById('conversations-list').style.display = '';
-    document.getElementById('conversation-detail').classList.remove('visible');
-    document.getElementById('post-detail').classList.remove('visible');
     loadConversations();
 }
 
@@ -211,11 +313,8 @@ function showConversationDetail(peerId) {
     currentView = 'conversation-detail';
     currentConversationPeerId = peerId;
     conversationOldestTimestamp = null;
-    document.getElementById('timeline').style.display = 'none';
-    document.getElementById('load-more').style.display = 'none';
-    document.getElementById('conversations-list').style.display = 'none';
+    hideAllViews();
     document.getElementById('conversation-detail').classList.add('visible');
-    document.getElementById('post-detail').classList.remove('visible');
 
     const peer = peers.find(p => p.peer_id === peerId);
     const peerName = peer?.display_name || peerId.substring(0, 12) + '...';
@@ -236,22 +335,24 @@ function backToConversations() {
 // Post detail view
 // ---------------------------------------------------------------------------
 async function showPostDetail(messageId) {
+    previousView = currentView;
     currentView = 'post-detail';
     currentPostId = messageId;
+    currentPostReplies = [];
+    repliesOldestTimestamp = null;
 
-    document.getElementById('timeline').style.display = 'none';
-    document.getElementById('load-more').style.display = 'none';
-    document.getElementById('conversations-list').style.display = 'none';
-    document.getElementById('conversation-detail').classList.remove('visible');
+    hideAllViews();
     document.getElementById('post-detail').classList.add('visible');
 
     try {
-        const post = await apiGet(`/api/messages/${messageId}`);
+        const post = await apiGet(`/api/messages/${encodeURIComponent(messageId)}`);
         renderPostDetail(post);
         // Mark as read when viewing
         if (!post.is_read) {
-            await apiPost(`/api/messages/${messageId}/read`, {});
+            await apiPost(`/api/messages/${encodeURIComponent(messageId)}/read`, {});
         }
+        // Load replies (Phase 9)
+        await loadReplies(messageId, false);
     } catch (e) {
         showToast('Failed to load post');
         console.error(e);
@@ -261,16 +362,19 @@ async function showPostDetail(messageId) {
 function renderPostDetail(post) {
     const el = document.getElementById('post-detail-content');
     const isSelf = post.sender_id === myPeerId;
-    const senderLabel = isSelf ? 'You' : post.sender_id.substring(0, 12) + '...';
+    const peer = peers.find(p => p.peer_id === post.sender_id);
+    const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : post.sender_id.substring(0, 12) + '...';
     const senderClass = isSelf ? 'post-sender self' : 'post-sender';
     const timestamp = new Date(post.timestamp * 1000).toLocaleString();
     const attachmentsHtml = renderAttachments(post.attachments);
+    const reactionsHtml = renderReactions(post);
 
     el.innerHTML = `
-        <div class="${senderClass}" title="${post.sender_id}">${escapeHtml(senderLabel)}</div>
+        <div class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</div>
         <div class="post-time">${timestamp}</div>
         <div class="post-body">${escapeHtml(post.body || '')}</div>
         ${attachmentsHtml}
+        ${reactionsHtml}
     `;
 }
 
@@ -581,7 +685,7 @@ function renderFriendsList() {
         return `<div class="friend-item" data-peer-id="${p.peer_id}" onclick="openConversationWithPeer('${p.peer_id}')">
             <span class="online-dot ${onlineClass}"></span>
             <div class="friend-info">
-                <div class="friend-name" title="${p.peer_id}">${escapeHtml(displayName)}</div>
+                <div class="friend-name" title="${p.peer_id}" onclick="event.stopPropagation();showPeerProfile('${p.peer_id}')">${escapeHtml(displayName)}</div>
                 <div class="friend-last-seen">${p.online ? 'online' : 'last seen ' + lastSeen}</div>
             </div>
         </div>`;
@@ -715,6 +819,273 @@ function handleWsEvent(event) {
 }
 
 // ---------------------------------------------------------------------------
+// Replies (Phase 9)
+// ---------------------------------------------------------------------------
+async function loadReplies(messageId, append) {
+    let url = `/api/messages/${encodeURIComponent(messageId)}/replies?limit=${PAGE_SIZE}`;
+    if (append && repliesOldestTimestamp) {
+        url += `&before=${repliesOldestTimestamp}`;
+    }
+
+    try {
+        const data = await apiGet(url);
+        if (append) {
+            currentPostReplies = currentPostReplies.concat(data);
+        } else {
+            currentPostReplies = data;
+        }
+        if (currentPostReplies.length > 0) {
+            repliesOldestTimestamp = currentPostReplies[currentPostReplies.length - 1].timestamp + 1;
+        }
+        renderReplies();
+    } catch (e) {
+        console.error('Failed to load replies:', e);
+    }
+}
+
+function renderReplies() {
+    const el = document.getElementById('post-replies');
+    const loadMoreEl = document.getElementById('replies-load-more');
+
+    if (currentPostReplies.length === 0) {
+        el.innerHTML = '';
+        loadMoreEl.style.display = 'none';
+        return;
+    }
+
+    el.innerHTML = currentPostReplies.map(renderReplyItem).join('');
+    loadMoreEl.style.display = currentPostReplies.length >= PAGE_SIZE ? '' : 'none';
+}
+
+function renderReplyItem(m) {
+    const isSelf = m.sender_id === myPeerId;
+    const peer = peers.find(p => p.peer_id === m.sender_id);
+    const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : m.sender_id.substring(0, 12) + '...';
+    const senderClass = isSelf ? 'msg-sender self' : 'msg-sender';
+    const attachmentsHtml = renderAttachments(m.attachments);
+    const reactionsHtml = renderReactions(m);
+
+    return `<div class="reply-item" data-id="${m.message_id}">
+        <div class="msg-header">
+            <span class="${senderClass}" title="${m.sender_id}" onclick="showPeerProfile('${m.sender_id}')">${senderLabel}</span>
+            <span class="msg-time">${timeAgo(m.timestamp)}</span>
+        </div>
+        <div class="msg-body">${escapeHtml(m.body || '')}</div>
+        ${attachmentsHtml}
+        ${reactionsHtml}
+    </div>`;
+}
+
+function loadMoreReplies() {
+    if (currentPostId) {
+        loadReplies(currentPostId, true);
+    }
+}
+
+async function sendReply() {
+    const body = document.getElementById('reply-body').value.trim();
+    if (!body || !currentPostId) return;
+
+    try {
+        await apiPost(`/api/messages/${encodeURIComponent(currentPostId)}/reply`, { body });
+        document.getElementById('reply-body').value = '';
+        showToast('Reply sent');
+        // Reload replies
+        await loadReplies(currentPostId, false);
+    } catch (e) {
+        showToast('Reply failed: ' + e.message);
+    }
+}
+
+// Send reply on Ctrl+Enter in reply box
+document.getElementById('reply-body').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendReply();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Profiles (Phase 10)
+// ---------------------------------------------------------------------------
+async function loadMyProfile() {
+    try {
+        myProfile = await apiGet('/api/profile');
+        renderMyProfileCard();
+    } catch (e) {
+        console.error('Failed to load profile:', e);
+    }
+}
+
+function renderMyProfileCard() {
+    const nameEl = document.getElementById('my-profile-name');
+    const bioEl = document.getElementById('my-profile-bio');
+    const avatarEl = document.getElementById('my-profile-avatar');
+
+    if (myProfile && myProfile.display_name) {
+        nameEl.textContent = myProfile.display_name;
+    } else {
+        nameEl.textContent = myPeerId ? myPeerId.substring(0, 12) + '...' : 'Me';
+    }
+
+    if (myProfile && myProfile.bio) {
+        bioEl.textContent = myProfile.bio.substring(0, 60);
+    } else {
+        bioEl.textContent = 'Click to edit profile';
+    }
+
+    if (myProfile && myProfile.avatar_hash) {
+        avatarEl.innerHTML = `<img src="/api/attachments/${encodeURIComponent(myProfile.avatar_hash)}" alt="" />`;
+    } else {
+        const initial = (myProfile && myProfile.display_name) ? myProfile.display_name[0].toUpperCase() : '?';
+        avatarEl.textContent = initial;
+    }
+}
+
+function showMyProfile() {
+    previousView = currentView;
+    currentView = 'profile-edit';
+    viewingProfileId = myPeerId;
+
+    hideAllViews();
+    document.getElementById('profile-edit').classList.add('visible');
+    document.getElementById('compose-box').style.display = 'none';
+
+    // Pre-fill form
+    document.getElementById('profile-display-name').value = (myProfile && myProfile.display_name) || '';
+    document.getElementById('profile-bio').value = (myProfile && myProfile.bio) || '';
+    document.getElementById('profile-avatar-hash').value = (myProfile && myProfile.avatar_hash) || '';
+}
+
+async function saveProfile() {
+    const displayName = document.getElementById('profile-display-name').value.trim();
+    const bio = document.getElementById('profile-bio').value.trim();
+    const avatarHash = document.getElementById('profile-avatar-hash').value.trim();
+
+    try {
+        myProfile = await apiPut('/api/profile', {
+            display_name: displayName || null,
+            bio: bio || null,
+            avatar_hash: avatarHash || null,
+        });
+        renderMyProfileCard();
+        showToast('Profile saved');
+        backFromProfile();
+    } catch (e) {
+        showToast('Failed to save profile: ' + e.message);
+    }
+}
+
+async function showPeerProfile(peerId) {
+    if (peerId === myPeerId) {
+        showMyProfile();
+        return;
+    }
+
+    previousView = currentView;
+    currentView = 'profile-view';
+    viewingProfileId = peerId;
+
+    hideAllViews();
+    document.getElementById('profile-view').classList.add('visible');
+    document.getElementById('compose-box').style.display = 'none';
+
+    try {
+        const profile = await apiGet(`/api/peers/${encodeURIComponent(peerId)}/profile`);
+        renderPeerProfile(profile, peerId);
+    } catch (e) {
+        const el = document.getElementById('profile-view-content');
+        const peer = peers.find(p => p.peer_id === peerId);
+        const name = (peer && peer.display_name) || peerId.substring(0, 12) + '...';
+        el.innerHTML = `
+            <div class="profile-view-header">
+                <div class="profile-view-avatar">${name[0].toUpperCase()}</div>
+                <div>
+                    <div class="profile-view-name">${escapeHtml(name)}</div>
+                    <div class="profile-view-id">${escapeHtml(peerId)}</div>
+                </div>
+            </div>
+            <div class="profile-view-bio">No profile available.</div>
+        `;
+    }
+}
+
+function renderPeerProfile(profile, peerId) {
+    const el = document.getElementById('profile-view-content');
+    const name = profile.display_name || peerId.substring(0, 12) + '...';
+    const initial = name[0].toUpperCase();
+
+    let avatarHtml;
+    if (profile.avatar_hash) {
+        avatarHtml = `<div class="profile-view-avatar"><img src="/api/attachments/${encodeURIComponent(profile.avatar_hash)}" alt="" /></div>`;
+    } else {
+        avatarHtml = `<div class="profile-view-avatar">${initial}</div>`;
+    }
+
+    const bioHtml = profile.bio
+        ? `<div class="profile-view-bio">${escapeHtml(profile.bio)}</div>`
+        : '<div class="profile-view-bio" style="color:#666">No bio set.</div>';
+
+    // Render public fields
+    let fieldsHtml = '';
+    const publicFields = profile.public_fields || {};
+    const friendsFields = profile.friends_fields || {};
+    const allFields = { ...publicFields, ...friendsFields };
+    const fieldKeys = Object.keys(allFields);
+    if (fieldKeys.length > 0) {
+        fieldsHtml = '<dl class="profile-view-fields">';
+        for (const key of fieldKeys) {
+            fieldsHtml += `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(String(allFields[key]))}</dd>`;
+        }
+        fieldsHtml += '</dl>';
+    }
+
+    // Add button to open conversation if they are a peer
+    const peer = peers.find(p => p.peer_id === peerId);
+    const actionHtml = peer
+        ? `<div style="margin-top:1rem;"><button class="btn-primary" style="background:#5566cc;border:none;color:#fff;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-size:0.85rem;" onclick="backFromProfile();openConversationWithPeer('${peerId}')">Send Message</button></div>`
+        : '';
+
+    el.innerHTML = `
+        <div class="profile-view-header">
+            ${avatarHtml}
+            <div>
+                <div class="profile-view-name">${escapeHtml(name)}</div>
+                <div class="profile-view-id">${escapeHtml(peerId)}</div>
+            </div>
+        </div>
+        ${bioHtml}
+        ${fieldsHtml}
+        ${actionHtml}
+    `;
+}
+
+function backFromProfile() {
+    currentView = previousView || 'timeline';
+    viewingProfileId = null;
+    document.getElementById('profile-view').classList.remove('visible');
+    document.getElementById('profile-edit').classList.remove('visible');
+    document.getElementById('compose-box').style.display = '';
+
+    // Restore previous view
+    if (currentView === 'timeline') {
+        showTimelineView();
+        loadMessages(false);
+    } else if (currentView === 'conversations') {
+        showConversationsView();
+    } else if (currentView === 'conversation-detail' && currentConversationPeerId) {
+        showConversationDetail(currentConversationPeerId);
+    } else if (currentView === 'post-detail' && currentPostId) {
+        // Re-show post detail
+        hideAllViews();
+        document.getElementById('post-detail').classList.add('visible');
+    } else {
+        showTimelineView();
+        loadMessages(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 async function init() {
@@ -730,6 +1101,7 @@ async function init() {
     }
 
     await loadPeers();
+    await loadMyProfile();
     await loadMessages(false);
     connectWs();
 }
