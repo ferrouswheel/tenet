@@ -384,6 +384,58 @@ body {
     font-weight: 500;
 }
 
+/* Post detail view */
+.post-detail {
+    display: none;
+}
+.post-detail.visible { display: block; }
+.post-detail-back {
+    background: #1a1d27;
+    border: 1px solid #2a2d37;
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin-bottom: 1rem;
+}
+.post-detail-back button {
+    background: #2a2d37;
+    border: none;
+    color: #aaa;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+.post-detail-back button:hover { background: #3a3d47; color: #ddd; }
+.post-detail-content {
+    background: #1a1d27;
+    border: 1px solid #2a2d37;
+    border-radius: 8px;
+    padding: 1.5rem;
+}
+.post-detail-content .post-sender {
+    font-size: 0.9rem;
+    color: #aaa;
+    margin-bottom: 0.5rem;
+}
+.post-detail-content .post-sender.self { color: #5566cc; }
+.post-detail-content .post-time {
+    font-size: 0.8rem;
+    color: #666;
+    margin-bottom: 1rem;
+}
+.post-detail-content .post-body {
+    font-size: 1rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.message.clickable {
+    cursor: pointer;
+}
+.message.clickable:hover {
+    border-color: #5566cc;
+}
+
 /* Toast notification */
 .toast {
     position: fixed;

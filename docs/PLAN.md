@@ -344,7 +344,7 @@ GET    /api/conversations/:peer_id       -- messages with a specific peer
 
 ---
 
-## Phase 6 — Public Posting
+## Phase 6 — Public Posting ✅ COMPLETE
 
 **Goal**: Compose and view public posts with a clear distinct presentation.
 
