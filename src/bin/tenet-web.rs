@@ -214,6 +214,21 @@ async fn main() {
             "/api/peers/:peer_id",
             get(get_peer_handler).delete(delete_peer_handler),
         )
+        // Groups API (Phase 4)
+        .route(
+            "/api/groups",
+            get(list_groups_handler).post(create_group_handler),
+        )
+        .route("/api/groups/:group_id", get(get_group_handler))
+        .route(
+            "/api/groups/:group_id/members",
+            post(add_group_member_handler),
+        )
+        .route(
+            "/api/groups/:group_id/members/:peer_id",
+            axum::routing::delete(remove_group_member_handler),
+        )
+        .route("/api/groups/:group_id/leave", post(leave_group_handler))
         // WebSocket (Phase 2)
         .route("/api/ws", get(ws_handler))
         // Static fallback
@@ -783,6 +798,365 @@ async fn delete_peer_handler(
         )
             .into_response(),
         Ok(false) => api_error(StatusCode::NOT_FOUND, "peer not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Groups API
+// ---------------------------------------------------------------------------
+
+async fn list_groups_handler(State(state): State<SharedState>) -> Response {
+    let st = state.lock().await;
+    match st.storage.list_groups() {
+        Ok(groups) => {
+            let json: Vec<serde_json::Value> = groups
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "group_id": g.group_id,
+                        "creator_id": g.creator_id,
+                        "created_at": g.created_at,
+                        "key_version": g.key_version,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn get_group_handler(
+    State(state): State<SharedState>,
+    Path(group_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.get_group(&group_id) {
+        Ok(Some(g)) => {
+            // Get group members
+            let members = st.storage.list_group_members(&group_id).unwrap_or_default();
+            let member_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+
+            let json = serde_json::json!({
+                "group_id": g.group_id,
+                "creator_id": g.creator_id,
+                "created_at": g.created_at,
+                "key_version": g.key_version,
+                "members": member_ids,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "group not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateGroupRequest {
+    group_id: String,
+    member_ids: Vec<String>,
+}
+
+async fn create_group_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<CreateGroupRequest>,
+) -> Response {
+    if req.group_id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "group_id cannot be empty");
+    }
+
+    let st = state.lock().await;
+    let now = now_secs();
+
+    // Generate a new symmetric key for the group
+    let mut group_key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_key);
+
+    // Store group in database
+    let group_row = tenet::storage::GroupRow {
+        group_id: req.group_id.clone(),
+        group_key: group_key.to_vec(),
+        creator_id: st.keypair.id.clone(),
+        created_at: now,
+        key_version: 1,
+    };
+
+    if let Err(e) = st.storage.insert_group(&group_row) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    // Add members to group (including creator)
+    let mut all_members = req.member_ids.clone();
+    if !all_members.contains(&st.keypair.id) {
+        all_members.push(st.keypair.id.clone());
+    }
+
+    for member_id in &all_members {
+        let member_row = tenet::storage::GroupMemberRow {
+            group_id: req.group_id.clone(),
+            peer_id: member_id.clone(),
+            joined_at: now,
+        };
+        if let Err(e) = st.storage.insert_group_member(&member_row) {
+            eprintln!("failed to add group member {}: {}", member_id, e);
+        }
+    }
+
+    // Distribute group key to each member (except creator) via encrypted direct messages
+    for member_id in &req.member_ids {
+        if member_id == &st.keypair.id {
+            continue; // Skip creator
+        }
+
+        // Look up member's public key
+        let peer = match st.storage.get_peer(member_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                eprintln!("peer not found during key distribution: {}", member_id);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("error fetching peer {}: {}", member_id, e);
+                continue;
+            }
+        };
+
+        let recipient_enc_key = match peer.encryption_public_key.as_deref() {
+            Some(k) => k.to_string(),
+            None => {
+                eprintln!("peer {} has no encryption key; skipping", member_id);
+                continue;
+            }
+        };
+
+        // Build a group key distribution message payload
+        let key_distribution = serde_json::json!({
+            "type": "group_key_distribution",
+            "group_id": req.group_id,
+            "group_key": hex::encode(group_key),
+            "key_version": 1,
+            "creator_id": st.keypair.id,
+        });
+
+        let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
+
+        // Encrypt the key distribution message
+        let content_key = generate_content_key();
+        let mut nonce = [0u8; NONCE_SIZE];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+        let payload = match build_encrypted_payload(
+            &key_dist_bytes,
+            &recipient_enc_key,
+            WEB_PAYLOAD_AAD,
+            WEB_HPKE_INFO,
+            &content_key,
+            &nonce,
+            None,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "failed to encrypt key distribution for {}: {}",
+                    member_id, e
+                );
+                continue;
+            }
+        };
+
+        let envelope = match build_envelope_from_payload(
+            st.keypair.id.clone(),
+            member_id.clone(),
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::Direct,
+            None,
+            payload,
+            &st.keypair.signing_private_key_hex,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to build envelope for {}: {}", member_id, e);
+                continue;
+            }
+        };
+
+        // Post to relay
+        if let Some(ref relay_url) = st.relay_url {
+            let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+            if let Ok(json_val) = serde_json::to_value(&envelope) {
+                let _ = ureq::post(&url).send_json(json_val);
+            }
+        }
+    }
+
+    let json = serde_json::json!({
+        "group_id": req.group_id,
+        "creator_id": st.keypair.id,
+        "created_at": now,
+        "key_version": 1,
+        "members": all_members,
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddGroupMemberRequest {
+    peer_id: String,
+}
+
+async fn add_group_member_handler(
+    State(state): State<SharedState>,
+    Path(group_id): Path<String>,
+    axum::Json(req): axum::Json<AddGroupMemberRequest>,
+) -> Response {
+    if req.peer_id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "peer_id cannot be empty");
+    }
+
+    let st = state.lock().await;
+    let now = now_secs();
+
+    // Check if group exists
+    let group = match st.storage.get_group(&group_id) {
+        Ok(Some(g)) => g,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    // Add member to database
+    let member_row = tenet::storage::GroupMemberRow {
+        group_id: group_id.clone(),
+        peer_id: req.peer_id.clone(),
+        joined_at: now,
+    };
+
+    if let Err(e) = st.storage.insert_group_member(&member_row) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    // Send group key to new member via encrypted direct message
+    let peer = match st.storage.get_peer(&req.peer_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "peer not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let recipient_enc_key = match peer.encryption_public_key.as_deref() {
+        Some(k) => k.to_string(),
+        None => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "peer has no encryption key; cannot distribute group key",
+            )
+        }
+    };
+
+    let group_key: [u8; 32] = match group.group_key.try_into() {
+        Ok(k) => k,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
+    };
+
+    // Build a group key distribution message
+    let key_distribution = serde_json::json!({
+        "type": "group_key_distribution",
+        "group_id": group_id,
+        "group_key": hex::encode(group_key),
+        "key_version": group.key_version,
+        "creator_id": group.creator_id,
+    });
+
+    let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
+
+    let content_key = generate_content_key();
+    let mut nonce = [0u8; NONCE_SIZE];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+    let payload = match build_encrypted_payload(
+        &key_dist_bytes,
+        &recipient_enc_key,
+        WEB_PAYLOAD_AAD,
+        WEB_HPKE_INFO,
+        &content_key,
+        &nonce,
+        None,
+    ) {
+        Ok(p) => p,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
+    };
+
+    let envelope = match build_envelope_from_payload(
+        st.keypair.id.clone(),
+        req.peer_id.clone(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Direct,
+        None,
+        payload,
+        &st.keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
+    };
+
+    // Post to relay
+    if let Some(ref relay_url) = st.relay_url {
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    let json = serde_json::json!({
+        "status": "added",
+        "group_id": group_id,
+        "peer_id": req.peer_id,
+    });
+    (StatusCode::OK, axum::Json(json)).into_response()
+}
+
+async fn remove_group_member_handler(
+    State(state): State<SharedState>,
+    Path((group_id, peer_id)): Path<(String, String)>,
+) -> Response {
+    let st = state.lock().await;
+
+    match st.storage.remove_group_member(&group_id, &peer_id) {
+        Ok(true) => {
+            // TODO: Implement key rotation for remaining members
+            let json = serde_json::json!({
+                "status": "removed",
+                "group_id": group_id,
+                "peer_id": peer_id,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "group member not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn leave_group_handler(
+    State(state): State<SharedState>,
+    Path(group_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+
+    match st.storage.remove_group_member(&group_id, &st.keypair.id) {
+        Ok(true) => {
+            // TODO: Implement key rotation for remaining members
+            let json = serde_json::json!({
+                "status": "left",
+                "group_id": group_id,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not a member of this group"),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
