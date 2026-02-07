@@ -321,7 +321,7 @@ DELETE /api/groups/:group_id/members/:peer_id -- remove member
 
 ---
 
-## Phase 5 — Direct Messaging
+## Phase 5 — Direct Messaging ✅ COMPLETE
 
 **Goal**: Dedicated direct message conversation view.
 
