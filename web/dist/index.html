@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tenet</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f1117;
+            color: #e0e0e0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            text-align: center;
+            max-width: 480px;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            color: #fff;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 2rem;
+        }
+        .status {
+            padding: 1rem;
+            border-radius: 8px;
+            background: #1a1d27;
+            margin-bottom: 1rem;
+        }
+        .status .label {
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 0.25rem;
+        }
+        .status .value {
+            font-size: 1.1rem;
+            word-break: break-all;
+        }
+        .status .value.ok { color: #4caf50; }
+        .status .value.error { color: #f44336; }
+        .status .value.loading { color: #ff9800; }
+        #identity-section { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Tenet</h1>
+        <p class="subtitle">Decentralized peer-to-peer social network</p>
+
+        <div class="status">
+            <div class="label">API Status</div>
+            <div class="value loading" id="api-status">Connecting...</div>
+        </div>
+
+        <div id="identity-section" class="status">
+            <div class="label">Peer ID</div>
+            <div class="value" id="peer-id"></div>
+        </div>
+    </div>
+
+    <script>
+        async function checkHealth() {
+            const el = document.getElementById('api-status');
+            try {
+                const res = await fetch('/api/health');
+                const data = await res.json();
+                el.textContent = 'Connected';
+                el.className = 'value ok';
+
+                if (data.peer_id) {
+                    document.getElementById('identity-section').style.display = 'block';
+                    document.getElementById('peer-id').textContent = data.peer_id;
+                }
+            } catch (e) {
+                el.textContent = 'Disconnected';
+                el.className = 'value error';
+            }
+        }
+        checkHealth();
+        setInterval(checkHealth, 10000);
+    </script>
+</body>
+</html>

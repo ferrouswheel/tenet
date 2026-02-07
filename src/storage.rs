@@ -1,0 +1,1404 @@
+//! SQLite storage layer for tenet.
+//!
+//! Provides a shared database that both the web server and CLI can use.
+//! Handles schema creation, CRUD operations for all entity types, and
+//! one-time migration from the legacy JSON/JSONL file format.
+
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use crate::crypto::StoredKeypair;
+use crate::protocol::{Envelope, MessageKind};
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum StorageError {
+    Sqlite(rusqlite::Error),
+    Io(std::io::Error),
+    Serde(serde_json::Error),
+    NotFound(String),
+    AlreadyExists(String),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageError::Sqlite(e) => write!(f, "sqlite error: {e}"),
+            StorageError::Io(e) => write!(f, "io error: {e}"),
+            StorageError::Serde(e) => write!(f, "serialization error: {e}"),
+            StorageError::NotFound(msg) => write!(f, "not found: {msg}"),
+            StorageError::AlreadyExists(msg) => write!(f, "already exists: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self {
+        StorageError::Sqlite(e)
+    }
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(e: std::io::Error) -> Self {
+        StorageError::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for StorageError {
+    fn from(e: serde_json::Error) -> Self {
+        StorageError::Serde(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row types
+// ---------------------------------------------------------------------------
+
+/// Identity row stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityRow {
+    pub id: String,
+    pub public_key: String,
+    pub private_key: String,
+    pub signing_pub: String,
+    pub signing_priv: String,
+    pub created_at: u64,
+}
+
+impl From<&StoredKeypair> for IdentityRow {
+    fn from(kp: &StoredKeypair) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            id: kp.id.clone(),
+            public_key: kp.public_key_hex.clone(),
+            private_key: kp.private_key_hex.clone(),
+            signing_pub: kp.signing_public_key_hex.clone(),
+            signing_priv: kp.signing_private_key_hex.clone(),
+            created_at: now,
+        }
+    }
+}
+
+impl IdentityRow {
+    pub fn to_stored_keypair(&self) -> StoredKeypair {
+        StoredKeypair {
+            id: self.id.clone(),
+            public_key_hex: self.public_key.clone(),
+            private_key_hex: self.private_key.clone(),
+            signing_public_key_hex: self.signing_pub.clone(),
+            signing_private_key_hex: self.signing_priv.clone(),
+        }
+    }
+}
+
+/// Peer row stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRow {
+    pub peer_id: String,
+    pub display_name: Option<String>,
+    pub signing_public_key: String,
+    pub encryption_public_key: Option<String>,
+    pub added_at: u64,
+    pub is_friend: bool,
+    pub last_seen_online: Option<u64>,
+    pub online: bool,
+}
+
+/// Message row stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRow {
+    pub message_id: String,
+    pub sender_id: String,
+    pub recipient_id: String,
+    pub message_kind: String,
+    pub group_id: Option<String>,
+    pub body: Option<String>,
+    pub timestamp: u64,
+    pub received_at: u64,
+    pub ttl_seconds: u64,
+    pub is_read: bool,
+    pub raw_envelope: Option<String>,
+}
+
+/// Group row stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupRow {
+    pub group_id: String,
+    pub group_key: Vec<u8>,
+    pub creator_id: String,
+    pub created_at: u64,
+    pub key_version: u32,
+}
+
+/// Group member row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMemberRow {
+    pub group_id: String,
+    pub peer_id: String,
+    pub joined_at: u64,
+}
+
+/// Outbox row for sent messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxRow {
+    pub message_id: String,
+    pub envelope: String,
+    pub sent_at: u64,
+    pub delivered: bool,
+}
+
+/// Relay configuration row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayRow {
+    pub url: String,
+    pub added_at: u64,
+    pub last_sync: Option<u64>,
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Storage handle
+// ---------------------------------------------------------------------------
+
+/// Main storage handle wrapping a SQLite connection.
+pub struct Storage {
+    conn: Connection,
+}
+
+impl Storage {
+    /// Open or create a database at the given path. Creates schema if needed.
+    pub fn open(path: &Path) -> Result<Self, StorageError> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let storage = Self { conn };
+        storage.create_schema()?;
+        Ok(storage)
+    }
+
+    /// Create an in-memory database (useful for testing).
+    pub fn open_in_memory() -> Result<Self, StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let storage = Self { conn };
+        storage.create_schema()?;
+        Ok(storage)
+    }
+
+    fn create_schema(&self) -> Result<(), StorageError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS identity (
+                id          TEXT PRIMARY KEY,
+                public_key  TEXT NOT NULL,
+                private_key TEXT NOT NULL,
+                signing_pub TEXT NOT NULL,
+                signing_priv TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS peers (
+                peer_id             TEXT PRIMARY KEY,
+                display_name        TEXT,
+                signing_public_key  TEXT NOT NULL,
+                encryption_public_key TEXT,
+                added_at            INTEGER NOT NULL,
+                is_friend           INTEGER NOT NULL DEFAULT 1,
+                last_seen_online    INTEGER,
+                online              INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id      TEXT PRIMARY KEY,
+                sender_id       TEXT NOT NULL,
+                recipient_id    TEXT NOT NULL,
+                message_kind    TEXT NOT NULL,
+                group_id        TEXT,
+                body            TEXT,
+                timestamp       INTEGER NOT NULL,
+                received_at     INTEGER NOT NULL,
+                ttl_seconds     INTEGER NOT NULL,
+                is_read         INTEGER NOT NULL DEFAULT 0,
+                raw_envelope    TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_recipient
+                ON messages(recipient_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_sender
+                ON messages(sender_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_kind
+                ON messages(message_kind, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_messages_group
+                ON messages(group_id, timestamp);
+
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id    TEXT PRIMARY KEY,
+                group_key   BLOB NOT NULL,
+                creator_id  TEXT NOT NULL,
+                created_at  INTEGER NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id    TEXT NOT NULL REFERENCES groups(group_id),
+                peer_id     TEXT NOT NULL,
+                joined_at   INTEGER NOT NULL,
+                PRIMARY KEY (group_id, peer_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS outbox (
+                message_id  TEXT PRIMARY KEY,
+                envelope    TEXT NOT NULL,
+                sent_at     INTEGER NOT NULL,
+                delivered   INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS relays (
+                url         TEXT PRIMARY KEY,
+                added_at    INTEGER NOT NULL,
+                last_sync   INTEGER,
+                enabled     INTEGER NOT NULL DEFAULT 1
+            );
+            ",
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity CRUD
+    // -----------------------------------------------------------------------
+
+    /// Insert a new identity. Returns error if one already exists.
+    pub fn insert_identity(&self, row: &IdentityRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO identity (id, public_key, private_key, signing_pub, signing_priv, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.id,
+                row.public_key,
+                row.private_key,
+                row.signing_pub,
+                row.signing_priv,
+                row.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load the first identity from the database (single-user model).
+    pub fn get_identity(&self) -> Result<Option<IdentityRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, public_key, private_key, signing_pub, signing_priv, created_at
+             FROM identity LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row([], |row| {
+                Ok(IdentityRow {
+                    id: row.get(0)?,
+                    public_key: row.get(1)?,
+                    private_key: row.get(2)?,
+                    signing_pub: row.get(3)?,
+                    signing_priv: row.get(4)?,
+                    created_at: row.get::<_, i64>(5)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    // -----------------------------------------------------------------------
+    // Peers CRUD
+    // -----------------------------------------------------------------------
+
+    pub fn insert_peer(&self, row: &PeerRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO peers
+             (peer_id, display_name, signing_public_key, encryption_public_key,
+              added_at, is_friend, last_seen_online, online)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                row.peer_id,
+                row.display_name,
+                row.signing_public_key,
+                row.encryption_public_key,
+                row.added_at as i64,
+                row.is_friend as i32,
+                row.last_seen_online.map(|t| t as i64),
+                row.online as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_peer(&self, peer_id: &str) -> Result<Option<PeerRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_id, display_name, signing_public_key, encryption_public_key,
+                    added_at, is_friend, last_seen_online, online
+             FROM peers WHERE peer_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![peer_id], |row| {
+                Ok(PeerRow {
+                    peer_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    signing_public_key: row.get(2)?,
+                    encryption_public_key: row.get(3)?,
+                    added_at: row.get::<_, i64>(4)? as u64,
+                    is_friend: row.get::<_, i32>(5)? != 0,
+                    last_seen_online: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+                    online: row.get::<_, i32>(7)? != 0,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_peers(&self) -> Result<Vec<PeerRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_id, display_name, signing_public_key, encryption_public_key,
+                    added_at, is_friend, last_seen_online, online
+             FROM peers ORDER BY added_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PeerRow {
+                peer_id: row.get(0)?,
+                display_name: row.get(1)?,
+                signing_public_key: row.get(2)?,
+                encryption_public_key: row.get(3)?,
+                added_at: row.get::<_, i64>(4)? as u64,
+                is_friend: row.get::<_, i32>(5)? != 0,
+                last_seen_online: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+                online: row.get::<_, i32>(7)? != 0,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn delete_peer(&self, peer_id: &str) -> Result<bool, StorageError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM peers WHERE peer_id = ?1", params![peer_id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn update_peer_online(
+        &self,
+        peer_id: &str,
+        online: bool,
+        last_seen: u64,
+    ) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE peers SET online = ?1, last_seen_online = ?2 WHERE peer_id = ?3",
+            params![online as i32, last_seen as i64, peer_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Messages CRUD
+    // -----------------------------------------------------------------------
+
+    pub fn insert_message(&self, row: &MessageRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO messages
+             (message_id, sender_id, recipient_id, message_kind, group_id,
+              body, timestamp, received_at, ttl_seconds, is_read, raw_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                row.message_id,
+                row.sender_id,
+                row.recipient_id,
+                row.message_kind,
+                row.group_id,
+                row.body,
+                row.timestamp as i64,
+                row.received_at as i64,
+                row.ttl_seconds as i64,
+                row.is_read as i32,
+                row.raw_envelope,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_message(&self, message_id: &str) -> Result<Option<MessageRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope
+             FROM messages WHERE message_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![message_id], |row| {
+                Ok(MessageRow {
+                    message_id: row.get(0)?,
+                    sender_id: row.get(1)?,
+                    recipient_id: row.get(2)?,
+                    message_kind: row.get(3)?,
+                    group_id: row.get(4)?,
+                    body: row.get(5)?,
+                    timestamp: row.get::<_, i64>(6)? as u64,
+                    received_at: row.get::<_, i64>(7)? as u64,
+                    ttl_seconds: row.get::<_, i64>(8)? as u64,
+                    is_read: row.get::<_, i32>(9)? != 0,
+                    raw_envelope: row.get(10)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List messages with optional filters.
+    pub fn list_messages(
+        &self,
+        kind: Option<&str>,
+        group_id: Option<&str>,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MessageRow>, StorageError> {
+        let mut sql = String::from(
+            "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope
+             FROM messages WHERE 1=1",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(k) = kind {
+            sql.push_str(" AND message_kind = ?");
+            bind_values.push(Box::new(k.to_string()));
+        }
+        if let Some(g) = group_id {
+            sql.push_str(" AND group_id = ?");
+            bind_values.push(Box::new(g.to_string()));
+        }
+        if let Some(b) = before {
+            sql.push_str(" AND timestamp < ?");
+            bind_values.push(Box::new(b as i64));
+        }
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        bind_values.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok(MessageRow {
+                message_id: row.get(0)?,
+                sender_id: row.get(1)?,
+                recipient_id: row.get(2)?,
+                message_kind: row.get(3)?,
+                group_id: row.get(4)?,
+                body: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+                received_at: row.get::<_, i64>(7)? as u64,
+                ttl_seconds: row.get::<_, i64>(8)? as u64,
+                is_read: row.get::<_, i32>(9)? != 0,
+                raw_envelope: row.get(10)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn has_message(&self, message_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn mark_message_read(&self, message_id: &str) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE messages SET is_read = 1 WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Groups CRUD
+    // -----------------------------------------------------------------------
+
+    pub fn insert_group(&self, row: &GroupRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO groups (group_id, group_key, creator_id, created_at, key_version)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.group_id,
+                row.group_key,
+                row.creator_id,
+                row.created_at as i64,
+                row.key_version as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_group(&self, group_id: &str) -> Result<Option<GroupRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, group_key, creator_id, created_at, key_version
+             FROM groups WHERE group_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![group_id], |row| {
+                Ok(GroupRow {
+                    group_id: row.get(0)?,
+                    group_key: row.get(1)?,
+                    creator_id: row.get(2)?,
+                    created_at: row.get::<_, i64>(3)? as u64,
+                    key_version: row.get::<_, i64>(4)? as u32,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_groups(&self) -> Result<Vec<GroupRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, group_key, creator_id, created_at, key_version
+             FROM groups ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GroupRow {
+                group_id: row.get(0)?,
+                group_key: row.get(1)?,
+                creator_id: row.get(2)?,
+                created_at: row.get::<_, i64>(3)? as u64,
+                key_version: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn delete_group(&self, group_id: &str) -> Result<bool, StorageError> {
+        self.conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1",
+            params![group_id],
+        )?;
+        let affected = self
+            .conn
+            .execute("DELETE FROM groups WHERE group_id = ?1", params![group_id])?;
+        Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Group members
+    // -----------------------------------------------------------------------
+
+    pub fn insert_group_member(&self, row: &GroupMemberRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
+             VALUES (?1, ?2, ?3)",
+            params![row.group_id, row.peer_id, row.joined_at as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_group_members(&self, group_id: &str) -> Result<Vec<GroupMemberRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, peer_id, joined_at
+             FROM group_members WHERE group_id = ?1 ORDER BY joined_at",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| {
+            Ok(GroupMemberRow {
+                group_id: row.get(0)?,
+                peer_id: row.get(1)?,
+                joined_at: row.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn remove_group_member(&self, group_id: &str, peer_id: &str) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND peer_id = ?2",
+            params![group_id, peer_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Outbox CRUD
+    // -----------------------------------------------------------------------
+
+    pub fn insert_outbox(&self, row: &OutboxRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO outbox (message_id, envelope, sent_at, delivered)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                row.message_id,
+                row.envelope,
+                row.sent_at as i64,
+                row.delivered as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_outbox(&self) -> Result<Vec<OutboxRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, envelope, sent_at, delivered
+             FROM outbox ORDER BY sent_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OutboxRow {
+                message_id: row.get(0)?,
+                envelope: row.get(1)?,
+                sent_at: row.get::<_, i64>(2)? as u64,
+                delivered: row.get::<_, i32>(3)? != 0,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn mark_outbox_delivered(&self, message_id: &str) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE outbox SET delivered = 1 WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Relays CRUD
+    // -----------------------------------------------------------------------
+
+    pub fn insert_relay(&self, row: &RelayRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO relays (url, added_at, last_sync, enabled)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                row.url,
+                row.added_at as i64,
+                row.last_sync.map(|t| t as i64),
+                row.enabled as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_relays(&self) -> Result<Vec<RelayRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, added_at, last_sync, enabled
+             FROM relays ORDER BY added_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RelayRow {
+                url: row.get(0)?,
+                added_at: row.get::<_, i64>(1)? as u64,
+                last_sync: row.get::<_, Option<i64>>(2)?.map(|t| t as u64),
+                enabled: row.get::<_, i32>(3)? != 0,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn list_enabled_relays(&self) -> Result<Vec<RelayRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, added_at, last_sync, enabled
+             FROM relays WHERE enabled = 1 ORDER BY added_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RelayRow {
+                url: row.get(0)?,
+                added_at: row.get::<_, i64>(1)? as u64,
+                last_sync: row.get::<_, Option<i64>>(2)?.map(|t| t as u64),
+                enabled: row.get::<_, i32>(3)? != 0,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn update_relay_last_sync(&self, url: &str, last_sync: u64) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE relays SET last_sync = ?1 WHERE url = ?2",
+            params![last_sync as i64, url],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn delete_relay(&self, url: &str) -> Result<bool, StorageError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM relays WHERE url = ?1", params![url])?;
+        Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON-to-SQLite migration
+    // -----------------------------------------------------------------------
+
+    /// Migrate legacy JSON/JSONL files into the database.
+    ///
+    /// Reads identity.json, peers.json, inbox.jsonl, outbox.jsonl from
+    /// `data_dir` and imports them. Renames migrated files to *.migrated.
+    pub fn migrate_from_json(&self, data_dir: &Path) -> Result<MigrationReport, StorageError> {
+        let mut report = MigrationReport::default();
+
+        // 1. Migrate identity.json
+        let identity_path = data_dir.join("identity.json");
+        if identity_path.exists() {
+            let data = std::fs::read_to_string(&identity_path)?;
+            let kp: StoredKeypair = serde_json::from_str(&data)?;
+            let row = IdentityRow::from(&kp);
+            if self.get_identity()?.is_none() {
+                self.insert_identity(&row)?;
+                report.identity_migrated = true;
+            }
+            std::fs::rename(&identity_path, data_dir.join("identity.json.migrated"))?;
+        }
+
+        // 2. Migrate peers.json
+        let peers_path = data_dir.join("peers.json");
+        if peers_path.exists() {
+            let data = std::fs::read_to_string(&peers_path)?;
+            let peers: Vec<LegacyPeer> = serde_json::from_str(&data)?;
+            for peer in &peers {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let row = PeerRow {
+                    peer_id: peer.id.clone(),
+                    display_name: Some(peer.name.clone()),
+                    signing_public_key: peer.public_key_hex.clone(),
+                    encryption_public_key: None,
+                    added_at: now,
+                    is_friend: true,
+                    last_seen_online: None,
+                    online: false,
+                };
+                self.insert_peer(&row)?;
+            }
+            report.peers_migrated = peers.len();
+            std::fs::rename(&peers_path, data_dir.join("peers.json.migrated"))?;
+        }
+
+        // 3. Migrate inbox.jsonl
+        let inbox_path = data_dir.join("inbox.jsonl");
+        if inbox_path.exists() {
+            let data = std::fs::read_to_string(&inbox_path)?;
+            for line in data.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(msg) = serde_json::from_str::<LegacyReceivedMessage>(line) {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let msg_id = format!("migrated-inbox-{}", report.inbox_migrated);
+                    let row = MessageRow {
+                        message_id: msg_id,
+                        sender_id: msg.sender_id,
+                        recipient_id: String::new(),
+                        message_kind: "direct".to_string(),
+                        group_id: None,
+                        body: Some(msg.message),
+                        timestamp: msg.timestamp,
+                        received_at: now,
+                        ttl_seconds: 3600,
+                        is_read: false,
+                        raw_envelope: None,
+                    };
+                    self.insert_message(&row)?;
+                    report.inbox_migrated += 1;
+                }
+            }
+            std::fs::rename(&inbox_path, data_dir.join("inbox.jsonl.migrated"))?;
+        }
+
+        // 4. Migrate outbox.jsonl
+        let outbox_path = data_dir.join("outbox.jsonl");
+        if outbox_path.exists() {
+            let data = std::fs::read_to_string(&outbox_path)?;
+            for line in data.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(envelope) = serde_json::from_str::<Envelope>(line) {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let row = OutboxRow {
+                        message_id: envelope.header.message_id.0.clone(),
+                        envelope: line.to_string(),
+                        sent_at: now,
+                        delivered: true,
+                    };
+                    self.insert_outbox(&row)?;
+                    report.outbox_migrated += 1;
+                }
+            }
+            std::fs::rename(&outbox_path, data_dir.join("outbox.jsonl.migrated"))?;
+        }
+
+        Ok(report)
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for envelope ingestion
+    // -----------------------------------------------------------------------
+
+    /// Store a received envelope as a message row.
+    pub fn store_received_envelope(
+        &self,
+        envelope: &Envelope,
+        decrypted_body: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let kind_str = message_kind_to_str(&envelope.header.message_kind);
+        let raw = serde_json::to_string(envelope)?;
+        let row = MessageRow {
+            message_id: envelope.header.message_id.0.clone(),
+            sender_id: envelope.header.sender_id.clone(),
+            recipient_id: envelope.header.recipient_id.clone(),
+            message_kind: kind_str.to_string(),
+            group_id: envelope.header.group_id.clone(),
+            body: decrypted_body.map(|s| s.to_string()),
+            timestamp: envelope.header.timestamp,
+            received_at: now,
+            ttl_seconds: envelope.header.ttl_seconds,
+            is_read: false,
+            raw_envelope: Some(raw),
+        };
+        self.insert_message(&row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy types for migration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct LegacyPeer {
+    name: String,
+    id: String,
+    public_key_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyReceivedMessage {
+    sender_id: String,
+    timestamp: u64,
+    message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Migration report
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct MigrationReport {
+    pub identity_migrated: bool,
+    pub peers_migrated: usize,
+    pub inbox_migrated: usize,
+    pub outbox_migrated: usize,
+}
+
+impl MigrationReport {
+    pub fn is_empty(&self) -> bool {
+        !self.identity_migrated
+            && self.peers_migrated == 0
+            && self.inbox_migrated == 0
+            && self.outbox_migrated == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn message_kind_to_str(kind: &MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Public => "public",
+        MessageKind::Meta => "meta",
+        MessageKind::Direct => "direct",
+        MessageKind::FriendGroup => "friend_group",
+        MessageKind::StoreForPeer => "store_for_peer",
+    }
+}
+
+/// Resolve the database path: `{data_dir}/tenet.db`.
+pub fn db_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tenet.db")
+}
+
+/// Resolve the tenet home directory from environment or default.
+pub fn resolve_data_dir() -> PathBuf {
+    std::env::var("TENET_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs_or_default().join(".tenet"))
+}
+
+fn dirs_or_default() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn test_schema_creation() {
+        let storage = Storage::open_in_memory().unwrap();
+        // Schema should already be created — verify by inserting data
+        let row = RelayRow {
+            url: "http://localhost:8080".to_string(),
+            added_at: now_secs(),
+            last_sync: None,
+            enabled: true,
+        };
+        storage.insert_relay(&row).unwrap();
+    }
+
+    #[test]
+    fn test_identity_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // No identity initially
+        assert!(storage.get_identity().unwrap().is_none());
+
+        let row = IdentityRow {
+            id: "test-id".to_string(),
+            public_key: "pub-hex".to_string(),
+            private_key: "priv-hex".to_string(),
+            signing_pub: "sign-pub-hex".to_string(),
+            signing_priv: "sign-priv-hex".to_string(),
+            created_at: now_secs(),
+        };
+        storage.insert_identity(&row).unwrap();
+
+        let loaded = storage.get_identity().unwrap().unwrap();
+        assert_eq!(loaded.id, "test-id");
+        assert_eq!(loaded.public_key, "pub-hex");
+        assert_eq!(loaded.signing_pub, "sign-pub-hex");
+    }
+
+    #[test]
+    fn test_peer_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let peer = PeerRow {
+            peer_id: "peer-1".to_string(),
+            display_name: Some("Alice".to_string()),
+            signing_public_key: "sign-key".to_string(),
+            encryption_public_key: Some("enc-key".to_string()),
+            added_at: now,
+            is_friend: true,
+            last_seen_online: None,
+            online: false,
+        };
+        storage.insert_peer(&peer).unwrap();
+
+        // Get peer
+        let loaded = storage.get_peer("peer-1").unwrap().unwrap();
+        assert_eq!(loaded.display_name, Some("Alice".to_string()));
+        assert!(loaded.is_friend);
+        assert!(!loaded.online);
+
+        // List peers
+        let peers = storage.list_peers().unwrap();
+        assert_eq!(peers.len(), 1);
+
+        // Update online status
+        storage.update_peer_online("peer-1", true, now).unwrap();
+        let loaded = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(loaded.online);
+        assert_eq!(loaded.last_seen_online, Some(now));
+
+        // Delete peer
+        assert!(storage.delete_peer("peer-1").unwrap());
+        assert!(storage.get_peer("peer-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_message_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let msg = MessageRow {
+            message_id: "msg-1".to_string(),
+            sender_id: "sender".to_string(),
+            recipient_id: "recipient".to_string(),
+            message_kind: "direct".to_string(),
+            group_id: None,
+            body: Some("Hello".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: None,
+        };
+        storage.insert_message(&msg).unwrap();
+
+        // Get message
+        let loaded = storage.get_message("msg-1").unwrap().unwrap();
+        assert_eq!(loaded.body, Some("Hello".to_string()));
+        assert!(!loaded.is_read);
+
+        // Has message
+        assert!(storage.has_message("msg-1").unwrap());
+        assert!(!storage.has_message("msg-nonexistent").unwrap());
+
+        // Mark read
+        assert!(storage.mark_message_read("msg-1").unwrap());
+        let loaded = storage.get_message("msg-1").unwrap().unwrap();
+        assert!(loaded.is_read);
+
+        // List messages
+        let msgs = storage.list_messages(None, None, None, 100).unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        // List with kind filter
+        let msgs = storage
+            .list_messages(Some("direct"), None, None, 100)
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        let msgs = storage
+            .list_messages(Some("public"), None, None, 100)
+            .unwrap();
+        assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_message_list_filters() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        // Insert messages at different timestamps
+        for i in 0..5 {
+            let msg = MessageRow {
+                message_id: format!("msg-{i}"),
+                sender_id: "sender".to_string(),
+                recipient_id: "recipient".to_string(),
+                message_kind: if i < 3 { "direct" } else { "public" }.to_string(),
+                group_id: if i == 4 {
+                    Some("group-1".to_string())
+                } else {
+                    None
+                },
+                body: Some(format!("Message {i}")),
+                timestamp: now + i,
+                received_at: now + i,
+                ttl_seconds: 3600,
+                is_read: false,
+                raw_envelope: None,
+            };
+            storage.insert_message(&msg).unwrap();
+        }
+
+        // Filter by kind
+        let direct = storage
+            .list_messages(Some("direct"), None, None, 100)
+            .unwrap();
+        assert_eq!(direct.len(), 3);
+
+        // Filter by before timestamp
+        let before = storage
+            .list_messages(None, None, Some(now + 3), 100)
+            .unwrap();
+        assert_eq!(before.len(), 3);
+
+        // Limit
+        let limited = storage.list_messages(None, None, None, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+
+        // Filter by group
+        let group = storage
+            .list_messages(None, Some("group-1"), None, 100)
+            .unwrap();
+        assert_eq!(group.len(), 1);
+    }
+
+    #[test]
+    fn test_group_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let group = GroupRow {
+            group_id: "grp-1".to_string(),
+            group_key: vec![42u8; 32],
+            creator_id: "creator".to_string(),
+            created_at: now,
+            key_version: 1,
+        };
+        storage.insert_group(&group).unwrap();
+
+        let loaded = storage.get_group("grp-1").unwrap().unwrap();
+        assert_eq!(loaded.group_key.len(), 32);
+        assert_eq!(loaded.creator_id, "creator");
+
+        // Add members
+        storage
+            .insert_group_member(&GroupMemberRow {
+                group_id: "grp-1".to_string(),
+                peer_id: "peer-a".to_string(),
+                joined_at: now,
+            })
+            .unwrap();
+        storage
+            .insert_group_member(&GroupMemberRow {
+                group_id: "grp-1".to_string(),
+                peer_id: "peer-b".to_string(),
+                joined_at: now,
+            })
+            .unwrap();
+
+        let members = storage.list_group_members("grp-1").unwrap();
+        assert_eq!(members.len(), 2);
+
+        // Remove member
+        assert!(storage.remove_group_member("grp-1", "peer-a").unwrap());
+        let members = storage.list_group_members("grp-1").unwrap();
+        assert_eq!(members.len(), 1);
+
+        // Delete group
+        assert!(storage.delete_group("grp-1").unwrap());
+        assert!(storage.get_group("grp-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_outbox_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let entry = OutboxRow {
+            message_id: "out-1".to_string(),
+            envelope: r#"{"test": true}"#.to_string(),
+            sent_at: now,
+            delivered: false,
+        };
+        storage.insert_outbox(&entry).unwrap();
+
+        let outbox = storage.list_outbox().unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert!(!outbox[0].delivered);
+
+        // Mark delivered
+        assert!(storage.mark_outbox_delivered("out-1").unwrap());
+        let outbox = storage.list_outbox().unwrap();
+        assert!(outbox[0].delivered);
+    }
+
+    #[test]
+    fn test_relay_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let relay = RelayRow {
+            url: "http://localhost:8080".to_string(),
+            added_at: now,
+            last_sync: None,
+            enabled: true,
+        };
+        storage.insert_relay(&relay).unwrap();
+
+        let relays = storage.list_relays().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert!(relays[0].last_sync.is_none());
+
+        // Update last_sync
+        storage
+            .update_relay_last_sync("http://localhost:8080", now + 100)
+            .unwrap();
+        let relays = storage.list_relays().unwrap();
+        assert_eq!(relays[0].last_sync, Some(now + 100));
+
+        // Add a disabled relay
+        storage
+            .insert_relay(&RelayRow {
+                url: "http://other:8080".to_string(),
+                added_at: now,
+                last_sync: None,
+                enabled: false,
+            })
+            .unwrap();
+
+        let all = storage.list_relays().unwrap();
+        assert_eq!(all.len(), 2);
+        let enabled = storage.list_enabled_relays().unwrap();
+        assert_eq!(enabled.len(), 1);
+
+        // Delete relay
+        assert!(storage.delete_relay("http://other:8080").unwrap());
+        assert_eq!(storage.list_relays().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_identity_from_stored_keypair() {
+        let kp = StoredKeypair {
+            id: "test-id".to_string(),
+            public_key_hex: "pub".to_string(),
+            private_key_hex: "priv".to_string(),
+            signing_public_key_hex: "spub".to_string(),
+            signing_private_key_hex: "spriv".to_string(),
+        };
+        let row = IdentityRow::from(&kp);
+        assert_eq!(row.id, "test-id");
+
+        let kp2 = row.to_stored_keypair();
+        assert_eq!(kp2.id, kp.id);
+        assert_eq!(kp2.public_key_hex, kp.public_key_hex);
+    }
+
+    #[test]
+    fn test_duplicate_message_ignored() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let msg = MessageRow {
+            message_id: "msg-dup".to_string(),
+            sender_id: "s".to_string(),
+            recipient_id: "r".to_string(),
+            message_kind: "direct".to_string(),
+            group_id: None,
+            body: Some("first".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: None,
+        };
+        storage.insert_message(&msg).unwrap();
+
+        // Insert duplicate (should be silently ignored by INSERT OR IGNORE)
+        let msg2 = MessageRow {
+            body: Some("second".to_string()),
+            ..msg
+        };
+        storage.insert_message(&msg2).unwrap();
+
+        // Original body should remain
+        let loaded = storage.get_message("msg-dup").unwrap().unwrap();
+        assert_eq!(loaded.body, Some("first".to_string()));
+    }
+
+    #[test]
+    fn test_json_migration() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("tenet-test-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create identity.json
+        let identity = StoredKeypair {
+            id: "migrated-id".to_string(),
+            public_key_hex: "pub-hex".to_string(),
+            private_key_hex: "priv-hex".to_string(),
+            signing_public_key_hex: "spub-hex".to_string(),
+            signing_private_key_hex: "spriv-hex".to_string(),
+        };
+        std::fs::write(
+            dir.join("identity.json"),
+            serde_json::to_string(&identity).unwrap(),
+        )
+        .unwrap();
+
+        // Create peers.json
+        let peers = serde_json::json!([
+            {"name": "alice", "id": "alice-id", "public_key_hex": "alice-key"},
+            {"name": "bob", "id": "bob-id", "public_key_hex": "bob-key"}
+        ]);
+        std::fs::write(dir.join("peers.json"), peers.to_string()).unwrap();
+
+        // Create inbox.jsonl
+        let mut inbox = std::fs::File::create(dir.join("inbox.jsonl")).unwrap();
+        writeln!(
+            inbox,
+            r#"{{"sender_id":"alice-id","timestamp":1000,"message":"hello"}}"#
+        )
+        .unwrap();
+        writeln!(
+            inbox,
+            r#"{{"sender_id":"bob-id","timestamp":2000,"message":"world"}}"#
+        )
+        .unwrap();
+        drop(inbox);
+
+        // Run migration
+        let storage = Storage::open_in_memory().unwrap();
+        let report = storage.migrate_from_json(&dir).unwrap();
+
+        assert!(report.identity_migrated);
+        assert_eq!(report.peers_migrated, 2);
+        assert_eq!(report.inbox_migrated, 2);
+
+        // Verify data
+        let id = storage.get_identity().unwrap().unwrap();
+        assert_eq!(id.id, "migrated-id");
+
+        let peers = storage.list_peers().unwrap();
+        assert_eq!(peers.len(), 2);
+
+        let msgs = storage.list_messages(None, None, None, 100).unwrap();
+        assert_eq!(msgs.len(), 2);
+
+        // Verify files renamed
+        assert!(dir.join("identity.json.migrated").exists());
+        assert!(dir.join("peers.json.migrated").exists());
+        assert!(dir.join("inbox.jsonl.migrated").exists());
+        assert!(!dir.join("identity.json").exists());
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
