@@ -254,7 +254,7 @@ POST   /api/messages/group     { group_id, body }
 
 ---
 
-## Phase 3 — Peers & Presence
+## Phase 3 — Peers & Presence ✅ COMPLETE
 
 **Goal**: Friend/peer management UI and real-time online status.
 

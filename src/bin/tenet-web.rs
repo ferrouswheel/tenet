@@ -20,9 +20,10 @@ use tokio::sync::{broadcast, Mutex};
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
 use tenet::crypto::{generate_content_key, generate_keypair, StoredKeypair, NONCE_SIZE};
 use tenet::protocol::{
-    build_encrypted_payload, build_envelope_from_payload, build_plaintext_envelope, MessageKind,
+    build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
+    build_plaintext_envelope, decode_meta_payload, MessageKind, MetaMessage,
 };
-use tenet::storage::{db_path, IdentityRow, MessageRow, RelayRow, Storage};
+use tenet::storage::{db_path, IdentityRow, MessageRow, PeerRow, RelayRow, Storage};
 
 // ---------------------------------------------------------------------------
 // Embedded static assets
@@ -186,6 +187,14 @@ async fn main() {
         tokio::spawn(async move {
             relay_sync_loop(sync_state).await;
         });
+
+        // Send online announcement to known peers
+        let announce_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = announce_online(announce_state).await {
+                eprintln!("failed to announce online status: {}", e);
+            }
+        });
     }
 
     // Build Axum router
@@ -199,6 +208,12 @@ async fn main() {
         .route("/api/messages/public", post(send_public_handler))
         .route("/api/messages/group", post(send_group_handler))
         .route("/api/messages/:message_id/read", post(mark_read_handler))
+        // Peers API (Phase 3)
+        .route("/api/peers", get(list_peers_handler).post(add_peer_handler))
+        .route(
+            "/api/peers/:peer_id",
+            get(get_peer_handler).delete(delete_peer_handler),
+        )
         // WebSocket (Phase 2)
         .route("/api/ws", get(ws_handler))
         // Static fallback
@@ -650,6 +665,129 @@ async fn mark_read_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Peers API
+// ---------------------------------------------------------------------------
+
+async fn list_peers_handler(State(state): State<SharedState>) -> Response {
+    let st = state.lock().await;
+    match st.storage.list_peers() {
+        Ok(peers) => {
+            let json: Vec<serde_json::Value> = peers
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "peer_id": p.peer_id,
+                        "display_name": p.display_name,
+                        "signing_public_key": p.signing_public_key,
+                        "encryption_public_key": p.encryption_public_key,
+                        "added_at": p.added_at,
+                        "is_friend": p.is_friend,
+                        "last_seen_online": p.last_seen_online,
+                        "online": p.online,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn get_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.get_peer(&peer_id) {
+        Ok(Some(p)) => {
+            let json = serde_json::json!({
+                "peer_id": p.peer_id,
+                "display_name": p.display_name,
+                "signing_public_key": p.signing_public_key,
+                "encryption_public_key": p.encryption_public_key,
+                "added_at": p.added_at,
+                "is_friend": p.is_friend,
+                "last_seen_online": p.last_seen_online,
+                "online": p.online,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "peer not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddPeerRequest {
+    peer_id: String,
+    display_name: Option<String>,
+    signing_public_key: String,
+    encryption_public_key: Option<String>,
+}
+
+async fn add_peer_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<AddPeerRequest>,
+) -> Response {
+    if req.peer_id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "peer_id cannot be empty");
+    }
+    if req.signing_public_key.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "signing_public_key cannot be empty",
+        );
+    }
+
+    let now = now_secs();
+    let st = state.lock().await;
+
+    let peer_row = PeerRow {
+        peer_id: req.peer_id.clone(),
+        display_name: req.display_name.clone(),
+        signing_public_key: req.signing_public_key.clone(),
+        encryption_public_key: req.encryption_public_key.clone(),
+        added_at: now,
+        is_friend: true,
+        last_seen_online: None,
+        online: false,
+    };
+
+    match st.storage.insert_peer(&peer_row) {
+        Ok(()) => {
+            let json = serde_json::json!({
+                "peer_id": peer_row.peer_id,
+                "display_name": peer_row.display_name,
+                "signing_public_key": peer_row.signing_public_key,
+                "encryption_public_key": peer_row.encryption_public_key,
+                "added_at": peer_row.added_at,
+                "is_friend": peer_row.is_friend,
+                "last_seen_online": peer_row.last_seen_online,
+                "online": peer_row.online,
+            });
+            (StatusCode::CREATED, axum::Json(json)).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn delete_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.delete_peer(&peer_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "deleted"})),
+        )
+            .into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "peer not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
@@ -785,13 +923,55 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
     // Fetch inbox from relay
     let outcome = client.sync_inbox(None).map_err(|e| e.to_string())?;
 
+    // Fetch raw envelopes to check for Meta messages
+    let base = relay_url.trim_end_matches('/');
+    let inbox_url = format!("{}/inbox/{}", base, keypair.id);
+    let envelopes: Vec<tenet::protocol::Envelope> = ureq::get(&inbox_url)
+        .call()
+        .ok()
+        .and_then(|response| response.into_json().ok())
+        .unwrap_or_default();
+
+    // Process Meta messages for presence tracking
+    let now = now_secs();
+    for envelope in &envelopes {
+        if envelope.header.message_kind == MessageKind::Meta {
+            // Try to decode as Meta message
+            if let Ok(meta_msg) = decode_meta_payload(&envelope.payload) {
+                match meta_msg {
+                    MetaMessage::Online { peer_id, timestamp } => {
+                        // Update peer presence
+                        let st = state.lock().await;
+                        if let Ok(true) = st.storage.update_peer_online(&peer_id, true, timestamp) {
+                            // Broadcast peer_online event
+                            let _ = st.ws_tx.send(WsEvent::PeerOnline {
+                                peer_id: peer_id.clone(),
+                            });
+                            eprintln!("peer {} is now online", peer_id);
+                        }
+                    }
+                    MetaMessage::Ack {
+                        peer_id,
+                        online_timestamp,
+                    } => {
+                        // Update peer last_seen
+                        let st = state.lock().await;
+                        let _ = st
+                            .storage
+                            .update_peer_online(&peer_id, true, online_timestamp);
+                    }
+                    _ => {} // Ignore other meta message types for now
+                }
+            }
+        }
+    }
+
     if outcome.fetched == 0 {
         return Ok(());
     }
 
     // Store received messages in SQLite and broadcast via WebSocket
     let st = state.lock().await;
-    let now = now_secs();
 
     for msg in &outcome.messages {
         if st.storage.has_message(&msg.message_id).unwrap_or(true) {
@@ -834,6 +1014,60 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Online announcement
+// ---------------------------------------------------------------------------
+
+async fn announce_online(state: SharedState) -> Result<(), String> {
+    let (keypair, relay_url, peers) = {
+        let st = state.lock().await;
+        let relay_url = st
+            .relay_url
+            .clone()
+            .ok_or_else(|| "no relay configured".to_string())?;
+        let peers = st.storage.list_peers().map_err(|e| e.to_string())?;
+        (st.keypair.clone(), relay_url, peers)
+    };
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_secs();
+    let meta_msg = MetaMessage::Online {
+        peer_id: keypair.id.clone(),
+        timestamp: now,
+    };
+
+    let payload = build_meta_payload(&meta_msg).map_err(|e| e.to_string())?;
+
+    // Send online announcement to each peer
+    for peer in &peers {
+        let envelope = build_envelope_from_payload(
+            keypair.id.clone(),
+            peer.peer_id.clone(),
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::Meta,
+            None,
+            payload.clone(),
+            &keypair.signing_private_key_hex,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Post to relay
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    eprintln!("announced online status to {} peers", peers.len());
     Ok(())
 }
 
