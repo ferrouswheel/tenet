@@ -291,7 +291,7 @@ DELETE /api/peers/:peer_id               -- remove peer
 
 ---
 
-## Phase 4 — Groups
+## Phase 4 — Groups ✅ COMPLETE
 
 **Goal**: Group creation, membership management, and group messaging UI.
 
