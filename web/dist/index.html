@@ -39,9 +39,141 @@
 
         /* Layout */
         .container {
-            max-width: 720px;
+            display: flex;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 1rem;
+            gap: 1rem;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            flex-shrink: 0;
+        }
+        .main-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        /* Friends panel */
+        .friends-panel {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+        .friends-panel h2 {
+            font-size: 1rem;
+            margin-bottom: 0.75rem;
+            color: #fff;
+        }
+        .friend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-bottom: 0.25rem;
+        }
+        .friend-item:hover { background: #0f1117; }
+        .friend-item .online-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #666;
+        }
+        .friend-item .online-dot.online { background: #4caf50; }
+        .friend-item .friend-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .friend-item .friend-name {
+            font-size: 0.85rem;
+            color: #e0e0e0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .friend-item .friend-last-seen {
+            font-size: 0.7rem;
+            color: #666;
+        }
+        .friends-empty {
+            text-align: center;
+            color: #666;
+            font-size: 0.85rem;
+            padding: 1rem 0;
+        }
+
+        /* Add friend button/form */
+        .add-friend-btn {
+            width: 100%;
+            background: #2a2d47;
+            border: 1px solid #5566cc;
+            color: #fff;
+            padding: 0.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            margin-top: 0.5rem;
+        }
+        .add-friend-btn:hover { background: #3a3d57; }
+
+        .add-friend-form {
+            background: #1a1d27;
+            border: 1px solid #2a2d37;
+            border-radius: 8px;
+            padding: 1rem;
+            display: none;
+        }
+        .add-friend-form.visible { display: block; }
+        .add-friend-form h3 {
+            font-size: 0.9rem;
+            margin-bottom: 0.75rem;
+            color: #fff;
+        }
+        .add-friend-form input {
+            width: 100%;
+            background: #0f1117;
+            border: 1px solid #2a2d37;
+            color: #e0e0e0;
+            border-radius: 4px;
+            padding: 0.5rem;
+            font-size: 0.85rem;
+            margin-bottom: 0.5rem;
+        }
+        .add-friend-form input:focus { outline: none; border-color: #5566cc; }
+        .add-friend-form .form-actions {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+        }
+        .add-friend-form button {
+            flex: 1;
+            padding: 0.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            border: none;
+        }
+        .add-friend-form .btn-primary {
+            background: #5566cc;
+            color: #fff;
+        }
+        .add-friend-form .btn-primary:hover { background: #6677dd; }
+        .add-friend-form .btn-secondary {
+            background: #2a2d37;
+            color: #aaa;
+        }
+        .add-friend-form .btn-secondary:hover { background: #3a3d47; }
+
+        @media (max-width: 768px) {
+            .container { flex-direction: column; }
+            .sidebar { width: 100%; }
         }
 
         /* Filter tabs */
@@ -215,35 +347,61 @@
     </div>
 
     <div class="container">
-        <!-- Filter tabs -->
-        <div class="filters">
-            <button class="active" data-kind="">All</button>
-            <button data-kind="public">Public</button>
-            <button data-kind="direct">Direct</button>
-            <button data-kind="friend_group">Groups</button>
-        </div>
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <!-- Friends list -->
+            <div class="friends-panel">
+                <h2>Friends</h2>
+                <div id="friends-list"></div>
+                <button class="add-friend-btn" onclick="toggleAddFriendForm()">+ Add Friend</button>
+            </div>
 
-        <!-- Compose box -->
-        <div class="compose">
-            <textarea id="compose-body" placeholder="Write a message..."></textarea>
-            <div class="compose-actions">
-                <select id="compose-kind">
-                    <option value="public">Public</option>
-                </select>
-                <button id="compose-send" onclick="sendMessage()">Send</button>
+            <!-- Add friend form -->
+            <div id="add-friend-form" class="add-friend-form">
+                <h3>Add Friend</h3>
+                <input type="text" id="friend-peer-id" placeholder="Peer ID" />
+                <input type="text" id="friend-display-name" placeholder="Display Name (optional)" />
+                <input type="text" id="friend-signing-key" placeholder="Signing Public Key" />
+                <input type="text" id="friend-enc-key" placeholder="Encryption Key (optional)" />
+                <div class="form-actions">
+                    <button class="btn-secondary" onclick="toggleAddFriendForm()">Cancel</button>
+                    <button class="btn-primary" onclick="addFriend()">Add</button>
+                </div>
             </div>
         </div>
 
-        <!-- Timeline -->
-        <div id="timeline"></div>
+        <!-- Main content -->
+        <div class="main-content">
+            <!-- Filter tabs -->
+            <div class="filters">
+                <button class="active" data-kind="">All</button>
+                <button data-kind="public">Public</button>
+                <button data-kind="direct">Direct</button>
+                <button data-kind="friend_group">Groups</button>
+            </div>
 
-        <!-- Load more / empty -->
-        <div id="load-more" class="load-more" style="display:none;">
-            <button onclick="loadMore()">Load older messages</button>
-        </div>
-        <div id="empty-state" class="empty" style="display:none;">
-            <div class="icon">&#128172;</div>
-            <div>No messages yet</div>
+            <!-- Compose box -->
+            <div class="compose">
+                <textarea id="compose-body" placeholder="Write a message..."></textarea>
+                <div class="compose-actions">
+                    <select id="compose-kind">
+                        <option value="public">Public</option>
+                    </select>
+                    <button id="compose-send" onclick="sendMessage()">Send</button>
+                </div>
+            </div>
+
+            <!-- Timeline -->
+            <div id="timeline"></div>
+
+            <!-- Load more / empty -->
+            <div id="load-more" class="load-more" style="display:none;">
+                <button onclick="loadMore()">Load older messages</button>
+            </div>
+            <div id="empty-state" class="empty" style="display:none;">
+                <div class="icon">&#128172;</div>
+                <div>No messages yet</div>
+            </div>
         </div>
     </div>
 
@@ -259,6 +417,7 @@
     let messages = [];
     let oldestTimestamp = null;
     let ws = null;
+    let peers = [];
     const PAGE_SIZE = 50;
 
     // ---------------------------------------------------------------------------
@@ -279,6 +438,11 @@
             const err = await res.json().catch(() => ({ error: 'request failed' }));
             throw new Error(err.error || 'request failed');
         }
+        return res.json();
+    }
+    async function apiDelete(path) {
+        const res = await fetch(path, { method: 'DELETE' });
+        if (!res.ok) throw new Error(await res.text());
         return res.json();
     }
 
@@ -443,6 +607,78 @@
     }
 
     // ---------------------------------------------------------------------------
+    // Friends management
+    // ---------------------------------------------------------------------------
+    async function loadPeers() {
+        try {
+            peers = await apiGet('/api/peers');
+            renderFriendsList();
+        } catch (e) {
+            console.error('Failed to load peers:', e);
+        }
+    }
+
+    function renderFriendsList() {
+        const el = document.getElementById('friends-list');
+        if (peers.length === 0) {
+            el.innerHTML = '<div class="friends-empty">No friends yet</div>';
+            return;
+        }
+
+        el.innerHTML = peers.map(p => {
+            const displayName = p.display_name || p.peer_id.substring(0, 12) + '...';
+            const onlineClass = p.online ? 'online' : '';
+            const lastSeen = p.last_seen_online ? timeAgo(p.last_seen_online) : 'never';
+            return `<div class="friend-item" data-peer-id="${p.peer_id}">
+                <span class="online-dot ${onlineClass}"></span>
+                <div class="friend-info">
+                    <div class="friend-name" title="${p.peer_id}">${escapeHtml(displayName)}</div>
+                    <div class="friend-last-seen">${p.online ? 'online' : 'last seen ' + lastSeen}</div>
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    function toggleAddFriendForm() {
+        const form = document.getElementById('add-friend-form');
+        form.classList.toggle('visible');
+        if (!form.classList.contains('visible')) {
+            document.getElementById('friend-peer-id').value = '';
+            document.getElementById('friend-display-name').value = '';
+            document.getElementById('friend-signing-key').value = '';
+            document.getElementById('friend-enc-key').value = '';
+        }
+    }
+
+    async function addFriend() {
+        const peerId = document.getElementById('friend-peer-id').value.trim();
+        const displayName = document.getElementById('friend-display-name').value.trim();
+        const signingKey = document.getElementById('friend-signing-key').value.trim();
+        const encKey = document.getElementById('friend-enc-key').value.trim();
+
+        if (!peerId || !signingKey) {
+            showToast('Peer ID and Signing Key are required');
+            return;
+        }
+
+        try {
+            const payload = {
+                peer_id: peerId,
+                signing_public_key: signingKey,
+            };
+            if (displayName) payload.display_name = displayName;
+            if (encKey) payload.encryption_public_key = encKey;
+
+            await apiPost('/api/peers', payload);
+            showToast('Friend added successfully');
+            toggleAddFriendForm();
+            await loadPeers();
+        } catch (e) {
+            showToast('Failed to add friend: ' + e.message);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // WebSocket
     // ---------------------------------------------------------------------------
     function connectWs() {
@@ -489,6 +725,24 @@
         } else if (event.type === 'message_read') {
             const el = document.querySelector(`.message[data-id="${event.message_id}"]`);
             if (el) el.classList.remove('unread');
+        } else if (event.type === 'peer_online') {
+            // Update peer online status
+            const peer = peers.find(p => p.peer_id === event.peer_id);
+            if (peer) {
+                peer.online = true;
+                peer.last_seen_online = Math.floor(Date.now() / 1000);
+                renderFriendsList();
+                const displayName = peer.display_name || peer.peer_id.substring(0, 12) + '...';
+                showToast(displayName + ' is now online');
+            }
+        } else if (event.type === 'peer_offline') {
+            // Update peer offline status
+            const peer = peers.find(p => p.peer_id === event.peer_id);
+            if (peer) {
+                peer.online = false;
+                peer.last_seen_online = Math.floor(Date.now() / 1000);
+                renderFriendsList();
+            }
         }
     }
 
@@ -507,6 +761,7 @@
             document.getElementById('status-dot').classList.add('err');
         }
 
+        await loadPeers();
         await loadMessages(false);
         connectWs();
     }
