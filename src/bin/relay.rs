@@ -32,6 +32,9 @@ async fn main() {
         .await
         .unwrap_or_else(|error| panic!("failed to bind {bind}: {error}"));
 
+    let local_addr = listener.local_addr().expect("failed to get local address");
+    eprintln!("tenet-relay listening on http://{}", local_addr);
+
     axum::serve(listener, app)
         .await
         .unwrap_or_else(|error| panic!("server error: {error}"));

@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
-use tenet::crypto::{
-    derive_user_id_from_public_key, generate_keypair, load_keypair, rotate_keypair, store_keypair,
-    KeyRotation, StoredKeypair,
+use tenet::crypto::{derive_user_id_from_public_key, generate_keypair, StoredKeypair};
+use tenet::identity::{
+    create_identity, list_identities, resolve_identity, save_config, TenetConfig,
 };
+use tenet::storage::{db_path, IdentityRow};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Peer {
@@ -34,23 +35,43 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = env::args().collect::<Vec<String>>();
+    let args = env::args().collect::<Vec<String>>();
     if args.len() < 2 {
         print_usage();
         return Ok(());
     }
 
-    let command = args[1].clone();
-    let command_args = args.split_off(2);
+    // Extract --identity flag from anywhere in args
+    let mut identity_flag: Option<String> = env::var("TENET_IDENTITY").ok();
+    let mut filtered_args: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--identity" {
+            i += 1;
+            if i < args.len() {
+                identity_flag = Some(args[i].clone());
+            }
+        } else {
+            filtered_args.push(args[i].clone());
+        }
+        i += 1;
+    }
+
+    let command = filtered_args.get(1).cloned().unwrap_or_default();
+    let command_args: Vec<String> = if filtered_args.len() > 2 {
+        filtered_args[2..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     match command.as_str() {
-        "init" => init_identity(),
-        "add-peer" => add_peer(&command_args),
-        "send" => send_message(&command_args),
-        "sync" => sync_messages(&command_args),
-        "export-key" => export_key(&command_args),
-        "import-key" => import_key(&command_args),
-        "rotate-key" => rotate_identity(),
+        "init" => init_identity(identity_flag.as_deref()),
+        "add-peer" => add_peer(&command_args, identity_flag.as_deref()),
+        "send" => send_message(&command_args, identity_flag.as_deref()),
+        "sync" => sync_messages(&command_args, identity_flag.as_deref()),
+        "export-key" => export_key(&command_args, identity_flag.as_deref()),
+        "import-key" => import_key(&command_args, identity_flag.as_deref()),
+        "rotate-key" => rotate_identity(identity_flag.as_deref()),
         _ => {
             print_usage();
             Ok(())
@@ -70,9 +91,13 @@ fn print_usage() {
          import-key <public_key_hex> <private_key_hex>\n\
          rotate-key\n\
          \n\
+         Options:\n\
+         --identity <id>   Select identity (short ID prefix)\n\
+         \n\
          Environment:\n\
-         TENET_HOME defaults to .tenet\n\
-         TENET_RELAY_URL provides a relay URL default for send/sync"
+         TENET_HOME       defaults to .tenet\n\
+         TENET_RELAY_URL  provides a relay URL default for send/sync\n\
+         TENET_IDENTITY   select identity by short ID prefix"
     );
 }
 
@@ -105,45 +130,73 @@ fn ensure_dir(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn identity_path() -> PathBuf {
-    data_dir().join("identity.json")
-}
-
-fn peers_path() -> PathBuf {
-    data_dir().join("peers.json")
-}
-
-fn outbox_path() -> PathBuf {
-    data_dir().join("outbox.jsonl")
-}
-
-fn inbox_path() -> PathBuf {
-    data_dir().join("inbox.jsonl")
-}
-
-fn init_identity() -> Result<(), Box<dyn Error>> {
+/// Resolve identity and return (keypair, identity_dir, stored_relay_url).
+/// Also logs identity selection info to stderr.
+fn resolve_and_log(
+    explicit_id: Option<&str>,
+) -> Result<(StoredKeypair, PathBuf, Option<String>), Box<dyn Error>> {
     let dir = data_dir();
-    ensure_dir(&dir)?;
-    let identity_file = identity_path();
+    let resolved = resolve_identity(&dir, explicit_id)?;
 
-    if identity_file.exists() {
-        let identity = load_identity()?;
-        println!("identity already exists: {}", identity.id);
-        return Ok(());
+    if resolved.newly_created {
+        eprintln!(
+            "  identities: 1 available (newly created), using: {}",
+            resolved.keypair.id
+        );
+    } else {
+        eprintln!(
+            "  identities: {} available, using: {}",
+            resolved.total_identities, resolved.keypair.id
+        );
     }
 
-    let identity = generate_keypair();
-    store_keypair(&identity_file, &identity)?;
-    println!("identity created: {}", identity.id);
+    Ok((
+        resolved.keypair,
+        resolved.identity_dir,
+        resolved.stored_relay_url,
+    ))
+}
+
+fn peers_path(identity_dir: &Path) -> PathBuf {
+    identity_dir.join("peers.json")
+}
+
+fn outbox_path(identity_dir: &Path) -> PathBuf {
+    identity_dir.join("outbox.jsonl")
+}
+
+fn inbox_path(identity_dir: &Path) -> PathBuf {
+    identity_dir.join("inbox.jsonl")
+}
+
+fn init_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let dir = data_dir();
+    ensure_dir(&dir)?;
+
+    // If an explicit_id is given, check if it already exists
+    if let Some(id) = explicit_id {
+        let identities = list_identities(&dir)?;
+        if let Some(entry) = identities
+            .iter()
+            .find(|e| e.short_id == id || e.short_id.starts_with(id))
+        {
+            let db = db_path(&entry.path);
+            let storage = tenet::storage::Storage::open(&db)?;
+            if let Some(row) = storage.get_identity()? {
+                println!("identity already exists: {}", row.id);
+                return Ok(());
+            }
+        }
+    }
+
+    let resolved = create_identity(&dir)?;
+    println!("identity created: {}", resolved.keypair.id);
+    eprintln!("  identities: {} available", resolved.total_identities);
     Ok(())
 }
 
-fn load_identity() -> Result<StoredKeypair, Box<dyn Error>> {
-    Ok(load_keypair(&identity_path())?)
-}
-
-fn load_peers() -> Result<Vec<Peer>, Box<dyn Error>> {
-    let path = peers_path();
+fn load_peers(identity_dir: &Path) -> Result<Vec<Peer>, Box<dyn Error>> {
+    let path = peers_path(identity_dir);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -151,25 +204,25 @@ fn load_peers() -> Result<Vec<Peer>, Box<dyn Error>> {
     Ok(serde_json::from_str(&data)?)
 }
 
-fn save_peers(peers: &[Peer]) -> Result<(), Box<dyn Error>> {
+fn save_peers(identity_dir: &Path, peers: &[Peer]) -> Result<(), Box<dyn Error>> {
     let json = serde_json::to_string_pretty(peers)?;
-    fs::write(peers_path(), json)?;
+    fs::write(peers_path(identity_dir), json)?;
     Ok(())
 }
 
-fn add_peer(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn add_peer(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     if args.len() < 2 {
         return Err("add-peer requires <name> <public_key_hex>".into());
     }
 
-    ensure_dir(&data_dir())?;
+    let (_keypair, identity_dir, _) = resolve_and_log(explicit_id)?;
 
     let name = args[0].clone();
     let public_key_hex = args[1].clone();
     let public_key_bytes = hex::decode(&public_key_hex)?;
     let id = derive_user_id_from_public_key(&public_key_bytes);
 
-    let mut peers = load_peers()?;
+    let mut peers = load_peers(&identity_dir)?;
     if let Some(existing) = peers.iter_mut().find(|peer| peer.name == name) {
         existing.public_key_hex = public_key_hex;
         existing.id = id.clone();
@@ -181,13 +234,13 @@ fn add_peer(args: &[String]) -> Result<(), Box<dyn Error>> {
         });
     }
 
-    save_peers(&peers)?;
+    save_peers(&identity_dir, &peers)?;
     println!("peer saved: {} ({})", name, id);
     Ok(())
 }
 
-fn send_message(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut relay_url = env::var("TENET_RELAY_URL").ok();
+fn send_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
     let mut peer_name: Option<String> = None;
     let mut message_parts: Vec<String> = Vec::new();
 
@@ -199,7 +252,7 @@ fn send_message(args: &[String]) -> Result<(), Box<dyn Error>> {
                 if index >= args.len() {
                     return Err("--relay requires a URL".into());
                 }
-                relay_url = Some(args[index].clone());
+                relay_url_override = Some(args[index].clone());
             }
             value => {
                 if peer_name.is_none() {
@@ -212,15 +265,20 @@ fn send_message(args: &[String]) -> Result<(), Box<dyn Error>> {
         index += 1;
     }
 
-    let relay_url = relay_url.ok_or("relay URL required (use --relay or TENET_RELAY_URL)")?;
+    let (identity, identity_dir, stored_relay) = resolve_and_log(explicit_id)?;
+
+    // Priority: --relay > TENET_RELAY_URL > stored relay in identity DB
+    let relay_url = relay_url_override
+        .or(stored_relay)
+        .ok_or("relay URL required (use --relay, TENET_RELAY_URL, or store one with init)")?;
+
     let peer_name = peer_name.ok_or("send requires <peer_name>")?;
     let message = message_parts.join(" ");
     if message.trim().is_empty() {
         return Err("send requires a message".into());
     }
 
-    let identity = load_identity()?;
-    let peers = load_peers()?;
+    let peers = load_peers(&identity_dir)?;
     let peer = peers
         .iter()
         .find(|peer| peer.name == peer_name)
@@ -228,7 +286,7 @@ fn send_message(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let client = build_relay_client(identity, &relay_url);
     let envelope = client.send_message(&peer.id, &peer.public_key_hex, &message)?;
-    append_json_line(outbox_path(), &envelope)?;
+    append_json_line(&identity_dir, outbox_path(&identity_dir), &envelope)?;
 
     println!(
         "sent message {} to {}",
@@ -237,8 +295,8 @@ fn send_message(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn sync_messages(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut relay_url = env::var("TENET_RELAY_URL").ok();
+fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -247,15 +305,20 @@ fn sync_messages(args: &[String]) -> Result<(), Box<dyn Error>> {
                 if index >= args.len() {
                     return Err("--relay requires a URL".into());
                 }
-                relay_url = Some(args[index].clone());
+                relay_url_override = Some(args[index].clone());
             }
             _ => {}
         }
         index += 1;
     }
 
-    let relay_url = relay_url.ok_or("relay URL required (use --relay or TENET_RELAY_URL)")?;
-    let identity = load_identity()?;
+    let (identity, identity_dir, stored_relay) = resolve_and_log(explicit_id)?;
+
+    // Priority: --relay > TENET_RELAY_URL > stored relay in identity DB
+    let relay_url = relay_url_override
+        .or(stored_relay)
+        .ok_or("relay URL required (use --relay, TENET_RELAY_URL, or store one with init)")?;
+
     let mut client = build_relay_client(identity, &relay_url);
     let outcome = client.sync_inbox(None)?;
     if outcome.fetched == 0 {
@@ -275,7 +338,7 @@ fn sync_messages(args: &[String]) -> Result<(), Box<dyn Error>> {
             timestamp: message.timestamp,
             message: message.body,
         };
-        append_json_line(inbox_path(), &record)?;
+        append_json_line(&identity_dir, inbox_path(&identity_dir), &record)?;
         received += 1;
     }
 
@@ -283,12 +346,12 @@ fn sync_messages(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn export_key(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn export_key(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     if args.len() > 1 {
         return Err("export-key accepts at most one flag".into());
     }
 
-    let identity = load_identity()?;
+    let (identity, _, _) = resolve_and_log(explicit_id)?;
     match args.first().map(String::as_str) {
         None => println!("{}", serde_json::to_string_pretty(&identity)?),
         Some("--public") => println!("{}", identity.public_key_hex),
@@ -299,12 +362,13 @@ fn export_key(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn import_key(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn import_key(args: &[String], _explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     if args.len() < 2 {
         return Err("import-key requires <public_key_hex> <private_key_hex>".into());
     }
 
-    ensure_dir(&data_dir())?;
+    let dir = data_dir();
+    ensure_dir(&dir)?;
 
     let public_key_hex = args[0].clone();
     let private_key_hex = args[1].clone();
@@ -322,35 +386,86 @@ fn import_key(args: &[String]) -> Result<(), Box<dyn Error>> {
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
 
-    let identity = StoredKeypair {
-        id,
+    let keypair = StoredKeypair {
+        id: id.clone(),
         public_key_hex,
         private_key_hex,
         signing_public_key_hex: hex::encode(verifying_key.to_bytes()),
         signing_private_key_hex: hex::encode(signing_key.to_bytes()),
     };
 
-    store_keypair(&identity_path(), &identity)?;
-    println!("identity imported: {}", identity.id);
+    // Create identity directory and store in the new multi-identity layout
+    let short_id: String = id.chars().take(12).collect();
+    let identity_dir = tenet::identity::identities_dir(&dir).join(&short_id);
+    fs::create_dir_all(&identity_dir)?;
+
+    let db = db_path(&identity_dir);
+    let storage = tenet::storage::Storage::open(&db)?;
+
+    if storage.get_identity()?.is_none() {
+        let row = IdentityRow::from(&keypair);
+        storage.insert_identity(&row)?;
+    }
+
+    // If this is the only identity, set as default
+    let identities = list_identities(&dir)?;
+    if identities.len() == 1 {
+        let cfg = TenetConfig {
+            default_identity: Some(short_id),
+        };
+        save_config(&dir, &cfg)?;
+    }
+
+    println!("identity imported: {}", keypair.id);
     println!("note: new Ed25519 signing keys were generated");
+    eprintln!("  identities: {} available", identities.len());
     Ok(())
 }
 
-fn rotate_identity() -> Result<(), Box<dyn Error>> {
-    ensure_dir(&data_dir())?;
-    let KeyRotation {
-        previous_id,
-        new_id,
-    } = rotate_keypair(&identity_path())?;
+fn rotate_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let dir = data_dir();
+    ensure_dir(&dir)?;
+
+    let (old_keypair, identity_dir, _) = resolve_and_log(explicit_id)?;
+
+    // Generate a new keypair
+    let new_keypair = generate_keypair();
+
+    // Store the new keypair in a new identity directory
+    let new_short_id: String = new_keypair.id.chars().take(12).collect();
+    let new_identity_dir = tenet::identity::identities_dir(&dir).join(&new_short_id);
+    fs::create_dir_all(&new_identity_dir)?;
+
+    let db = db_path(&new_identity_dir);
+    let storage = tenet::storage::Storage::open(&db)?;
+    let row = IdentityRow::from(&new_keypair);
+    storage.insert_identity(&row)?;
+
+    // Copy peers to the new identity directory
+    let old_peers = peers_path(&identity_dir);
+    if old_peers.exists() {
+        fs::copy(&old_peers, peers_path(&new_identity_dir))?;
+    }
+
+    // Update default to the new identity
+    let cfg = TenetConfig {
+        default_identity: Some(new_short_id),
+    };
+    save_config(&dir, &cfg)?;
+
     println!(
         "identity rotated from {} to {} (share the new public key with peers)",
-        previous_id, new_id
+        old_keypair.id, new_keypair.id
     );
     Ok(())
 }
 
-fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), Box<dyn Error>> {
-    ensure_dir(&data_dir())?;
+fn append_json_line<T: Serialize>(
+    identity_dir: &Path,
+    path: PathBuf,
+    value: &T,
+) -> Result<(), Box<dyn Error>> {
+    ensure_dir(identity_dir)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
