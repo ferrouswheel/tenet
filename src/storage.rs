@@ -129,6 +129,9 @@ pub struct MessageRow {
     pub ttl_seconds: u64,
     pub is_read: bool,
     pub raw_envelope: Option<String>,
+    /// Phase 9: Optional reference to the parent message this is a reply to.
+    #[serde(default)]
+    pub reply_to: Option<String>,
 }
 
 /// Group row stored in the database.
@@ -194,6 +197,28 @@ pub struct ConversationSummary {
     pub last_timestamp: u64,
     pub last_message: Option<String>,
     pub unread_count: u32,
+}
+
+/// Reaction row stored in the database (Phase 8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionRow {
+    pub message_id: String,
+    pub target_id: String,
+    pub sender_id: String,
+    pub reaction: String,
+    pub timestamp: u64,
+}
+
+/// Profile row stored in the database (Phase 10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileRow {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_hash: Option<String>,
+    pub public_fields: String,
+    pub friends_fields: String,
+    pub updated_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -314,8 +339,46 @@ impl Storage {
                 position        INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (message_id, content_hash)
             );
+
+            -- Reactions (Phase 8)
+            CREATE TABLE IF NOT EXISTS reactions (
+                message_id      TEXT NOT NULL,
+                target_id       TEXT NOT NULL,
+                sender_id       TEXT NOT NULL,
+                reaction        TEXT NOT NULL,
+                timestamp       INTEGER NOT NULL,
+                PRIMARY KEY (target_id, sender_id)
+            );
+
+            -- Profiles (Phase 10)
+            CREATE TABLE IF NOT EXISTS profiles (
+                user_id         TEXT PRIMARY KEY,
+                display_name    TEXT,
+                bio             TEXT,
+                avatar_hash     TEXT,
+                public_fields   TEXT NOT NULL DEFAULT '{}',
+                friends_fields  TEXT NOT NULL DEFAULT '{}',
+                updated_at      INTEGER NOT NULL
+            );
             ",
         )?;
+
+        // Phase 9: Add reply_to column to messages if not present
+        // We check if the column exists first to avoid errors on existing databases
+        let has_reply_to: bool = self
+            .conn
+            .prepare("SELECT reply_to FROM messages LIMIT 0")
+            .is_ok();
+        if !has_reply_to {
+            self.conn
+                .execute_batch("ALTER TABLE messages ADD COLUMN reply_to TEXT;")?;
+        }
+
+        // Create reply_to index after the column exists
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to);",
+        )?;
+
         Ok(())
     }
 
@@ -461,8 +524,8 @@ impl Storage {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages
              (message_id, sender_id, recipient_id, message_kind, group_id,
-              body, timestamp, received_at, ttl_seconds, is_read, raw_envelope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 row.message_id,
                 row.sender_id,
@@ -475,6 +538,7 @@ impl Storage {
                 row.ttl_seconds as i64,
                 row.is_read as i32,
                 row.raw_envelope,
+                row.reply_to,
             ],
         )?;
         Ok(())
@@ -483,7 +547,7 @@ impl Storage {
     pub fn get_message(&self, message_id: &str) -> Result<Option<MessageRow>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
              FROM messages WHERE message_id = ?1",
         )?;
         let row = stmt
@@ -500,6 +564,7 @@ impl Storage {
                     ttl_seconds: row.get::<_, i64>(8)? as u64,
                     is_read: row.get::<_, i32>(9)? != 0,
                     raw_envelope: row.get(10)?,
+                    reply_to: row.get(11)?,
                 })
             })
             .optional()?;
@@ -516,7 +581,7 @@ impl Storage {
     ) -> Result<Vec<MessageRow>, StorageError> {
         let mut sql = String::from(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
              FROM messages WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -552,6 +617,7 @@ impl Storage {
                 ttl_seconds: row.get::<_, i64>(8)? as u64,
                 is_read: row.get::<_, i32>(9)? != 0,
                 raw_envelope: row.get(10)?,
+                reply_to: row.get(11)?,
             })
         })?;
         let mut result = Vec::new();
@@ -639,7 +705,7 @@ impl Storage {
     ) -> Result<Vec<MessageRow>, StorageError> {
         let mut sql = String::from(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
              FROM messages
              WHERE message_kind = 'direct'
                AND ((sender_id = ?1 AND recipient_id = ?2)
@@ -676,6 +742,7 @@ impl Storage {
                 ttl_seconds: row.get::<_, i64>(8)? as u64,
                 is_read: row.get::<_, i32>(9)? != 0,
                 raw_envelope: row.get(10)?,
+                reply_to: row.get(11)?,
             })
         })?;
 
@@ -1005,6 +1072,219 @@ impl Storage {
     }
 
     // -----------------------------------------------------------------------
+    // Reactions CRUD (Phase 8)
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a reaction. Uses PRIMARY KEY (target_id, sender_id)
+    /// so each sender can have at most one reaction per target message.
+    pub fn upsert_reaction(&self, row: &ReactionRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO reactions
+             (message_id, target_id, sender_id, reaction, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.message_id,
+                row.target_id,
+                row.sender_id,
+                row.reaction,
+                row.timestamp as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a reaction by target_id and sender_id.
+    pub fn delete_reaction(&self, target_id: &str, sender_id: &str) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "DELETE FROM reactions WHERE target_id = ?1 AND sender_id = ?2",
+            params![target_id, sender_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Get a specific sender's reaction for a target message.
+    pub fn get_reaction(
+        &self,
+        target_id: &str,
+        sender_id: &str,
+    ) -> Result<Option<ReactionRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, target_id, sender_id, reaction, timestamp
+             FROM reactions WHERE target_id = ?1 AND sender_id = ?2",
+        )?;
+        let row = stmt
+            .query_row(params![target_id, sender_id], |row| {
+                Ok(ReactionRow {
+                    message_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    sender_id: row.get(2)?,
+                    reaction: row.get(3)?,
+                    timestamp: row.get::<_, i64>(4)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List all reactions for a target message.
+    pub fn list_reactions(&self, target_id: &str) -> Result<Vec<ReactionRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, target_id, sender_id, reaction, timestamp
+             FROM reactions WHERE target_id = ?1 ORDER BY timestamp",
+        )?;
+        let rows = stmt.query_map(params![target_id], |row| {
+            Ok(ReactionRow {
+                message_id: row.get(0)?,
+                target_id: row.get(1)?,
+                sender_id: row.get(2)?,
+                reaction: row.get(3)?,
+                timestamp: row.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get aggregated reaction counts for a target message.
+    pub fn count_reactions(&self, target_id: &str) -> Result<(u32, u32), StorageError> {
+        let upvotes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE target_id = ?1 AND reaction = 'upvote'",
+            params![target_id],
+            |row| row.get(0),
+        )?;
+        let downvotes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE target_id = ?1 AND reaction = 'downvote'",
+            params![target_id],
+            |row| row.get(0),
+        )?;
+        Ok((upvotes as u32, downvotes as u32))
+    }
+
+    // -----------------------------------------------------------------------
+    // Replies (Phase 9)
+    // -----------------------------------------------------------------------
+
+    /// List replies to a given message.
+    pub fn list_replies(
+        &self,
+        parent_id: &str,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MessageRow>, StorageError> {
+        let mut sql = String::from(
+            "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+             FROM messages WHERE reply_to = ?",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(parent_id.to_string())];
+
+        if let Some(b) = before {
+            sql.push_str(" AND timestamp < ?");
+            bind_values.push(Box::new(b as i64));
+        }
+
+        sql.push_str(" ORDER BY timestamp ASC LIMIT ?");
+        bind_values.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok(MessageRow {
+                message_id: row.get(0)?,
+                sender_id: row.get(1)?,
+                recipient_id: row.get(2)?,
+                message_kind: row.get(3)?,
+                group_id: row.get(4)?,
+                body: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+                received_at: row.get::<_, i64>(7)? as u64,
+                ttl_seconds: row.get::<_, i64>(8)? as u64,
+                is_read: row.get::<_, i32>(9)? != 0,
+                raw_envelope: row.get(10)?,
+                reply_to: row.get(11)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Count the number of replies to a given message.
+    pub fn count_replies(&self, parent_id: &str) -> Result<u32, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE reply_to = ?1",
+            params![parent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiles CRUD (Phase 10)
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a profile.
+    pub fn upsert_profile(&self, row: &ProfileRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO profiles
+             (user_id, display_name, bio, avatar_hash, public_fields, friends_fields, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.user_id,
+                row.display_name,
+                row.bio,
+                row.avatar_hash,
+                row.public_fields,
+                row.friends_fields,
+                row.updated_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a profile by user ID.
+    pub fn get_profile(&self, user_id: &str) -> Result<Option<ProfileRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_id, display_name, bio, avatar_hash, public_fields, friends_fields, updated_at
+             FROM profiles WHERE user_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![user_id], |row| {
+                Ok(ProfileRow {
+                    user_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    bio: row.get(2)?,
+                    avatar_hash: row.get(3)?,
+                    public_fields: row.get(4)?,
+                    friends_fields: row.get(5)?,
+                    updated_at: row.get::<_, i64>(6)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Update a profile only if the incoming update is newer.
+    pub fn upsert_profile_if_newer(&self, row: &ProfileRow) -> Result<bool, StorageError> {
+        if let Some(existing) = self.get_profile(&row.user_id)? {
+            if existing.updated_at >= row.updated_at {
+                return Ok(false);
+            }
+        }
+        self.upsert_profile(row)?;
+        Ok(true)
+    }
+
+    // -----------------------------------------------------------------------
     // JSON-to-SQLite migration
     // -----------------------------------------------------------------------
 
@@ -1081,6 +1361,7 @@ impl Storage {
                         ttl_seconds: 3600,
                         is_read: false,
                         raw_envelope: None,
+                        reply_to: None,
                     };
                     self.insert_message(&row)?;
                     report.inbox_migrated += 1;
@@ -1147,6 +1428,7 @@ impl Storage {
             ttl_seconds: envelope.header.ttl_seconds,
             is_read: false,
             raw_envelope: Some(raw),
+            reply_to: None,
         };
         self.insert_message(&row)
     }
@@ -1329,6 +1611,7 @@ mod tests {
             ttl_seconds: 3600,
             is_read: false,
             raw_envelope: None,
+            reply_to: None,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -1384,6 +1667,7 @@ mod tests {
                 ttl_seconds: 3600,
                 is_read: false,
                 raw_envelope: None,
+                reply_to: None,
             };
             storage.insert_message(&msg).unwrap();
         }
@@ -1559,6 +1843,7 @@ mod tests {
             ttl_seconds: 3600,
             is_read: false,
             raw_envelope: None,
+            reply_to: None,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -1695,6 +1980,7 @@ mod tests {
             ttl_seconds: 3600,
             is_read: false,
             raw_envelope: None,
+            reply_to: None,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -1746,5 +2032,213 @@ mod tests {
         // Empty list for unknown message
         let empty = storage.list_message_attachments("nonexistent").unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_reactions_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        // Create a target message
+        let msg = MessageRow {
+            message_id: "post-1".to_string(),
+            sender_id: "author".to_string(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("Hello world".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: true,
+            raw_envelope: None,
+            reply_to: None,
+        };
+        storage.insert_message(&msg).unwrap();
+
+        // Add upvote
+        let reaction = ReactionRow {
+            message_id: "react-1".to_string(),
+            target_id: "post-1".to_string(),
+            sender_id: "voter-a".to_string(),
+            reaction: "upvote".to_string(),
+            timestamp: now,
+        };
+        storage.upsert_reaction(&reaction).unwrap();
+
+        // Add downvote from another user
+        let reaction2 = ReactionRow {
+            message_id: "react-2".to_string(),
+            target_id: "post-1".to_string(),
+            sender_id: "voter-b".to_string(),
+            reaction: "downvote".to_string(),
+            timestamp: now,
+        };
+        storage.upsert_reaction(&reaction2).unwrap();
+
+        // Get specific reaction
+        let loaded = storage.get_reaction("post-1", "voter-a").unwrap().unwrap();
+        assert_eq!(loaded.reaction, "upvote");
+
+        // Count reactions
+        let (up, down) = storage.count_reactions("post-1").unwrap();
+        assert_eq!(up, 1);
+        assert_eq!(down, 1);
+
+        // List reactions
+        let reactions = storage.list_reactions("post-1").unwrap();
+        assert_eq!(reactions.len(), 2);
+
+        // Change vote (upsert replaces)
+        let changed = ReactionRow {
+            message_id: "react-3".to_string(),
+            target_id: "post-1".to_string(),
+            sender_id: "voter-a".to_string(),
+            reaction: "downvote".to_string(),
+            timestamp: now + 1,
+        };
+        storage.upsert_reaction(&changed).unwrap();
+        let (up, down) = storage.count_reactions("post-1").unwrap();
+        assert_eq!(up, 0);
+        assert_eq!(down, 2);
+
+        // Delete reaction
+        assert!(storage.delete_reaction("post-1", "voter-b").unwrap());
+        let (up, down) = storage.count_reactions("post-1").unwrap();
+        assert_eq!(up, 0);
+        assert_eq!(down, 1);
+
+        // Delete non-existent reaction
+        assert!(!storage.delete_reaction("post-1", "nonexistent").unwrap());
+    }
+
+    #[test]
+    fn test_replies() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        // Create parent post
+        let parent = MessageRow {
+            message_id: "parent-1".to_string(),
+            sender_id: "author".to_string(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("Original post".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: true,
+            raw_envelope: None,
+            reply_to: None,
+        };
+        storage.insert_message(&parent).unwrap();
+
+        // Create replies
+        let reply1 = MessageRow {
+            message_id: "reply-1".to_string(),
+            sender_id: "replier-a".to_string(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("First reply".to_string()),
+            timestamp: now + 1,
+            received_at: now + 1,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: None,
+            reply_to: Some("parent-1".to_string()),
+        };
+        let reply2 = MessageRow {
+            message_id: "reply-2".to_string(),
+            sender_id: "replier-b".to_string(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("Second reply".to_string()),
+            timestamp: now + 2,
+            received_at: now + 2,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: None,
+            reply_to: Some("parent-1".to_string()),
+        };
+        storage.insert_message(&reply1).unwrap();
+        storage.insert_message(&reply2).unwrap();
+
+        // Count replies
+        assert_eq!(storage.count_replies("parent-1").unwrap(), 2);
+        assert_eq!(storage.count_replies("reply-1").unwrap(), 0);
+
+        // List replies (ascending order)
+        let replies = storage.list_replies("parent-1", None, 100).unwrap();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].message_id, "reply-1");
+        assert_eq!(replies[1].message_id, "reply-2");
+
+        // reply_to field preserved on load
+        let loaded = storage.get_message("reply-1").unwrap().unwrap();
+        assert_eq!(loaded.reply_to, Some("parent-1".to_string()));
+    }
+
+    #[test]
+    fn test_profiles_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        // No profile initially
+        assert!(storage.get_profile("user-1").unwrap().is_none());
+
+        // Insert profile
+        let profile = ProfileRow {
+            user_id: "user-1".to_string(),
+            display_name: Some("Alice".to_string()),
+            bio: Some("Hello there".to_string()),
+            avatar_hash: None,
+            public_fields: r#"{"location":"Earth"}"#.to_string(),
+            friends_fields: r#"{"email":"alice@example.com"}"#.to_string(),
+            updated_at: now,
+        };
+        storage.upsert_profile(&profile).unwrap();
+
+        // Get profile
+        let loaded = storage.get_profile("user-1").unwrap().unwrap();
+        assert_eq!(loaded.display_name, Some("Alice".to_string()));
+        assert_eq!(loaded.bio, Some("Hello there".to_string()));
+        assert_eq!(loaded.public_fields, r#"{"location":"Earth"}"#);
+
+        // Update profile
+        let updated = ProfileRow {
+            display_name: Some("Alice Updated".to_string()),
+            updated_at: now + 10,
+            ..profile.clone()
+        };
+        storage.upsert_profile(&updated).unwrap();
+        let loaded = storage.get_profile("user-1").unwrap().unwrap();
+        assert_eq!(loaded.display_name, Some("Alice Updated".to_string()));
+
+        // upsert_if_newer: older update should be rejected
+        let older = ProfileRow {
+            display_name: Some("Old Alice".to_string()),
+            updated_at: now - 10,
+            ..profile
+        };
+        assert!(!storage.upsert_profile_if_newer(&older).unwrap());
+        let loaded = storage.get_profile("user-1").unwrap().unwrap();
+        assert_eq!(loaded.display_name, Some("Alice Updated".to_string()));
+
+        // upsert_if_newer: newer update should succeed
+        let newer = ProfileRow {
+            user_id: "user-1".to_string(),
+            display_name: Some("Newest Alice".to_string()),
+            bio: None,
+            avatar_hash: None,
+            public_fields: "{}".to_string(),
+            friends_fields: "{}".to_string(),
+            updated_at: now + 100,
+        };
+        assert!(storage.upsert_profile_if_newer(&newer).unwrap());
+        let loaded = storage.get_profile("user-1").unwrap().unwrap();
+        assert_eq!(loaded.display_name, Some("Newest Alice".to_string()));
     }
 }

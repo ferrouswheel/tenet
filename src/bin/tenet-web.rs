@@ -28,8 +28,8 @@ use tenet::protocol::{
     build_plaintext_envelope, decode_meta_payload, MessageKind, MetaMessage,
 };
 use tenet::storage::{
-    db_path, AttachmentRow, IdentityRow, MessageAttachmentRow, MessageRow, PeerRow, RelayRow,
-    Storage,
+    db_path, AttachmentRow, IdentityRow, MessageAttachmentRow, MessageRow, PeerRow, ProfileRow,
+    ReactionRow, RelayRow, Storage,
 };
 
 // ---------------------------------------------------------------------------
@@ -247,6 +247,27 @@ async fn main() {
             "/api/attachments/:content_hash",
             get(download_attachment_handler),
         )
+        // Reactions API (Phase 8)
+        .route(
+            "/api/messages/:message_id/react",
+            post(react_handler).delete(unreact_handler),
+        )
+        .route(
+            "/api/messages/:message_id/reactions",
+            get(list_reactions_handler),
+        )
+        // Replies API (Phase 9)
+        .route(
+            "/api/messages/:message_id/replies",
+            get(list_replies_handler),
+        )
+        .route("/api/messages/:message_id/reply", post(reply_handler))
+        // Profiles API (Phase 10)
+        .route(
+            "/api/profile",
+            get(get_own_profile_handler).put(update_own_profile_handler),
+        )
+        .route("/api/peers/:peer_id/profile", get(get_peer_profile_handler))
         // Conversations API (Phase 5)
         .route("/api/conversations", get(list_conversations_handler))
         .route("/api/conversations/:peer_id", get(get_conversation_handler))
@@ -309,7 +330,8 @@ struct ListMessagesQuery {
     limit: Option<u32>,
 }
 
-/// Build the JSON representation of a message including its attachments.
+/// Build the JSON representation of a message including its attachments,
+/// reaction counts, and reply count.
 fn message_to_json(m: &MessageRow, storage: &Storage) -> serde_json::Value {
     let attachments = storage
         .list_message_attachments(&m.message_id)
@@ -325,6 +347,9 @@ fn message_to_json(m: &MessageRow, storage: &Storage) -> serde_json::Value {
         })
         .collect();
 
+    let (upvotes, downvotes) = storage.count_reactions(&m.message_id).unwrap_or((0, 0));
+    let reply_count = storage.count_replies(&m.message_id).unwrap_or(0);
+
     serde_json::json!({
         "message_id": m.message_id,
         "sender_id": m.sender_id,
@@ -336,6 +361,10 @@ fn message_to_json(m: &MessageRow, storage: &Storage) -> serde_json::Value {
         "received_at": m.received_at,
         "is_read": m.is_read,
         "attachments": att_json,
+        "reply_to": m.reply_to,
+        "upvotes": upvotes,
+        "downvotes": downvotes,
+        "reply_count": reply_count,
     })
 }
 
@@ -488,6 +517,7 @@ async fn send_direct_handler(
         ttl_seconds: DEFAULT_TTL_SECONDS,
         is_read: true,
         raw_envelope: None,
+        reply_to: None,
     });
 
     // Link attachments to message
@@ -579,6 +609,7 @@ async fn send_public_handler(
         ttl_seconds: DEFAULT_TTL_SECONDS,
         is_read: true,
         raw_envelope: None,
+        reply_to: None,
     });
 
     // Link attachments to message
@@ -686,6 +717,7 @@ async fn send_group_handler(
         ttl_seconds: DEFAULT_TTL_SECONDS,
         is_read: true,
         raw_envelope: None,
+        reply_to: None,
     });
 
     // Link attachments to message
@@ -1310,6 +1342,587 @@ async fn download_attachment_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Reactions API (Phase 8)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReactRequest {
+    reaction: String,
+}
+
+async fn react_handler(
+    State(state): State<SharedState>,
+    Path(message_id): Path<String>,
+    axum::Json(req): axum::Json<ReactRequest>,
+) -> Response {
+    if req.reaction != "upvote" && req.reaction != "downvote" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "reaction must be 'upvote' or 'downvote'",
+        );
+    }
+
+    let st = state.lock().await;
+
+    // Verify target message exists
+    if !st.storage.has_message(&message_id).unwrap_or(false) {
+        return api_error(StatusCode::NOT_FOUND, "message not found");
+    }
+
+    let now = now_secs();
+
+    // Build a reaction message and send it as a public message
+    let reaction_payload = serde_json::json!({
+        "target_message_id": message_id,
+        "reaction": req.reaction,
+        "timestamp": now,
+    });
+
+    let body_str = serde_json::to_string(&reaction_payload).unwrap_or_default();
+
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+
+    let envelope = match build_plaintext_envelope(
+        st.keypair.id.as_str(),
+        "*",
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Public,
+        None,
+        &body_str,
+        salt,
+        &st.keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
+    };
+
+    // Post to relay
+    if let Some(ref relay_url) = st.relay_url {
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    let reaction_msg_id = envelope.header.message_id.0.clone();
+
+    // Store the reaction
+    let reaction_row = ReactionRow {
+        message_id: reaction_msg_id.clone(),
+        target_id: message_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        reaction: req.reaction.clone(),
+        timestamp: now,
+    };
+    if let Err(e) = st.storage.upsert_reaction(&reaction_row) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    let (upvotes, downvotes) = st.storage.count_reactions(&message_id).unwrap_or((0, 0));
+
+    let json = serde_json::json!({
+        "status": "ok",
+        "target_id": message_id,
+        "reaction": req.reaction,
+        "upvotes": upvotes,
+        "downvotes": downvotes,
+    });
+    (StatusCode::OK, axum::Json(json)).into_response()
+}
+
+async fn unreact_handler(
+    State(state): State<SharedState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+
+    match st.storage.delete_reaction(&message_id, &st.keypair.id) {
+        Ok(true) => {
+            let (upvotes, downvotes) = st.storage.count_reactions(&message_id).unwrap_or((0, 0));
+            let json = serde_json::json!({
+                "status": "removed",
+                "target_id": message_id,
+                "upvotes": upvotes,
+                "downvotes": downvotes,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "no reaction to remove"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn list_reactions_handler(
+    State(state): State<SharedState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    let (upvotes, downvotes) = st.storage.count_reactions(&message_id).unwrap_or((0, 0));
+    let reactions = st.storage.list_reactions(&message_id).unwrap_or_default();
+
+    let reaction_json: Vec<serde_json::Value> = reactions
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "sender_id": r.sender_id,
+                "reaction": r.reaction,
+                "timestamp": r.timestamp,
+            })
+        })
+        .collect();
+
+    // Determine current user's reaction
+    let my_reaction = st
+        .storage
+        .get_reaction(&message_id, &st.keypair.id)
+        .ok()
+        .flatten()
+        .map(|r| r.reaction);
+
+    let json = serde_json::json!({
+        "target_id": message_id,
+        "upvotes": upvotes,
+        "downvotes": downvotes,
+        "my_reaction": my_reaction,
+        "reactions": reaction_json,
+    });
+    (StatusCode::OK, axum::Json(json)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Replies API (Phase 9)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReplyRequest {
+    body: String,
+    #[serde(default)]
+    attachments: Vec<SendAttachmentRef>,
+}
+
+#[derive(Deserialize)]
+struct ListRepliesQuery {
+    before: Option<u64>,
+    limit: Option<u32>,
+}
+
+async fn list_replies_handler(
+    State(state): State<SharedState>,
+    Path(message_id): Path<String>,
+    Query(params): Query<ListRepliesQuery>,
+) -> Response {
+    let st = state.lock().await;
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    match st.storage.list_replies(&message_id, params.before, limit) {
+        Ok(replies) => {
+            let json: Vec<serde_json::Value> = replies
+                .iter()
+                .map(|m| message_to_json(m, &st.storage))
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn reply_handler(
+    State(state): State<SharedState>,
+    Path(parent_message_id): Path<String>,
+    axum::Json(req): axum::Json<ReplyRequest>,
+) -> Response {
+    if req.body.trim().is_empty() && req.attachments.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "body or attachments required");
+    }
+
+    let st = state.lock().await;
+
+    // Verify parent message exists and determine its kind
+    let parent = match st.storage.get_message(&parent_message_id) {
+        Ok(Some(m)) => m,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "parent message not found"),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let now = now_secs();
+
+    // Replies inherit the message_kind of the parent
+    let message_kind = parent.message_kind.as_str();
+
+    // Build envelope based on parent message kind
+    let envelope = if message_kind == "public" {
+        let mut salt = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+
+        match build_plaintext_envelope(
+            st.keypair.id.as_str(),
+            "*",
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::Public,
+            None,
+            &req.body,
+            salt,
+            &st.keypair.signing_private_key_hex,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}"))
+            }
+        }
+    } else if message_kind == "friend_group" {
+        // For group replies, encrypt with group key
+        let group_id = match parent.group_id.as_deref() {
+            Some(gid) => gid,
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "parent group message has no group_id",
+                )
+            }
+        };
+        let group = match st.storage.get_group(group_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let group_key: [u8; 32] = match group.group_key.try_into() {
+            Ok(k) => k,
+            Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
+        };
+        let aad = group_id.as_bytes();
+        let payload = match tenet::protocol::build_group_message_payload(
+            req.body.as_bytes(),
+            &group_key,
+            aad,
+        ) {
+            Ok(p) => p,
+            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
+        };
+        match build_envelope_from_payload(
+            st.keypair.id.clone(),
+            "*".to_string(),
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::FriendGroup,
+            Some(group_id.to_string()),
+            payload,
+            &st.keypair.signing_private_key_hex,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}"))
+            }
+        }
+    } else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "replies only supported for public and group messages",
+        );
+    };
+
+    // Post to relay
+    if let Some(ref relay_url) = st.relay_url {
+        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+        if let Ok(json_val) = serde_json::to_value(&envelope) {
+            let _ = ureq::post(&url).send_json(json_val);
+        }
+    }
+
+    let msg_id = envelope.header.message_id.0.clone();
+
+    // Persist as message with reply_to set
+    let _ = st.storage.insert_outbox(&tenet::storage::OutboxRow {
+        message_id: msg_id.clone(),
+        envelope: serde_json::to_string(&envelope).unwrap_or_default(),
+        sent_at: now,
+        delivered: false,
+    });
+
+    let _ = st.storage.insert_message(&MessageRow {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        recipient_id: "*".to_string(),
+        message_kind: message_kind.to_string(),
+        group_id: parent.group_id.clone(),
+        body: Some(req.body.clone()),
+        timestamp: now,
+        received_at: now,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        is_read: true,
+        raw_envelope: None,
+        reply_to: Some(parent_message_id.clone()),
+    });
+
+    // Link attachments
+    link_attachments(&st.storage, &msg_id, &req.attachments);
+
+    // Broadcast
+    let _ = st.ws_tx.send(WsEvent::NewMessage {
+        message_id: msg_id.clone(),
+        sender_id: st.keypair.id.clone(),
+        message_kind: message_kind.to_string(),
+        body: Some(req.body),
+        timestamp: now,
+    });
+
+    let json = serde_json::json!({
+        "message_id": msg_id,
+        "status": "sent",
+        "reply_to": parent_message_id,
+    });
+    (StatusCode::CREATED, axum::Json(json)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Profiles API (Phase 10)
+// ---------------------------------------------------------------------------
+
+async fn get_own_profile_handler(State(state): State<SharedState>) -> Response {
+    let st = state.lock().await;
+    match st.storage.get_profile(&st.keypair.id) {
+        Ok(Some(profile)) => {
+            let public_fields: serde_json::Value =
+                serde_json::from_str(&profile.public_fields).unwrap_or(serde_json::json!({}));
+            let friends_fields: serde_json::Value =
+                serde_json::from_str(&profile.friends_fields).unwrap_or(serde_json::json!({}));
+
+            let json = serde_json::json!({
+                "user_id": profile.user_id,
+                "display_name": profile.display_name,
+                "bio": profile.bio,
+                "avatar_hash": profile.avatar_hash,
+                "public_fields": public_fields,
+                "friends_fields": friends_fields,
+                "updated_at": profile.updated_at,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(None) => {
+            // Return empty profile
+            let json = serde_json::json!({
+                "user_id": st.keypair.id,
+                "display_name": null,
+                "bio": null,
+                "avatar_hash": null,
+                "public_fields": {},
+                "friends_fields": {},
+                "updated_at": 0,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateProfileRequest {
+    display_name: Option<String>,
+    bio: Option<String>,
+    avatar_hash: Option<String>,
+    #[serde(default = "default_empty_json")]
+    public_fields: serde_json::Value,
+    #[serde(default = "default_empty_json")]
+    friends_fields: serde_json::Value,
+}
+
+fn default_empty_json() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+async fn update_own_profile_handler(
+    State(state): State<SharedState>,
+    axum::Json(req): axum::Json<UpdateProfileRequest>,
+) -> Response {
+    let st = state.lock().await;
+    let now = now_secs();
+
+    let profile = ProfileRow {
+        user_id: st.keypair.id.clone(),
+        display_name: req.display_name.clone(),
+        bio: req.bio.clone(),
+        avatar_hash: req.avatar_hash.clone(),
+        public_fields: serde_json::to_string(&req.public_fields)
+            .unwrap_or_else(|_| "{}".to_string()),
+        friends_fields: serde_json::to_string(&req.friends_fields)
+            .unwrap_or_else(|_| "{}".to_string()),
+        updated_at: now,
+    };
+
+    if let Err(e) = st.storage.upsert_profile(&profile) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    // Broadcast public profile as a Public message
+    let public_profile = serde_json::json!({
+        "type": "tenet.profile",
+        "user_id": st.keypair.id,
+        "display_name": req.display_name,
+        "bio": req.bio,
+        "avatar_hash": req.avatar_hash,
+        "public_fields": req.public_fields,
+        "updated_at": now,
+    });
+
+    let body_str = serde_json::to_string(&public_profile).unwrap_or_default();
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+
+    // Send public profile as a Public message
+    if let Ok(envelope) = build_plaintext_envelope(
+        st.keypair.id.as_str(),
+        "*",
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Public,
+        None,
+        &body_str,
+        salt,
+        &st.keypair.signing_private_key_hex,
+    ) {
+        if let Some(ref relay_url) = st.relay_url {
+            let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+            if let Ok(json_val) = serde_json::to_value(&envelope) {
+                let _ = ureq::post(&url).send_json(json_val);
+            }
+        }
+    }
+
+    // Send friends-only profile to each friend via encrypted Direct messages
+    let friends_profile = serde_json::json!({
+        "type": "tenet.profile",
+        "user_id": st.keypair.id,
+        "display_name": req.display_name,
+        "bio": req.bio,
+        "avatar_hash": req.avatar_hash,
+        "public_fields": req.public_fields,
+        "friends_fields": req.friends_fields,
+        "updated_at": now,
+    });
+    let friends_body = serde_json::to_string(&friends_profile).unwrap_or_default();
+
+    if let Ok(peers) = st.storage.list_peers() {
+        for peer in &peers {
+            if !peer.is_friend {
+                continue;
+            }
+            let enc_key = match peer.encryption_public_key.as_deref() {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
+
+            let content_key = generate_content_key();
+            let mut nonce = [0u8; NONCE_SIZE];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+            if let Ok(payload) = build_encrypted_payload(
+                friends_body.as_bytes(),
+                &enc_key,
+                WEB_PAYLOAD_AAD,
+                WEB_HPKE_INFO,
+                &content_key,
+                &nonce,
+                None,
+            ) {
+                if let Ok(envelope) = build_envelope_from_payload(
+                    st.keypair.id.clone(),
+                    peer.peer_id.clone(),
+                    None,
+                    None,
+                    now,
+                    DEFAULT_TTL_SECONDS,
+                    MessageKind::Direct,
+                    None,
+                    payload,
+                    &st.keypair.signing_private_key_hex,
+                ) {
+                    if let Some(ref relay_url) = st.relay_url {
+                        let url = format!("{}/envelopes", relay_url.trim_end_matches('/'));
+                        if let Ok(json_val) = serde_json::to_value(&envelope) {
+                            let _ = ureq::post(&url).send_json(json_val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let json = serde_json::json!({
+        "user_id": st.keypair.id,
+        "display_name": req.display_name,
+        "bio": req.bio,
+        "avatar_hash": req.avatar_hash,
+        "public_fields": req.public_fields,
+        "friends_fields": req.friends_fields,
+        "updated_at": now,
+    });
+    (StatusCode::OK, axum::Json(json)).into_response()
+}
+
+async fn get_peer_profile_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+
+    // Check if peer is a friend
+    let is_friend = st
+        .storage
+        .get_peer(&peer_id)
+        .ok()
+        .flatten()
+        .map(|p| p.is_friend)
+        .unwrap_or(false);
+
+    match st.storage.get_profile(&peer_id) {
+        Ok(Some(profile)) => {
+            let public_fields: serde_json::Value =
+                serde_json::from_str(&profile.public_fields).unwrap_or(serde_json::json!({}));
+
+            let mut json = serde_json::json!({
+                "user_id": profile.user_id,
+                "display_name": profile.display_name,
+                "bio": profile.bio,
+                "avatar_hash": profile.avatar_hash,
+                "public_fields": public_fields,
+                "updated_at": profile.updated_at,
+            });
+
+            // If the peer is a friend, include friends-only fields
+            if is_friend {
+                let friends_fields: serde_json::Value =
+                    serde_json::from_str(&profile.friends_fields).unwrap_or(serde_json::json!({}));
+                json["friends_fields"] = friends_fields;
+            }
+
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(None) => {
+            let json = serde_json::json!({
+                "user_id": peer_id,
+                "display_name": null,
+                "bio": null,
+                "avatar_hash": null,
+                "public_fields": {},
+                "updated_at": 0,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Conversations API (Phase 5)
 // ---------------------------------------------------------------------------
 
@@ -1569,6 +2182,7 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
             ttl_seconds: DEFAULT_TTL_SECONDS,
             is_read: false,
             raw_envelope: None,
+            reply_to: None,
         };
         if st.storage.insert_message(&row).is_ok() {
             // Push to WebSocket clients
