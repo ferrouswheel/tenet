@@ -436,6 +436,111 @@ body {
     border-color: #5566cc;
 }
 
+/* Attachments (Phase 7) */
+.compose-attachments {
+    margin-top: 0.5rem;
+}
+.attachment-picker {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.attachment-picker label {
+    background: #2a2d37;
+    border: 1px solid #3a3d47;
+    color: #aaa;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.attachment-picker label:hover { background: #3a3d47; color: #ddd; }
+.attachment-picker input[type="file"] { display: none; }
+.attachment-previews {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+.attachment-preview {
+    position: relative;
+    background: #0f1117;
+    border: 1px solid #2a2d37;
+    border-radius: 6px;
+    padding: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 200px;
+}
+.attachment-preview img {
+    width: 48px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 4px;
+}
+.attachment-preview .att-info {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.75rem;
+    color: #aaa;
+}
+.attachment-preview .att-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.attachment-preview .att-size {
+    color: #666;
+}
+.attachment-preview .att-remove {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: #f44336;
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    font-size: 0.7rem;
+    line-height: 18px;
+    text-align: center;
+    cursor: pointer;
+    padding: 0;
+}
+.msg-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+.msg-attachment-img {
+    max-width: 300px;
+    max-height: 200px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.msg-attachment-img:hover { opacity: 0.9; }
+.msg-attachment-file {
+    background: #0f1117;
+    border: 1px solid #2a2d37;
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    text-decoration: none;
+    color: #aaa;
+    font-size: 0.8rem;
+}
+.msg-attachment-file:hover { border-color: #5566cc; color: #ddd; }
+.msg-attachment-file .file-icon { font-size: 1rem; }
+.compose-drop-active {
+    border-color: #5566cc !important;
+    background: #1a2a3a !important;
+}
+
 /* Toast notification */
 .toast {
     position: fixed;

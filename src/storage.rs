@@ -167,6 +167,26 @@ pub struct RelayRow {
     pub enabled: bool,
 }
 
+/// Attachment row stored in the database (Phase 7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentRow {
+    pub content_hash: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    #[serde(skip)]
+    pub data: Vec<u8>,
+    pub created_at: u64,
+}
+
+/// Link between a message and its attachments (Phase 7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageAttachmentRow {
+    pub message_id: String,
+    pub content_hash: String,
+    pub filename: Option<String>,
+    pub position: u32,
+}
+
 /// Conversation summary for the conversations list view (Phase 5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
@@ -277,6 +297,22 @@ impl Storage {
                 added_at    INTEGER NOT NULL,
                 last_sync   INTEGER,
                 enabled     INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS attachments (
+                content_hash    TEXT PRIMARY KEY,
+                content_type    TEXT NOT NULL,
+                size_bytes      INTEGER NOT NULL,
+                data            BLOB NOT NULL,
+                created_at      INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS message_attachments (
+                message_id      TEXT NOT NULL REFERENCES messages(message_id),
+                content_hash    TEXT NOT NULL REFERENCES attachments(content_hash),
+                filename        TEXT,
+                position        INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_id, content_hash)
             );
             ",
         )?;
@@ -877,6 +913,95 @@ impl Storage {
             .conn
             .execute("DELETE FROM relays WHERE url = ?1", params![url])?;
         Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Attachments CRUD (Phase 7)
+    // -----------------------------------------------------------------------
+
+    /// Insert an attachment. Uses INSERT OR IGNORE for content-addressed dedup.
+    pub fn insert_attachment(&self, row: &AttachmentRow) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO attachments
+             (content_hash, content_type, size_bytes, data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.content_hash,
+                row.content_type,
+                row.size_bytes as i64,
+                row.data,
+                row.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve an attachment by its content hash.
+    pub fn get_attachment(
+        &self,
+        content_hash: &str,
+    ) -> Result<Option<AttachmentRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, content_type, size_bytes, data, created_at
+             FROM attachments WHERE content_hash = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![content_hash], |row| {
+                Ok(AttachmentRow {
+                    content_hash: row.get(0)?,
+                    content_type: row.get(1)?,
+                    size_bytes: row.get::<_, i64>(2)? as u64,
+                    data: row.get(3)?,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Link an attachment to a message.
+    pub fn insert_message_attachment(
+        &self,
+        row: &MessageAttachmentRow,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO message_attachments
+             (message_id, content_hash, filename, position)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                row.message_id,
+                row.content_hash,
+                row.filename,
+                row.position as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all attachments for a given message.
+    pub fn list_message_attachments(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<MessageAttachmentRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, content_hash, filename, position
+             FROM message_attachments
+             WHERE message_id = ?1
+             ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![message_id], |row| {
+            Ok(MessageAttachmentRow {
+                message_id: row.get(0)?,
+                content_hash: row.get(1)?,
+                filename: row.get(2)?,
+                position: row.get::<_, i64>(3)? as u32,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -1517,5 +1642,109 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_attachment_crud() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        let attachment = AttachmentRow {
+            content_hash: "abc123hash".to_string(),
+            content_type: "image/png".to_string(),
+            size_bytes: 1024,
+            data: vec![0u8; 1024],
+            created_at: now,
+        };
+        storage.insert_attachment(&attachment).unwrap();
+
+        // Get attachment
+        let loaded = storage.get_attachment("abc123hash").unwrap().unwrap();
+        assert_eq!(loaded.content_type, "image/png");
+        assert_eq!(loaded.size_bytes, 1024);
+        assert_eq!(loaded.data.len(), 1024);
+
+        // Insert duplicate (should be silently ignored)
+        let dup = AttachmentRow {
+            content_type: "image/jpeg".to_string(),
+            ..attachment
+        };
+        storage.insert_attachment(&dup).unwrap();
+        let loaded = storage.get_attachment("abc123hash").unwrap().unwrap();
+        assert_eq!(loaded.content_type, "image/png"); // original preserved
+
+        // Not found
+        assert!(storage.get_attachment("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_message_attachments() {
+        let storage = Storage::open_in_memory().unwrap();
+        let now = now_secs();
+
+        // Create a message first
+        let msg = MessageRow {
+            message_id: "msg-attach-1".to_string(),
+            sender_id: "sender".to_string(),
+            recipient_id: "recipient".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("Check out this image".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: None,
+        };
+        storage.insert_message(&msg).unwrap();
+
+        // Create attachments
+        let att1 = AttachmentRow {
+            content_hash: "hash-a".to_string(),
+            content_type: "image/png".to_string(),
+            size_bytes: 2048,
+            data: vec![1u8; 2048],
+            created_at: now,
+        };
+        let att2 = AttachmentRow {
+            content_hash: "hash-b".to_string(),
+            content_type: "application/pdf".to_string(),
+            size_bytes: 4096,
+            data: vec![2u8; 4096],
+            created_at: now,
+        };
+        storage.insert_attachment(&att1).unwrap();
+        storage.insert_attachment(&att2).unwrap();
+
+        // Link attachments to message
+        storage
+            .insert_message_attachment(&MessageAttachmentRow {
+                message_id: "msg-attach-1".to_string(),
+                content_hash: "hash-a".to_string(),
+                filename: Some("photo.png".to_string()),
+                position: 0,
+            })
+            .unwrap();
+        storage
+            .insert_message_attachment(&MessageAttachmentRow {
+                message_id: "msg-attach-1".to_string(),
+                content_hash: "hash-b".to_string(),
+                filename: Some("document.pdf".to_string()),
+                position: 1,
+            })
+            .unwrap();
+
+        // List message attachments
+        let attachments = storage.list_message_attachments("msg-attach-1").unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].content_hash, "hash-a");
+        assert_eq!(attachments[0].filename, Some("photo.png".to_string()));
+        assert_eq!(attachments[0].position, 0);
+        assert_eq!(attachments[1].content_hash, "hash-b");
+        assert_eq!(attachments[1].position, 1);
+
+        // Empty list for unknown message
+        let empty = storage.list_message_attachments("nonexistent").unwrap();
+        assert!(empty.is_empty());
     }
 }

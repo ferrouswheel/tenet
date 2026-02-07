@@ -443,6 +443,111 @@ body {
     border-color: #5566cc;
 }
 
+/* Attachments (Phase 7) */
+.compose-attachments {
+    margin-top: 0.5rem;
+}
+.attachment-picker {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.attachment-picker label {
+    background: #2a2d37;
+    border: 1px solid #3a3d47;
+    color: #aaa;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.attachment-picker label:hover { background: #3a3d47; color: #ddd; }
+.attachment-picker input[type="file"] { display: none; }
+.attachment-previews {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+.attachment-preview {
+    position: relative;
+    background: #0f1117;
+    border: 1px solid #2a2d37;
+    border-radius: 6px;
+    padding: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 200px;
+}
+.attachment-preview img {
+    width: 48px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 4px;
+}
+.attachment-preview .att-info {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.75rem;
+    color: #aaa;
+}
+.attachment-preview .att-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.attachment-preview .att-size {
+    color: #666;
+}
+.attachment-preview .att-remove {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: #f44336;
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    font-size: 0.7rem;
+    line-height: 18px;
+    text-align: center;
+    cursor: pointer;
+    padding: 0;
+}
+.msg-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+.msg-attachment-img {
+    max-width: 300px;
+    max-height: 200px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.msg-attachment-img:hover { opacity: 0.9; }
+.msg-attachment-file {
+    background: #0f1117;
+    border: 1px solid #2a2d37;
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    text-decoration: none;
+    color: #aaa;
+    font-size: 0.8rem;
+}
+.msg-attachment-file:hover { border-color: #5566cc; color: #ddd; }
+.msg-attachment-file .file-icon { font-size: 1rem; }
+.compose-drop-active {
+    border-color: #5566cc !important;
+    background: #1a2a3a !important;
+}
+
 /* Toast notification */
 .toast {
     position: fixed;
@@ -509,8 +614,15 @@ body {
             </div>
 
             <!-- Compose box -->
-            <div class="compose">
+            <div class="compose" id="compose-box">
                 <textarea id="compose-body" placeholder="Write a message..."></textarea>
+                <div class="compose-attachments">
+                    <div class="attachment-picker">
+                        <label for="attachment-input">Attach file</label>
+                        <input type="file" id="attachment-input" multiple onchange="handleFileSelect(this.files)" />
+                    </div>
+                    <div class="attachment-previews" id="attachment-previews"></div>
+                </div>
                 <div class="compose-actions">
                     <select id="compose-kind">
                         <option value="public">Public</option>
@@ -575,7 +687,9 @@ let currentConversationPeerId = null;
 let conversationMessages = [];
 let conversationOldestTimestamp = null;
 let currentPostId = null;
+let pendingAttachments = []; // { file, previewUrl }
 const PAGE_SIZE = 50;
+const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
 
 // ---------------------------------------------------------------------------
 // API helpers
@@ -643,6 +757,8 @@ function renderMessage(m) {
         ? `onclick="showPostDetail('${m.message_id}')"`
         : `onclick="markRead('${m.message_id}')"`;
 
+    const attachmentsHtml = renderAttachments(m.attachments);
+
     return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
         <div class="msg-header">
             <span class="msg-badge ${kindClass}">${kindClass}</span>
@@ -650,7 +766,26 @@ function renderMessage(m) {
             <span class="msg-time">${timeAgo(m.timestamp)}</span>
         </div>
         <div class="msg-body">${escapeHtml(m.body || '')}</div>
+        ${attachmentsHtml}
     </div>`;
+}
+
+function renderAttachments(attachments) {
+    if (!attachments || attachments.length === 0) return '';
+    const items = attachments.map(att => {
+        const url = `/api/attachments/${encodeURIComponent(att.content_hash)}`;
+        const name = att.filename || att.content_hash.substring(0, 12);
+        // Check if it looks like an image based on filename
+        const isImage = /\.(png|jpg|jpeg|gif|webp|svg|bmp)$/i.test(name);
+        if (isImage) {
+            return `<a href="${url}" target="_blank"><img class="msg-attachment-img" src="${url}" alt="${escapeHtml(name)}" loading="lazy" /></a>`;
+        }
+        return `<a class="msg-attachment-file" href="${url}" download="${escapeHtml(name)}">
+            <span class="file-icon">&#128196;</span>
+            <span>${escapeHtml(name)}</span>
+        </a>`;
+    });
+    return `<div class="msg-attachments">${items.join('')}</div>`;
 }
 
 function escapeHtml(text) {
@@ -803,11 +938,13 @@ function renderPostDetail(post) {
     const senderLabel = isSelf ? 'You' : post.sender_id.substring(0, 12) + '...';
     const senderClass = isSelf ? 'post-sender self' : 'post-sender';
     const timestamp = new Date(post.timestamp * 1000).toLocaleString();
+    const attachmentsHtml = renderAttachments(post.attachments);
 
     el.innerHTML = `
         <div class="${senderClass}" title="${post.sender_id}">${escapeHtml(senderLabel)}</div>
         <div class="post-time">${timestamp}</div>
         <div class="post-body">${escapeHtml(post.body || '')}</div>
+        ${attachmentsHtml}
     `;
 }
 
@@ -935,21 +1072,31 @@ function loadMoreConversationMessages() {
 // ---------------------------------------------------------------------------
 async function sendMessage() {
     const body = document.getElementById('compose-body').value.trim();
-    if (!body) return;
+    if (!body && pendingAttachments.length === 0) return;
 
     const kind = document.getElementById('compose-kind').value;
     const btn = document.getElementById('compose-send');
     btn.disabled = true;
 
     try {
+        // Upload attachments first
+        const uploadedAttachments = [];
+        for (const att of pendingAttachments) {
+            const result = await uploadAttachment(att.file);
+            uploadedAttachments.push({
+                content_hash: result.content_hash,
+                filename: att.file.name,
+            });
+        }
+
         let endpoint;
         let payload;
         if (kind === 'public') {
             endpoint = '/api/messages/public';
-            payload = { body };
+            payload = { body: body || '', attachments: uploadedAttachments };
         } else if (kind === 'direct' && currentConversationPeerId) {
             endpoint = '/api/messages/direct';
-            payload = { recipient_id: currentConversationPeerId, body };
+            payload = { recipient_id: currentConversationPeerId, body: body || '', attachments: uploadedAttachments };
         } else {
             showToast('Unsupported message kind for compose');
             btn.disabled = false;
@@ -957,6 +1104,7 @@ async function sendMessage() {
         }
         await apiPost(endpoint, payload);
         document.getElementById('compose-body').value = '';
+        clearAttachments();
         showToast('Message sent');
 
         // Reload conversation messages if in conversation detail view
@@ -969,6 +1117,96 @@ async function sendMessage() {
         btn.disabled = false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attachment management (Phase 7)
+// ---------------------------------------------------------------------------
+function handleFileSelect(files) {
+    for (const file of files) {
+        if (file.size > MAX_ATTACHMENT_SIZE) {
+            showToast('File "' + file.name + '" exceeds 10 MB limit');
+            continue;
+        }
+        const previewUrl = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
+        pendingAttachments.push({ file, previewUrl });
+    }
+    renderAttachmentPreviews();
+    // Reset input so the same file can be re-selected
+    document.getElementById('attachment-input').value = '';
+}
+
+function removeAttachment(index) {
+    const att = pendingAttachments[index];
+    if (att.previewUrl) URL.revokeObjectURL(att.previewUrl);
+    pendingAttachments.splice(index, 1);
+    renderAttachmentPreviews();
+}
+
+function clearAttachments() {
+    for (const att of pendingAttachments) {
+        if (att.previewUrl) URL.revokeObjectURL(att.previewUrl);
+    }
+    pendingAttachments = [];
+    renderAttachmentPreviews();
+}
+
+function renderAttachmentPreviews() {
+    const el = document.getElementById('attachment-previews');
+    if (pendingAttachments.length === 0) {
+        el.innerHTML = '';
+        return;
+    }
+    el.innerHTML = pendingAttachments.map((att, i) => {
+        const imgTag = att.previewUrl
+            ? '<img src="' + att.previewUrl + '" alt="" />'
+            : '<span style="font-size:1.5rem;">&#128196;</span>';
+        return '<div class="attachment-preview">'
+            + imgTag
+            + '<div class="att-info">'
+            + '<div class="att-name" title="' + escapeHtml(att.file.name) + '">' + escapeHtml(att.file.name) + '</div>'
+            + '<div class="att-size">' + formatBytes(att.file.size) + '</div>'
+            + '</div>'
+            + '<button class="att-remove" onclick="removeAttachment(' + i + ')">x</button>'
+            + '</div>';
+    }).join('');
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function uploadAttachment(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('/api/attachments', { method: 'POST', body: formData });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'upload failed' }));
+        throw new Error(err.error || 'upload failed');
+    }
+    return res.json();
+}
+
+// Drag and drop on compose box
+(function setupDragDrop() {
+    const compose = document.getElementById('compose-box');
+    if (!compose) return;
+    compose.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        compose.classList.add('compose-drop-active');
+    });
+    compose.addEventListener('dragleave', () => {
+        compose.classList.remove('compose-drop-active');
+    });
+    compose.addEventListener('drop', (e) => {
+        e.preventDefault();
+        compose.classList.remove('compose-drop-active');
+        if (e.dataTransfer.files.length > 0) {
+            handleFileSelect(e.dataTransfer.files);
+        }
+    });
+})();
 
 // Send on Ctrl+Enter / Cmd+Enter
 document.getElementById('compose-body').addEventListener('keydown', (e) => {
