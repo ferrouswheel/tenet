@@ -1,373 +1,658 @@
-# Tenet Project Assessment & Implementation Plan
+# Tenet Web Application — Implementation Plan
 
-## Current State Assessment
+This document describes the phased plan for building a web application that acts as a
+full peer on the tenet network. The web app consists of a Rust server (using the tenet
+library) that serves both an HTTP/WebSocket API and a bundled single-page application.
 
-### ✅ What's Working Well
+## Design Goals
 
-**Core Protocol** (src/protocol.rs):
-- Message types defined: `Public`, `Meta`, `Direct`, `FriendGroup`, `StoreForPeer`
-- Headers with signatures, TTL, message IDs
-- Validation rules for message kinds
-- Content-addressed IDs using SHA256
-- Envelope serialization/deserialization
-
-**Cryptography** (src/crypto.rs):
-- HPKE key encapsulation for per-recipient encryption
-- ChaCha20Poly1305 authenticated encryption
-- X25519 keypairs and key derivation
-- Content key generation
-
-**Relay Server** (src/relay.rs):
-- HTTP relay with Axum
-- TTL enforcement and expiration
-- Deduplication by message ID
-- Storage quotas (max messages, max bytes per recipient)
-- Batch operations
-
-**Client Implementations** (src/client.rs):
-- `RelayClient` for HTTP communication
-- `SimulationClient` for testing
-- Store-and-forward for offline peers (via `StoreForPeer`)
-- Meta messages for presence (Online/Ack/MessageRequest)
-
-**Simulation Framework**:
-- Comprehensive simulation harness
-- Scenario-based testing
-- Metrics tracking (latency, delivery rates)
-
-### ❌ Critical Gaps
-
-#### 1. **Public Messages Not Implemented**
-
-**Current State**: `MessageKind::Public` exists in the enum but is completely unimplemented.
-
-**What's Missing**:
-- No client code sends or receives public messages
-- No relay logic for public message distribution
-- No mechanism to prevent message amplification
-- No peer-level tracking to avoid re-sending messages
-- No time-based cutoff beyond TTL
-
-**Required Behavior**:
-- Any peer can forward a public message to other peers
-- Messages remain signed by original author
-- Deduplication at multiple levels:
-  - Relay level: Already exists (message ID deduplication)
-  - Peer level: Need to track which peers have received which messages
-- Don't re-send to peers who already have the message
-- Stop propagating messages after TTL expires
-- Gossip-style distribution across peer networks
-
-#### 2. **Group Messages Not Implemented**
-
-**Current State**: `MessageKind::FriendGroup` exists, header validation requires `group_id`, but no actual group functionality.
-
-**What's Missing**:
-- No group key management (creation, distribution, rotation)
-- No group membership tracking
-- No group message encryption/decryption
-- No client code to send/receive group messages
-- No group discovery or invitation mechanism
-
-**Required Behavior**:
-- Groups have unique IDs
-- Group members share a symmetric key for message encryption
-- Messages encrypted with group key can be decrypted by all members
-- Group metadata (member list, key version) needs management
-- Messages delivered to all online group members via relay
-
-#### 3. **Signature Verification Not Cryptographically Secure**
-
-**Current Issue**: protocol.rs:176-177 shows that `expected_signature()` is just a SHA256 hash of the header, not an actual Ed25519 signature!
-
-```rust
-let digest = Sha256::digest(&bytes);
-Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
-```
-
-This means:
-- Headers can't be verified as coming from the claimed sender
-- Anyone can forge messages
-- Critical for public messages where authenticity is essential
-
-#### 4. **Other Notable Gaps**:
-- No persistent local storage (only in-memory feeds)
-- Attachment storage/retrieval infrastructure missing
-- No peer list management in clients
-- No rate limiting or abuse prevention beyond relay quotas
+- **Single binary distribution**: the SPA's static assets (HTML, CSS, JS) are embedded
+  into the Rust executable at compile time, so the binary is self-contained.
+- **Full peer**: the server is a first-class tenet peer — it holds its own keypair,
+  connects to relays, sends and receives messages, and participates in store-and-forward.
+- **Shared storage with CLI**: state is persisted in a SQLite database that both the web
+  server and the existing CLI tool (`tenet`) can read and write, so a user can switch
+  between interfaces without data loss.
+- **Real-time updates**: WebSocket connections push new messages and presence changes to
+  the browser immediately rather than requiring polling.
 
 ---
 
-## Implementation Plan
+## Architecture Overview
 
-### Phase 1: Foundation Improvements (Prerequisites)
+```
+┌──────────────────────────────────────────────────┐
+│                   Browser (SPA)                  │
+│  ┌────────────┐  ┌──────────┐  ┌──────────────┐ │
+│  │  Timeline   │  │  Friends │  │  Compose /   │ │
+│  │  View       │  │  List    │  │  Groups      │ │
+│  └─────┬──────┘  └────┬─────┘  └──────┬───────┘ │
+│        │              │               │          │
+│        └──────────┬───┘───────────────┘          │
+│              WebSocket + REST API                │
+└──────────────────┬───────────────────────────────┘
+                   │ HTTP / WS
+┌──────────────────┴───────────────────────────────┐
+│              tenet-web (Rust binary)             │
+│  ┌────────────────────────────────────────────┐  │
+│  │         Axum HTTP + WebSocket server       │  │
+│  ├────────────────────────────────────────────┤  │
+│  │  API layer  │  WS hub  │  Static assets    │  │
+│  ├─────────────┴──────────┴───────────────────┤  │
+│  │         Application / domain logic         │  │
+│  ├────────────────────────────────────────────┤  │
+│  │  tenet library (protocol, crypto, client)  │  │
+│  ├────────────────────────────────────────────┤  │
+│  │          SQLite (rusqlite / sqlx)          │  │
+│  └────────────────────────────────────────────┘  │
+│                      │                           │
+│              Relay connection(s)                 │
+│              (HTTP via ureq/reqwest)             │
+└──────────────────────────────────────────────────┘
+```
 
-**1.1 Add True Cryptographic Signatures**
-- Add Ed25519 signing to crypto.rs
-- Update `StoredKeypair` to include Ed25519 keys alongside X25519
-- Modify `Header::expected_signature()` to actually sign with sender's private key
-- Update `Header::verify_signature()` to verify against sender's public key
-- Requires: Sender public key lookup in clients
-- Location: `src/crypto.rs`, `src/protocol.rs`
+**Key technology choices:**
 
-**1.2 Peer Directory for Public Key Lookup**
-- Add peer registry to clients
-- Store: peer_id → public_key mapping
-- Needed for signature verification
-- Location: `src/client.rs`, new `PeerRegistry` struct
+| Concern | Choice | Rationale |
+|---------|--------|-----------|
+| HTTP framework | Axum (already a dependency) | Consistent with relay server; mature WebSocket support |
+| Asset embedding | `rust-embed` or `include_dir` | Compile-time embedding; no runtime file dependencies |
+| Database | SQLite via `rusqlite` (with `bundled` feature) | Zero-config, single-file, embeddable; widely supported |
+| SPA framework | Vanilla JS or lightweight (e.g., Preact, Svelte) | Small bundle size matters for embedding |
+| WebSocket | `axum::extract::ws` | Built-in with Axum; tokio-native |
+| Background sync | Tokio task | Polls relay(s) on a timer; pushes to WS hub |
 
-### Phase 2: Public Messages Implementation
+---
 
-**2.1 Core Public Message Types** (src/protocol.rs)
-```rust
-pub struct PublicMessageMetadata {
-    pub seen_by: HashSet<String>,  // Track which peers have seen this
-    pub first_seen_at: u64,        // When we first saw this message
-    pub propagation_count: usize,  // How many times we've forwarded
+## Shared SQLite Database
+
+The CLI and web server share a single SQLite database at
+`{TENET_HOME}/tenet.db`. The existing CLI tool's JSON/JSONL files are
+migrated on first run.
+
+### Schema (initial)
+
+```sql
+-- Identity and key material
+CREATE TABLE identity (
+    id          TEXT PRIMARY KEY,  -- user id (SHA256 of public key)
+    public_key  TEXT NOT NULL,     -- X25519 hex
+    private_key TEXT NOT NULL,     -- X25519 hex (encrypted at rest later)
+    signing_pub TEXT NOT NULL,     -- Ed25519 hex
+    signing_priv TEXT NOT NULL,    -- Ed25519 hex
+    created_at  INTEGER NOT NULL
+);
+
+-- Known peers / friends
+CREATE TABLE peers (
+    peer_id             TEXT PRIMARY KEY,
+    display_name        TEXT,
+    signing_public_key  TEXT NOT NULL,
+    encryption_public_key TEXT,
+    added_at            INTEGER NOT NULL,
+    is_friend           INTEGER NOT NULL DEFAULT 1,
+    last_seen_online    INTEGER,          -- unix timestamp
+    online              INTEGER NOT NULL DEFAULT 0
+);
+
+-- Messages (all kinds)
+CREATE TABLE messages (
+    message_id      TEXT PRIMARY KEY,     -- ContentId
+    sender_id       TEXT NOT NULL,
+    recipient_id    TEXT NOT NULL,         -- peer id, group id, or "*"
+    message_kind    TEXT NOT NULL,         -- public, direct, friend_group, meta
+    group_id        TEXT,
+    body            TEXT,                  -- decrypted plaintext
+    timestamp       INTEGER NOT NULL,
+    received_at     INTEGER NOT NULL,
+    ttl_seconds     INTEGER NOT NULL,
+    is_read         INTEGER NOT NULL DEFAULT 0,
+    raw_envelope    TEXT                   -- original JSON for forwarding
+);
+
+CREATE INDEX idx_messages_recipient ON messages(recipient_id, timestamp);
+CREATE INDEX idx_messages_sender ON messages(sender_id, timestamp);
+CREATE INDEX idx_messages_kind ON messages(message_kind, timestamp);
+CREATE INDEX idx_messages_group ON messages(group_id, timestamp);
+
+-- Groups
+CREATE TABLE groups (
+    group_id    TEXT PRIMARY KEY,
+    group_key   BLOB NOT NULL,            -- 32-byte symmetric key
+    creator_id  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    key_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE group_members (
+    group_id    TEXT NOT NULL REFERENCES groups(group_id),
+    peer_id     TEXT NOT NULL,
+    joined_at   INTEGER NOT NULL,
+    PRIMARY KEY (group_id, peer_id)
+);
+
+-- Sent messages (outbox)
+CREATE TABLE outbox (
+    message_id  TEXT PRIMARY KEY,
+    envelope    TEXT NOT NULL,             -- serialized Envelope JSON
+    sent_at     INTEGER NOT NULL,
+    delivered   INTEGER NOT NULL DEFAULT 0
+);
+
+-- Relay configuration
+CREATE TABLE relays (
+    url         TEXT PRIMARY KEY,
+    added_at    INTEGER NOT NULL,
+    last_sync   INTEGER,
+    enabled     INTEGER NOT NULL DEFAULT 1
+);
+```
+
+### Migration from JSON/JSONL
+
+On startup, if `tenet.db` does not exist but `identity.json` does, the server
+runs a one-time migration:
+
+1. Read `identity.json` -> insert into `identity` table.
+2. Read `peers.json` -> insert into `peers` table.
+3. Read `inbox.jsonl` -> parse each envelope, decrypt, insert into `messages`.
+4. Read `outbox.jsonl` -> insert into `outbox`.
+5. Rename old files to `*.migrated` as backup.
+
+After migration, both the CLI and web server use SQLite exclusively. The CLI
+tool gains a `--db` flag (or respects `TENET_DB` env var) to use the shared
+database instead of JSON files.
+
+---
+
+## Phase 1 — Foundation
+
+**Goal**: A working web server binary that serves a minimal SPA, connects to
+the tenet network as a peer, and persists state in SQLite.
+
+### 1.1 SQLite storage layer
+
+- Add `rusqlite` (with `bundled` feature) to `Cargo.toml`.
+- Create `src/storage.rs` module with:
+  - Schema creation / migration logic.
+  - CRUD operations for identity, peers, messages, groups, outbox, relays.
+  - One-time JSON-to-SQLite migration.
+- Ensure the storage layer is usable from both the web server and CLI.
+- Unit tests for all storage operations.
+
+### 1.2 Web server binary scaffold
+
+- Create `src/bin/tenet-web.rs` as a new binary target.
+- Axum server with:
+  - Static asset serving (placeholder `index.html` for now).
+  - Health check endpoint (`GET /api/health`).
+  - Startup: load or generate identity from SQLite, configure relay URL(s).
+- Configuration via environment variables and/or CLI flags:
+  - `TENET_HOME` — data directory (default `~/.tenet`).
+  - `TENET_WEB_BIND` — listen address (default `127.0.0.1:3000`).
+  - `TENET_RELAY_URL` — relay to connect to.
+
+### 1.3 Background relay sync
+
+- Tokio task that periodically polls the relay for new messages.
+- Decrypt incoming envelopes using the local identity keypair.
+- Persist decrypted messages to SQLite.
+- Process `Meta` messages (online announcements, ACKs) to update peer presence.
+
+### 1.4 Minimal SPA shell
+
+- Create `web/` directory for frontend source.
+- Build tooling (e.g., `npm` + bundler, or hand-rolled) that produces
+  `dist/` output.
+- Use `rust-embed` to embed `web/dist/` into the binary at compile time.
+- Serve embedded assets at `/` with correct MIME types.
+- Minimal HTML page that confirms connectivity to the API.
+
+---
+
+## Phase 2 — Core API & Timeline
+
+**Goal**: REST API endpoints for reading and composing messages, plus a
+timeline view in the SPA.
+
+### 2.1 Message API
+
+```
+GET    /api/messages?kind=...&group=...&before=...&limit=...
+GET    /api/messages/:message_id
+POST   /api/messages/direct    { recipient_id, body }
+POST   /api/messages/public    { body }
+POST   /api/messages/group     { group_id, body }
+```
+
+- Query parameters support filtering by `message_kind`, `group_id`, pagination
+  via `before` (timestamp cursor) and `limit`.
+- POST endpoints encrypt, sign, build envelopes, post to relay, and persist
+  to SQLite.
+- Return the created message with its `message_id`.
+
+### 2.2 WebSocket hub
+
+- `GET /api/ws` upgrades to a WebSocket connection.
+- Server-side hub (broadcast channel) fans out events to all connected clients.
+- Event types pushed from server to client:
+  - `new_message` — a message was received or sent.
+  - `peer_online` / `peer_offline` — presence change.
+  - `message_read` — read status update.
+- JSON-framed messages over the WebSocket.
+
+### 2.3 Timeline UI
+
+- SPA view showing a reverse-chronological feed of messages.
+- Visual differentiation by message kind:
+  - **Public** — open/globe icon, distinct background color.
+  - **Direct** — lock icon, private styling.
+  - **FriendGroup** — group icon, group name badge.
+  - **Meta** — subtle/muted system message styling.
+- Messages update in real time via WebSocket.
+- Infinite scroll / "load more" pagination.
+
+---
+
+## Phase 3 — Peers & Presence
+
+**Goal**: Friend/peer management UI and real-time online status.
+
+### 3.1 Peer API
+
+```
+GET    /api/peers                         -- list all peers
+GET    /api/peers/:peer_id               -- peer detail
+POST   /api/peers                         -- add peer { peer_id, display_name, signing_public_key }
+DELETE /api/peers/:peer_id               -- remove peer
+```
+
+- Adding a peer registers them in the `PeerRegistry` and SQLite.
+- Removing a peer deletes from both and cleans up related state.
+- Peer detail includes online status and `last_seen_online`.
+
+### 3.2 Presence tracking
+
+- Background task processes `MetaMessage::Online` and `MetaMessage::Ack`
+  messages to update `peers.online` and `peers.last_seen_online` in SQLite.
+- When presence changes, push `peer_online` / `peer_offline` over WebSocket.
+- On startup, send `MetaMessage::Online` to known peers via relay.
+
+### 3.3 Friends list UI
+
+- Sidebar or dedicated view listing all peers.
+- Each entry shows:
+  - Display name (or peer ID if no name set).
+  - Online/offline indicator (green dot / grey dot).
+  - "Last seen" relative timestamp (e.g., "3 hours ago").
+- Click a peer to view their profile or start a direct message.
+- "Add friend" form: enter peer ID and public key (or scan/paste a share link).
+- "Remove friend" confirmation dialog.
+
+---
+
+## Phase 4 — Groups
+
+**Goal**: Group creation, membership management, and group messaging UI.
+
+### 4.1 Group API
+
+```
+GET    /api/groups                        -- list groups
+GET    /api/groups/:group_id             -- group detail + members
+POST   /api/groups                        -- create group { group_id, member_ids }
+POST   /api/groups/:group_id/join        -- join (if invited)
+POST   /api/groups/:group_id/leave       -- leave group
+POST   /api/groups/:group_id/members     -- add member { peer_id }
+DELETE /api/groups/:group_id/members/:peer_id -- remove member
+```
+
+- Group creation generates a symmetric key via `GroupManager::create_group`.
+- Key distribution to members happens via encrypted direct messages
+  (the group key is sent in a `Direct` envelope to each member).
+- Leaving a group triggers key rotation for remaining members.
+
+### 4.2 Group messaging UI
+
+- Group conversation view with message history.
+- Compose box for posting to the group.
+- Member list sidebar showing who is in the group and their online status.
+- Group management: view members, invite new members, leave group.
+
+---
+
+## Phase 5 — Direct Messaging
+
+**Goal**: Dedicated direct message conversation view.
+
+### 5.1 Conversation API
+
+```
+GET    /api/conversations                 -- list DM conversations (grouped by peer)
+GET    /api/conversations/:peer_id       -- messages with a specific peer
+```
+
+- Conversations aggregate `Direct` messages between the local user and a peer.
+- Returns messages in chronological order with pagination.
+
+### 5.2 DM UI
+
+- Conversation list view showing recent DM threads.
+- Each thread shows the peer name, last message preview, and unread count.
+- Conversation detail view with message history and compose box.
+- Messages sent via the existing `POST /api/messages/direct` endpoint.
+
+---
+
+## Phase 6 — Public Posting
+
+**Goal**: Compose and view public posts with a clear distinct presentation.
+
+### 6.1 Public feed view
+
+- Filtered timeline showing only `Public` messages.
+- Posts display sender identity, timestamp, and message body.
+- Compose box for creating new public posts.
+
+### 6.2 Public post detail
+
+- Clicking a post opens a detail view (will later support replies and reactions).
+
+---
+
+## Phase 7 — Attachments
+
+**Goal**: Support images and other file attachments on messages.
+
+### 7.1 Attachment storage
+
+- Extend SQLite schema:
+
+```sql
+CREATE TABLE attachments (
+    content_hash    TEXT PRIMARY KEY,  -- SHA256 of content
+    content_type    TEXT NOT NULL,     -- MIME type
+    size_bytes      INTEGER NOT NULL,
+    data            BLOB NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE TABLE message_attachments (
+    message_id      TEXT NOT NULL REFERENCES messages(message_id),
+    content_hash    TEXT NOT NULL REFERENCES attachments(content_hash),
+    filename        TEXT,
+    position        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (message_id, content_hash)
+);
+```
+
+- Attachments are content-addressed (stored by SHA256 hash, deduplicated).
+- Size limits enforced per-attachment and per-message.
+
+### 7.2 Attachment API
+
+```
+POST   /api/attachments                   -- upload file, returns content_hash
+GET    /api/attachments/:content_hash    -- download attachment
+```
+
+- Upload returns the content hash; the client includes it when composing a
+  message.
+- The existing `AttachmentRef` in the protocol's `Payload` type is used to
+  reference attachments in envelopes.
+- Attachments are encrypted alongside the message payload before transmission.
+
+### 7.3 Attachment UI
+
+- Image attachments render inline in the timeline and conversation views.
+- Non-image attachments show as downloadable links with filename and size.
+- Compose views gain a file picker / drag-and-drop zone.
+- Image previews shown before sending.
+
+---
+
+## Phase 8 — Reactions (Upvote / Downvote)
+
+**Goal**: Allow reacting to public posts with upvotes and downvotes.
+
+### 8.1 Reaction protocol
+
+- Introduce a new payload content type: `application/json;type=tenet.reaction`.
+- Reaction payload:
+
+```json
+{
+  "target_message_id": "<ContentId>",
+  "reaction": "upvote | downvote",
+  "timestamp": 1234567890
 }
 ```
 
-**2.2 Client-Side Public Message Handling** (src/client.rs)
-- Add public message tracking:
-  - `seen_public_messages: HashMap<ContentId, PublicMessageMetadata>`
-  - `public_message_cache: Vec<Envelope>` (recent public messages)
-- Implement `send_public_message()`:
-  - Create envelope with `MessageKind::Public`
-  - Broadcast to all known peers
-  - Track initial distribution
-- Implement `receive_public_message()`:
-  - Verify signature against sender's public key
-  - Check deduplication
-  - Add to local cache
-  - Determine if should forward
-- Implement `forward_public_message()`:
-  - Check TTL hasn't expired
-  - Don't send to peers in `seen_by` set
-  - Update `seen_by` when forwarding
-  - Respect propagation limits
+- Reactions are sent as `Public` messages (for public posts) so they propagate
+  through the network like any other public message.
+- Each peer can have at most one reaction per target message (last one wins).
 
-**2.3 Relay Public Message Support** (src/relay.rs)
-- Relay can treat public messages like any other for storage
-- Add optional gossip endpoint for public messages
-- Consider: separate queue for public vs direct messages
+### 8.2 Reaction storage
 
-**2.4 Propagation Algorithm**
-Strategy: Controlled flooding with tracking
-```
-On receiving public message:
-1. Verify signature
-2. Check if seen (message_id in cache) → skip if yes
-3. Check TTL not expired → skip if expired
-4. Add to local cache with metadata
-5. Deliver to local user
-6. For each peer in peer list:
-   - If peer not in seen_by set:
-     - Forward message to peer
-     - Add peer to seen_by set
-   - Track propagation count
-   - Stop if propagation_count > MAX_HOPS
+```sql
+CREATE TABLE reactions (
+    message_id      TEXT NOT NULL,     -- the reaction message's own ID
+    target_id       TEXT NOT NULL,     -- the post being reacted to
+    sender_id       TEXT NOT NULL,
+    reaction        TEXT NOT NULL,     -- 'upvote' or 'downvote'
+    timestamp       INTEGER NOT NULL,
+    PRIMARY KEY (target_id, sender_id)
+);
 ```
 
-**2.5 Tests for Public Messages**
-- `tests/public_message_tests.rs`: Unit tests
-- Simulation scenarios with public message propagation
-- Test deduplication across multiple hops
-- Test TTL expiration stops propagation
-- Test seen_by tracking prevents loops
+### 8.3 Reaction API & UI
 
-### Phase 3: Group Messages Implementation
+```
+POST   /api/messages/:message_id/react   { reaction: "upvote" | "downvote" }
+DELETE /api/messages/:message_id/react   -- remove reaction
+GET    /api/messages/:message_id/reactions
+```
 
-**3.1 Group Key Management** (new src/groups.rs)
-```rust
-pub struct GroupInfo {
-    pub group_id: String,
-    pub group_key: [u8; 32],      // Symmetric key for group
-    pub members: HashSet<String>,  // Member peer IDs
-    pub created_at: u64,
-    pub key_version: u32,
-}
+- Timeline and post detail views show aggregated vote counts.
+- Upvote/downvote buttons on each public post.
+- User's own reaction state is highlighted.
 
-pub struct GroupManager {
-    groups: HashMap<String, GroupInfo>,
-}
+---
 
-impl GroupManager {
-    pub fn create_group(&mut self, members: Vec<String>) -> GroupInfo;
-    pub fn add_member(&mut self, group_id: &str, peer_id: &str) -> Result<(), GroupError>;
-    pub fn remove_member(&mut self, group_id: &str, peer_id: &str) -> Result<(), GroupError>;
-    pub fn rotate_key(&mut self, group_id: &str) -> Result<(), GroupError>;
-    pub fn get_group_key(&self, group_id: &str) -> Option<&[u8; 32]>;
+## Phase 9 — Replies (Threads)
+
+**Goal**: Support threaded replies on public and group posts.
+
+### 9.1 Reply protocol
+
+- Extend the message payload with an optional `reply_to` field:
+
+```json
+{
+  "body": "reply text",
+  "reply_to": "<ContentId of parent message>"
 }
 ```
 
-**3.2 Group Message Encryption** (src/crypto.rs)
-```rust
-pub fn encrypt_group_payload(
-    plaintext: &[u8],
-    group_key: &[u8; 32],
-    aad: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), CryptoError>;
+- Replies inherit the `message_kind` of the parent (Public replies to Public
+  posts, FriendGroup replies to group posts).
 
-pub fn decrypt_group_payload(
-    ciphertext: &[u8],
-    nonce: &[u8],
-    group_key: &[u8; 32],
-    aad: &[u8],
-) -> Result<Vec<u8>, CryptoError>;
+### 9.2 Reply storage
+
+- Add column to `messages` table:
+
+```sql
+ALTER TABLE messages ADD COLUMN reply_to TEXT;
+CREATE INDEX idx_messages_reply_to ON messages(reply_to);
 ```
 
-**3.3 Group Message Protocol** (src/protocol.rs)
-```rust
-pub fn build_group_message_payload(
-    plaintext: impl AsRef<[u8]>,
-    group_key: &[u8; 32],
-    aad: &[u8],
-) -> Result<Payload, PayloadCryptoError>;
+### 9.3 Reply API & UI
 
-pub fn decrypt_group_message_payload(
-    payload: &Payload,
-    group_key: &[u8; 32],
-    aad: &[u8],
-) -> Result<Vec<u8>, PayloadCryptoError>;
+```
+GET    /api/messages/:message_id/replies
+POST   /api/messages/:message_id/reply   { body }
 ```
 
-**3.4 Client Group Support** (src/client.rs)
-- Add `GroupManager` to client implementations
-- Implement `create_group()`:
-  - Generate group key
-  - Share key with initial members (encrypted with each member's public key)
-  - Store group locally
-- Implement `send_group_message()`:
-  - Encrypt with group key
-  - Create envelope with `MessageKind::FriendGroup` and `group_id`
-  - Send to all group members (or relay)
-- Implement `receive_group_message()`:
-  - Verify sender is group member
-  - Look up group key
-  - Decrypt payload
-  - Deliver to user
-
-**3.5 Group Key Distribution Protocol**
-Initial approach (simple):
-- Group creator generates symmetric key
-- For each member: wrap key with HPKE (like direct messages)
-- Send `MessageKind::Meta` with group invitation + wrapped key
-- Members store group key locally
-
-Advanced (future):
-- Use a group key agreement protocol (e.g., TreeKEM)
-- Support member addition/removal with forward secrecy
-
-**3.6 Tests for Group Messages**
-- `tests/group_message_tests.rs`: Unit tests
-- Test group creation and key distribution
-- Test message encryption/decryption
-- Test multi-member delivery
-- Simulation scenarios with groups
-
-### Phase 4: Integration & Polish
-
-**4.1 Update Binary Targets**
-- `bin/tenet.rs` (CLI):
-  - Add `send-public <message>` command
-  - Add `create-group <peer1> <peer2> ...` command
-  - Add `send-group <group_id> <message>` command
-  - Add `list-groups` command
-- `bin/tenet-debugger.rs` (TUI):
-  - Add public message sending
-  - Add group creation/management UI
-  - Show public message propagation
-- `bin/tenet-sim.rs`:
-  - Add public message scenarios
-  - Add group message scenarios
-
-**4.2 Enhanced Scenarios**
-Create new scenario files:
-- `scenarios/public_gossip.toml`: Public message propagation
-- `scenarios/group_chat.toml`: Group messaging with multiple groups
-- `scenarios/mixed_traffic.toml`: Direct, public, and group messages
-
-**4.3 Documentation**
-- Update `docs/architecture.md` with public/group message details
-- Add `docs/public_messages.md` - Public message propagation algorithm
-- Add `docs/group_messages.md` - Group management and key distribution
-- Update `CLAUDE.md` with new types and patterns
-
-**4.4 Additional Tests**
-- Integration tests for public + group messages
-- Test message kind transitions
-- Test security boundaries (can't decrypt without keys)
-- Test abuse scenarios (spam, amplification)
+- Post detail view shows a threaded reply list beneath the original post.
+- Reply compose box in post detail view.
+- Reply counts shown on posts in the timeline.
+- Clicking a reply navigates to the parent post's thread view.
 
 ---
 
-## Implementation Order & Priority
+## Phase 10 — User Profiles
 
-### High Priority (Core Functionality)
-1. ✅ **Phase 1.1**: True cryptographic signatures (CRITICAL for security) - **COMPLETE**
-2. ✅ **Phase 1.2**: Peer directory for public key lookup - **COMPLETE**
-3. ✅ **Phase 2**: Public messages (requested by user) - **COMPLETE**
-4. ✅ **Phase 3**: Group messages (requested by user) - **COMPLETE**
+**Goal**: Editable user profiles with separate public and friends-only variants.
 
-### Medium Priority (Completeness)
-5. **Phase 4.1**: Update CLI/TUI binaries
-6. **Phase 4.2**: Enhanced scenarios
-7. **Phase 4.4**: Additional tests
+### 10.1 Profile storage
 
-### Lower Priority (Nice to Have)
-8. **Phase 4.3**: Documentation updates
-9. Advanced group key management (TreeKEM)
-10. Persistent storage
-11. Attachment handling
-12. Rate limiting & abuse prevention
+```sql
+CREATE TABLE profiles (
+    user_id         TEXT PRIMARY KEY,
+    display_name    TEXT,
+    bio             TEXT,
+    avatar_hash     TEXT,             -- references attachments table
+    public_fields   TEXT NOT NULL,    -- JSON: fields visible to everyone
+    friends_fields  TEXT NOT NULL,    -- JSON: fields visible only to friends
+    updated_at      INTEGER NOT NULL
+);
+```
 
----
+- `public_fields` and `friends_fields` are JSON objects with user-defined
+  key-value pairs (e.g., location, interests, links).
+- The local user's profile is stored locally and broadcast to peers.
 
-## Key Design Decisions
+### 10.2 Profile protocol
 
-### Public Messages: Propagation Strategy
-**Decision**: Controlled flooding with per-message seen_by tracking
-- **Pros**: Simple, resilient, natural gossip-style distribution
-- **Cons**: Bandwidth overhead, requires peer-level state
-- **Alternatives considered**: DHT-based routing (too complex), publish-subscribe (requires infrastructure)
+- Profile updates are sent as a structured payload type:
+  `application/json;type=tenet.profile`.
+- **Public profile**: sent as a `Public` message so anyone can see it.
+- **Friends-only profile**: sent as `Direct` messages to each friend, encrypted
+  per-recipient. This ensures only friends can see the friends-only fields.
+- On receiving a profile message, update the local `profiles` table.
+- Profiles are versioned by `updated_at` timestamp; only newer updates apply.
 
-### Group Messages: Key Distribution
-**Decision**: Simple symmetric key + HPKE wrapping for initial version
-- **Pros**: Leverages existing crypto, straightforward
-- **Cons**: No forward secrecy on member removal, key rotation is manual
-- **Future**: Upgrade to TreeKEM or similar group key agreement
+### 10.3 Profile API
 
-### Signature Scheme
-**Decision**: Ed25519 for message signatures, separate from X25519 for encryption
-- **Pros**: Industry standard, fast verification, small signatures
-- **Cons**: Need to manage two keypairs per identity (can derive one from the other in future)
+```
+GET    /api/profile                       -- own profile
+PUT    /api/profile                       -- update own profile
+GET    /api/peers/:peer_id/profile       -- view peer's profile
+```
 
-### Deduplication Strategy
-**Decision**: Multi-level deduplication
-1. Relay: Message ID dedup with TTL-based expiry
-2. Client: Per-client seen set for all message types
-3. Public messages: Per-message seen_by set for propagation control
+- When viewing a peer's profile, the server returns the public profile by
+  default. If the peer is a friend, the friends-only fields are merged in.
+- Profile updates trigger re-broadcast to peers.
 
----
+### 10.4 Profile UI
 
-## Estimated Complexity
-
-| Component | LOC Estimate | Risk | Dependencies |
-|-----------|--------------|------|--------------|
-| Crypto signatures (Phase 1.1) | ~200 | Medium | Ed25519 crate |
-| Peer registry (Phase 1.2) | ~100 | Low | None |
-| Public messages (Phase 2) | ~500 | Medium | Phase 1 |
-| Group messages (Phase 3) | ~800 | High | Phase 1 |
-| Binary updates (Phase 4.1) | ~300 | Low | Phase 2, 3 |
-| Tests | ~600 | Low | All phases |
-| **Total** | **~2,500** | | |
+- Profile edit page with sections for public and friends-only fields.
+- Avatar upload (uses attachment system from Phase 7).
+- Profile view accessible from:
+  - Clicking a peer in the friends list.
+  - Clicking a message sender's name/avatar in the timeline.
+  - Clicking a reply author.
+- Visual distinction between public and friends-only profile sections.
 
 ---
 
-## Status Tracking
+## Phase 11 — Notifications
 
-- [x] Phase 1.1: Cryptographic Signatures
-- [x] Phase 1.2: Peer Directory
-- [x] Phase 2: Public Messages
-- [ ] Phase 3: Group Messages
-- [ ] Phase 4: Integration & Polish
+**Goal**: In-app notification system for unread messages and replies.
+
+### 11.1 Notification storage
+
+```sql
+CREATE TABLE notifications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    type            TEXT NOT NULL,     -- 'direct_message', 'reply', 'reaction'
+    message_id      TEXT NOT NULL,
+    sender_id       TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    read            INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_notifications_unread ON notifications(read, created_at);
+```
+
+### 11.2 Notification API
+
+```
+GET    /api/notifications?unread=true&limit=...
+POST   /api/notifications/:id/read
+POST   /api/notifications/read-all
+GET    /api/notifications/count           -- { unread: N }
+```
+
+### 11.3 Notification generation
+
+Notifications are created automatically when:
+
+- A `Direct` message is received -> `direct_message` notification.
+- A reply to one of the user's posts is received -> `reply` notification.
+- A reaction to one of the user's posts is received -> `reaction` notification.
+
+### 11.4 Notification UI
+
+- Notification bell icon in the header with unread count badge.
+- Dropdown or panel listing recent notifications.
+- Each notification links to the relevant message/conversation.
+- Unread direct messages show a badge on the conversation list and friend entry.
+- "Mark all as read" action.
+- WebSocket event `notification` pushes new notifications in real time.
+
+---
+
+## Cross-cutting Concerns
+
+### Security
+
+- The web server binds to `127.0.0.1` by default (local-only access).
+- No authentication on the API in the initial phases — the server is
+  single-user and assumed to be accessed only from the local machine.
+- Future: optional authentication (passphrase, browser session cookie) for
+  remote access or multi-user setups.
+- Private key material is never exposed via the API.
+- All relay communication uses the existing tenet encryption (HPKE +
+  ChaCha20Poly1305).
+
+### Error handling
+
+- API errors return structured JSON: `{ "error": "message", "code": "..." }`.
+- Use the existing error enum pattern from the tenet codebase.
+- New error types: `StorageError`, `ApiError`.
+
+### Testing
+
+- Storage layer: unit tests against an in-memory SQLite database.
+- API endpoints: integration tests using Axum's test utilities.
+- WebSocket: integration tests for event delivery.
+- Frontend: basic smoke tests (can be expanded later).
+
+### Build process
+
+- `cargo build --bin tenet-web` produces the self-contained binary.
+- A build script or `Makefile` step runs the frontend build before
+  `cargo build` so that `rust-embed` picks up the latest assets.
+- CI runs both frontend and backend builds and tests.
+
+---
+
+## Phase Summary
+
+| Phase | Scope | Depends on |
+|-------|-------|------------|
+| 1 | Foundation: SQLite, binary, relay sync, SPA shell | — |
+| 2 | Core API, WebSocket hub, timeline UI | 1 |
+| 3 | Peer management, presence, friends list UI | 1, 2 |
+| 4 | Groups: API, key management, group chat UI | 1, 2, 3 |
+| 5 | Direct messaging: conversations UI | 1, 2, 3 |
+| 6 | Public posting: feed view, compose | 1, 2 |
+| 7 | Attachments: storage, upload/download, inline display | 1, 2 |
+| 8 | Reactions: upvote/downvote on public posts | 6, 7 (optional) |
+| 9 | Replies: threaded discussions | 2, 6 |
+| 10 | User profiles: public + friends-only, edit, view | 3, 7 |
+| 11 | Notifications: unread badges, real-time alerts | 2, 5, 9 |
+
+Phases 1-6 form the core experience. Phases 7-11 add richness and can be
+developed in parallel once the foundation is stable.
