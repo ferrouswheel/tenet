@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tenet</title>
+    <style>
+        {{STYLES}}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div style="display:flex;align-items:center;gap:0.75rem;">
+            <h1>Tenet</h1>
+            <span class="status-dot" id="status-dot"></span>
+        </div>
+        <div class="peer-id" id="peer-id" title=""></div>
+    </div>
+
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <!-- Friends list -->
+            <div class="friends-panel">
+                <h2>Friends</h2>
+                <div id="friends-list"></div>
+                <button class="add-friend-btn" onclick="toggleAddFriendForm()">+ Add Friend</button>
+            </div>
+
+            <!-- Add friend form -->
+            <div id="add-friend-form" class="add-friend-form">
+                <h3>Add Friend</h3>
+                <input type="text" id="friend-peer-id" placeholder="Peer ID" />
+                <input type="text" id="friend-display-name" placeholder="Display Name (optional)" />
+                <input type="text" id="friend-signing-key" placeholder="Signing Public Key" />
+                <input type="text" id="friend-enc-key" placeholder="Encryption Key (optional)" />
+                <div class="form-actions">
+                    <button class="btn-secondary" onclick="toggleAddFriendForm()">Cancel</button>
+                    <button class="btn-primary" onclick="addFriend()">Add</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main content -->
+        <div class="main-content">
+            <!-- Filter tabs -->
+            <div class="filters">
+                <button class="active" data-kind="">All</button>
+                <button data-kind="public">Public</button>
+                <button data-kind="direct">Direct</button>
+                <button data-kind="friend_group">Groups</button>
+                <button data-view="conversations">Conversations</button>
+            </div>
+
+            <!-- Compose box -->
+            <div class="compose">
+                <textarea id="compose-body" placeholder="Write a message..."></textarea>
+                <div class="compose-actions">
+                    <select id="compose-kind">
+                        <option value="public">Public</option>
+                    </select>
+                    <button id="compose-send" onclick="sendMessage()">Send</button>
+                </div>
+            </div>
+
+            <!-- Timeline -->
+            <div id="timeline"></div>
+
+            <!-- Conversations list -->
+            <div id="conversations-list" style="display:none;"></div>
+
+            <!-- Conversation detail -->
+            <div id="conversation-detail" class="conversation-detail">
+                <div class="conversation-back">
+                    <button onclick="backToConversations()">&#8592; Back</button>
+                    <span class="peer-name" id="conversation-peer-name"></span>
+                </div>
+                <div id="conversation-messages"></div>
+                <div id="conversation-load-more" class="load-more" style="display:none;">
+                    <button onclick="loadMoreConversationMessages()">Load older messages</button>
+                </div>
+            </div>
+
+            <!-- Load more / empty -->
+            <div id="load-more" class="load-more" style="display:none;">
+                <button onclick="loadMore()">Load older messages</button>
+            </div>
+            <div id="empty-state" class="empty" style="display:none;">
+                <div class="icon">&#128172;</div>
+                <div>No messages yet</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <script>
+    {{SCRIPTS}}
+    </script>
+</body>
+</html>
