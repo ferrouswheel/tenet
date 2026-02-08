@@ -195,6 +195,22 @@ impl ClientConfig {
     pub fn encryption(&self) -> &ClientEncryption {
         &self.encryption
     }
+
+    /// Build the WebSocket URL for subscribing to a recipient's inbox.
+    ///
+    /// Converts the relay HTTP URL to a WebSocket URL and appends the
+    /// `/ws/{recipient_id}` path.
+    pub fn ws_url(&self, recipient_id: &str) -> String {
+        let base = self.relay_url.trim_end_matches('/');
+        let ws_base = if base.starts_with("https://") {
+            base.replacen("https://", "wss://", 1)
+        } else if base.starts_with("http://") {
+            base.replacen("http://", "ws://", 1)
+        } else {
+            format!("ws://{base}")
+        };
+        format!("{ws_base}/ws/{recipient_id}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2827,5 +2843,21 @@ mod tests {
         assert_eq!(meta.propagation_count, 1);
         assert!(meta.seen_by.contains("peer3"));
         assert!(meta.seen_by.contains("peer4"));
+    }
+
+    #[test]
+    fn test_client_config_ws_url() {
+        let config = ClientConfig::new("http://localhost:8080", 3600, ClientEncryption::Plaintext);
+        assert_eq!(config.ws_url("alice"), "ws://localhost:8080/ws/alice");
+
+        let config = ClientConfig::new(
+            "https://relay.example.com",
+            3600,
+            ClientEncryption::Plaintext,
+        );
+        assert_eq!(config.ws_url("bob"), "wss://relay.example.com/ws/bob");
+
+        let config = ClientConfig::new("http://localhost:8080/", 3600, ClientEncryption::Plaintext);
+        assert_eq!(config.ws_url("charlie"), "ws://localhost:8080/ws/charlie");
     }
 }

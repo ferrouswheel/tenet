@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use axum::Router;
 use base64::Engine as _;
+use futures_util::StreamExt;
 use hpke::kem::X25519HkdfSha256;
 use hpke::Kem as _;
 use hpke::Serializable;
@@ -10,6 +11,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
+use tokio_tungstenite::tungstenite;
 
 use tenet::crypto::{decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key};
 use tenet::relay::{app, RelayConfig, RelayState};
@@ -280,4 +282,326 @@ async fn node_can_send_and_receive_through_relay() {
         decrypt_payload(&content_key, &nonce, &ciphertext, &aad).expect("decrypt payload");
 
     assert_eq!(decrypted, plaintext);
+}
+
+fn test_relay_config() -> RelayConfig {
+    RelayConfig {
+        ttl: Duration::from_secs(5),
+        max_messages: 100,
+        max_bytes: 1024 * 1024,
+        retry_backoff: Vec::new(),
+        peer_log_window: Duration::from_secs(60),
+        peer_log_interval: Duration::ZERO,
+        log_sink: None,
+        pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+fn ws_url(http_url: &str, recipient_id: &str) -> String {
+    let ws_base = http_url.replacen("http://", "ws://", 1);
+    format!("{ws_base}/ws/{recipient_id}")
+}
+
+fn make_test_envelope(sender: &str, recipient: &str, msg_id: &str) -> Envelope {
+    Envelope {
+        message_id: msg_id.to_string(),
+        header: Header {
+            sender_id: sender.to_string(),
+            recipient_id: recipient.to_string(),
+            timestamp: 1000,
+            content_type: "text/plain".to_string(),
+        },
+        wrapped_key: WrappedKeyData {
+            enc_hex: "aa".to_string(),
+            ciphertext_hex: "bb".to_string(),
+        },
+        payload: EncryptedPayload {
+            nonce_hex: "cc".to_string(),
+            ciphertext_hex: "dd".to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn websocket_receives_messages_in_realtime() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+    let recipient = "ws-recipient-1";
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws connect");
+
+    // Small delay for the server to register the subscriber
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let envelope = make_test_envelope("sender-a", recipient, "ws-msg-1");
+    let base_url_clone = base_url.clone();
+    let envelope_clone = envelope.clone();
+    tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope_clone))
+        .await
+        .expect("post");
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("timeout waiting for ws message")
+        .expect("stream ended")
+        .expect("ws read error");
+
+    match msg {
+        tungstenite::Message::Text(text) => {
+            let received: serde_json::Value =
+                serde_json::from_str(&text).expect("parse ws message");
+            assert_eq!(
+                received["header"]["sender_id"].as_str().unwrap(),
+                "sender-a"
+            );
+            assert_eq!(received["message_id"].as_str().unwrap(), "ws-msg-1");
+        }
+        other => panic!("expected text message, got {:?}", other),
+    }
+
+    ws.close(None).await.ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn websocket_multiple_subscribers_same_recipient() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+    let recipient = "ws-multi-recipient";
+
+    let (mut ws1, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws1 connect");
+    let (mut ws2, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws2 connect");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let envelope = make_test_envelope("sender-b", recipient, "ws-multi-msg");
+    let base_url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
+        .await
+        .expect("post");
+
+    for (i, ws) in [&mut ws1, &mut ws2].iter_mut().enumerate() {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timeout on ws{}", i + 1))
+            .unwrap_or_else(|| panic!("stream ended on ws{}", i + 1))
+            .unwrap_or_else(|e| panic!("read error on ws{}: {}", i + 1, e));
+
+        match msg {
+            tungstenite::Message::Text(text) => {
+                let received: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(received["message_id"].as_str().unwrap(), "ws-multi-msg");
+            }
+            other => panic!("expected text on ws{}, got {:?}", i + 1, other),
+        }
+    }
+
+    ws1.close(None).await.ok();
+    ws2.close(None).await.ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn websocket_does_not_receive_other_recipients_messages() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+
+    let (mut ws_alice, _) = tokio_tungstenite::connect_async(ws_url(&base_url, "alice"))
+        .await
+        .expect("ws alice connect");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send a message to bob, not alice
+    let envelope = make_test_envelope("sender-c", "bob", "msg-for-bob");
+    let base_url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
+        .await
+        .expect("post");
+
+    // Alice should NOT receive this message
+    let result = tokio::time::timeout(Duration::from_millis(300), ws_alice.next()).await;
+    assert!(result.is_err(), "alice should not receive bob's message");
+
+    ws_alice.close(None).await.ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn websocket_and_polling_coexist() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+    let recipient = "ws-poll-recipient";
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws connect");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let envelope = make_test_envelope("sender-d", recipient, "ws-poll-msg");
+    let base_url_clone = base_url.clone();
+    let envelope_clone = envelope.clone();
+    tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope_clone))
+        .await
+        .expect("post");
+
+    // WebSocket should receive the message
+    let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("ws timeout")
+        .expect("ws stream ended")
+        .expect("ws read error");
+
+    match msg {
+        tungstenite::Message::Text(text) => {
+            let received: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(received["message_id"].as_str().unwrap(), "ws-poll-msg");
+        }
+        other => panic!("expected text, got {:?}", other),
+    }
+
+    // Polling should also still work (message was consumed from WS but still in queue)
+    let base_url_clone = base_url.clone();
+    let inbox = tokio::task::spawn_blocking(move || fetch_inbox(&base_url_clone, recipient))
+        .await
+        .expect("fetch");
+    // The message is still in the queue because WebSocket notification is separate from queue drain
+    assert_eq!(
+        inbox.len(),
+        1,
+        "polling should still return the queued message"
+    );
+
+    ws.close(None).await.ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn websocket_receives_multiple_messages_sequentially() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+    let recipient = "ws-seq-recipient";
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws connect");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send 3 messages
+    for i in 0..3 {
+        let envelope = make_test_envelope("sender-e", recipient, &format!("ws-seq-msg-{}", i));
+        let base_url_clone = base_url.clone();
+        tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
+            .await
+            .expect("post");
+    }
+
+    // Receive all 3
+    let mut received_ids = Vec::new();
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended")
+            .expect("read error");
+
+        if let tungstenite::Message::Text(text) = msg {
+            let val: serde_json::Value = serde_json::from_str(&text).unwrap();
+            received_ids.push(val["message_id"].as_str().unwrap().to_string());
+        }
+    }
+
+    assert_eq!(received_ids.len(), 3);
+    for i in 0..3 {
+        assert!(
+            received_ids.contains(&format!("ws-seq-msg-{}", i)),
+            "missing ws-seq-msg-{}",
+            i
+        );
+    }
+
+    ws.close(None).await.ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn websocket_batch_store_notifies_subscribers() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+    let recipient = "ws-batch-recipient";
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws connect");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Post a batch of 2 envelopes for the same recipient
+    let envelopes = vec![
+        make_test_envelope("sender-f", recipient, "ws-batch-1"),
+        make_test_envelope("sender-g", recipient, "ws-batch-2"),
+    ];
+    let base_url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let body = serde_json::to_string(&envelopes).expect("serialize batch");
+        let response = ureq::post(&format!("{}/envelopes/batch", base_url_clone))
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+            .expect("post batch");
+        assert!(response.status() < 400, "relay rejected batch");
+    })
+    .await
+    .expect("post batch task");
+
+    let mut received_ids = Vec::new();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended")
+            .expect("read error");
+
+        if let tungstenite::Message::Text(text) = msg {
+            let val: serde_json::Value = serde_json::from_str(&text).unwrap();
+            received_ids.push(val["message_id"].as_str().unwrap().to_string());
+        }
+    }
+
+    assert!(received_ids.contains(&"ws-batch-1".to_string()));
+    assert!(received_ids.contains(&"ws-batch-2".to_string()));
+
+    ws.close(None).await.ok();
+    shutdown_tx.send(()).ok();
+}
+
+#[tokio::test]
+async fn websocket_disconnect_does_not_break_relay() {
+    let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
+    let recipient = "ws-disconnect-recipient";
+
+    // Connect and immediately disconnect
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+        .await
+        .expect("ws connect");
+    drop(ws);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Posting a message should still work fine
+    let envelope = make_test_envelope("sender-h", recipient, "after-disconnect");
+    let base_url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
+        .await
+        .expect("post after disconnect");
+
+    // Polling should still work
+    let base_url_clone = base_url.clone();
+    let inbox = tokio::task::spawn_blocking(move || fetch_inbox(&base_url_clone, recipient))
+        .await
+        .expect("fetch");
+    assert_eq!(inbox.len(), 1);
+
+    shutdown_tx.send(()).ok();
 }
