@@ -6,7 +6,10 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Query, State, WebSocketUpgrade,
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -15,7 +18,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{broadcast, Mutex, MutexGuard, RwLock};
 use tokio::time::sleep;
 
 #[derive(Clone)]
@@ -30,10 +33,13 @@ pub struct RelayConfig {
     pub pause_flag: Arc<AtomicBool>,
 }
 
+const WS_BROADCAST_CAPACITY: usize = 128;
+
 #[derive(Clone)]
 pub struct RelayState {
     config: RelayConfig,
     inner: Arc<Mutex<RelayStateInner>>,
+    subscribers: Arc<RwLock<HashMap<String, broadcast::Sender<Value>>>>,
 }
 
 struct RelayStateInner {
@@ -104,6 +110,7 @@ pub fn app(state: RelayState) -> Router {
         .route("/envelopes/batch", post(store_envelopes_batch))
         .route("/inbox/:recipient_id", get(fetch_inbox))
         .route("/inbox/batch", post(fetch_inbox_batch))
+        .route("/ws/:recipient_id", get(ws_handler))
         .with_state(state)
 }
 
@@ -116,6 +123,28 @@ impl RelayState {
                 dedup: HashMap::new(),
                 peer_last_seen: HashMap::new(),
             })),
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn subscribe(&self, recipient_id: &str) -> broadcast::Receiver<Value> {
+        let subs = self.subscribers.read().await;
+        if let Some(tx) = subs.get(recipient_id) {
+            return tx.subscribe();
+        }
+        drop(subs);
+
+        let mut subs = self.subscribers.write().await;
+        let tx = subs
+            .entry(recipient_id.to_string())
+            .or_insert_with(|| broadcast::channel(WS_BROADCAST_CAPACITY).0);
+        tx.subscribe()
+    }
+
+    async fn notify_subscribers(&self, recipient_id: &str, envelope: Value) {
+        let subs = self.subscribers.read().await;
+        if let Some(tx) = subs.get(recipient_id) {
+            let _ = tx.send(envelope);
         }
     }
 
@@ -156,20 +185,105 @@ async fn healthcheck() -> impl IntoResponse {
     StatusCode::OK
 }
 
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Path(recipient_id): Path<String>,
+    State(state): State<RelayState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, recipient_id, state))
+}
+
+async fn handle_ws_connection(mut socket: WebSocket, recipient_id: String, state: RelayState) {
+    let mut rx = state.subscribe(&recipient_id).await;
+
+    {
+        let mut inner = state.inner.lock().await;
+        let now = Instant::now();
+        record_peer_connection(&state.config, &mut inner, &recipient_id, now);
+    }
+
+    log_message(
+        &state.config,
+        format!(
+            "relay: websocket connected {}",
+            format_peer_id(&recipient_id)
+        ),
+    );
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(envelope) => {
+                        let text = match serde_json::to_string(&envelope) {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        if socket.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log_message(
+                            &state.config,
+                            format!(
+                                "relay: websocket {} lagged by {} messages",
+                                format_peer_id(&recipient_id),
+                                n
+                            ),
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    log_message(
+        &state.config,
+        format!(
+            "relay: websocket disconnected {}",
+            format_peer_id(&recipient_id)
+        ),
+    );
+}
+
 async fn store_envelope(
     State(state): State<RelayState>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let mut inner = match lock_with_retry(&state).await {
-        Ok(inner) => inner,
-        Err(status) => return (status, "relay busy").into_response(),
+    let recipient_id = recipient_id_from(&payload);
+    let ws_payload = payload.clone();
+
+    let result = {
+        let mut inner = match lock_with_retry(&state).await {
+            Ok(inner) => inner,
+            Err(status) => return (status, "relay busy").into_response(),
+        };
+        let now = Instant::now();
+        let now_epoch = SystemTime::now();
+        store_envelope_locked(&state.config, &mut inner, payload, now, now_epoch)
     };
 
-    let now = Instant::now();
-    let now_epoch = SystemTime::now();
-    match store_envelope_locked(&state.config, &mut inner, payload, now, now_epoch) {
-        Ok(StoreDecision::Accepted { message_id })
-        | Ok(StoreDecision::Duplicate { message_id }) => {
+    match result {
+        Ok(StoreDecision::Accepted { message_id }) => {
+            if let Some(rid) = &recipient_id {
+                state.notify_subscribers(rid, ws_payload).await;
+            }
+            (StatusCode::ACCEPTED, Json(StoreResponse { message_id })).into_response()
+        }
+        Ok(StoreDecision::Duplicate { message_id }) => {
             (StatusCode::ACCEPTED, Json(StoreResponse { message_id })).into_response()
         }
         Ok(StoreDecision::Expired { .. }) => (StatusCode::GONE, "envelope expired").into_response(),
@@ -189,50 +303,64 @@ async fn store_envelopes_batch(
     State(state): State<RelayState>,
     Json(payloads): Json<Vec<Value>>,
 ) -> impl IntoResponse {
-    let mut inner = match lock_with_retry(&state).await {
-        Ok(inner) => inner,
-        Err(status) => return (status, "relay busy").into_response(),
+    let payload_copies: Vec<_> = payloads
+        .iter()
+        .map(|p| (recipient_id_from(p), p.clone()))
+        .collect();
+
+    let results = {
+        let mut inner = match lock_with_retry(&state).await {
+            Ok(inner) => inner,
+            Err(status) => return (status, "relay busy").into_response(),
+        };
+        let now = Instant::now();
+        let now_epoch = SystemTime::now();
+        payloads
+            .into_iter()
+            .map(|payload| {
+                match store_envelope_locked(&state.config, &mut inner, payload, now, now_epoch) {
+                    Ok(StoreDecision::Accepted { message_id }) => BatchStoreResult {
+                        message_id: Some(message_id),
+                        status: BatchStoreStatus::Accepted,
+                        detail: None,
+                    },
+                    Ok(StoreDecision::Duplicate { message_id }) => BatchStoreResult {
+                        message_id: Some(message_id),
+                        status: BatchStoreStatus::Duplicate,
+                        detail: None,
+                    },
+                    Ok(StoreDecision::Expired { message_id }) => BatchStoreResult {
+                        message_id: Some(message_id),
+                        status: BatchStoreStatus::Expired,
+                        detail: None,
+                    },
+                    Ok(StoreDecision::TooLarge { message_id }) => BatchStoreResult {
+                        message_id: Some(message_id),
+                        status: BatchStoreStatus::TooLarge,
+                        detail: None,
+                    },
+                    Err(StoreError::MissingRecipient) => BatchStoreResult {
+                        message_id: None,
+                        status: BatchStoreStatus::Invalid,
+                        detail: Some("missing recipient_id".to_string()),
+                    },
+                    Err(StoreError::InvalidPayload(detail)) => BatchStoreResult {
+                        message_id: None,
+                        status: BatchStoreStatus::Invalid,
+                        detail: Some(detail),
+                    },
+                }
+            })
+            .collect::<Vec<_>>()
     };
 
-    let now = Instant::now();
-    let now_epoch = SystemTime::now();
-    let results = payloads
-        .into_iter()
-        .map(|payload| {
-            match store_envelope_locked(&state.config, &mut inner, payload, now, now_epoch) {
-                Ok(StoreDecision::Accepted { message_id }) => BatchStoreResult {
-                    message_id: Some(message_id),
-                    status: BatchStoreStatus::Accepted,
-                    detail: None,
-                },
-                Ok(StoreDecision::Duplicate { message_id }) => BatchStoreResult {
-                    message_id: Some(message_id),
-                    status: BatchStoreStatus::Duplicate,
-                    detail: None,
-                },
-                Ok(StoreDecision::Expired { message_id }) => BatchStoreResult {
-                    message_id: Some(message_id),
-                    status: BatchStoreStatus::Expired,
-                    detail: None,
-                },
-                Ok(StoreDecision::TooLarge { message_id }) => BatchStoreResult {
-                    message_id: Some(message_id),
-                    status: BatchStoreStatus::TooLarge,
-                    detail: None,
-                },
-                Err(StoreError::MissingRecipient) => BatchStoreResult {
-                    message_id: None,
-                    status: BatchStoreStatus::Invalid,
-                    detail: Some("missing recipient_id".to_string()),
-                },
-                Err(StoreError::InvalidPayload(detail)) => BatchStoreResult {
-                    message_id: None,
-                    status: BatchStoreStatus::Invalid,
-                    detail: Some(detail),
-                },
+    for (i, result) in results.iter().enumerate() {
+        if matches!(result.status, BatchStoreStatus::Accepted) {
+            if let Some((Some(rid), payload)) = payload_copies.get(i) {
+                state.notify_subscribers(rid, payload.clone()).await;
             }
-        })
-        .collect::<Vec<_>>();
+        }
+    }
 
     (StatusCode::ACCEPTED, Json(results)).into_response()
 }
