@@ -2,8 +2,8 @@
 // State
 // ---------------------------------------------------------------------------
 let myPeerId = '';
-let currentFilter = '';
-let currentView = 'timeline'; // 'timeline', 'conversations', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
+let currentFilter = 'public'; // 'public' or 'friend_group'
+let currentView = 'timeline'; // 'timeline', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
 let messages = [];
 let oldestTimestamp = null;
 let ws = null;
@@ -21,6 +21,7 @@ let viewingProfileId = null;
 let previousView = 'timeline';
 let relayConnected = null; // null = unknown, true/false = status
 const PAGE_SIZE = 50;
+const COMMENTS_PAGE_SIZE = 100;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,42 @@ async function apiPut(path, body) {
     }
     return res.json();
 }
+
+// ---------------------------------------------------------------------------
+// Hash-based URL routing
+// ---------------------------------------------------------------------------
+function navigateTo(route) {
+    if (route === 'timeline') {
+        window.location.hash = '#/';
+    } else {
+        window.location.hash = '#/' + route;
+    }
+}
+
+function handleRoute() {
+    const hash = window.location.hash || '#/';
+    const parts = hash.replace('#/', '').split('/');
+    const route = parts[0] || '';
+
+    if (route === 'post' && parts[1]) {
+        // Post detail: #/post/{messageId}
+        const messageId = decodeURIComponent(parts.slice(1).join('/'));
+        showPostDetail(messageId, true);
+    } else if (route === 'peer' && parts[1]) {
+        // DM conversation: #/peer/{peerId}
+        const peerId = decodeURIComponent(parts.slice(1).join('/'));
+        showConversationDetail(peerId, true);
+    } else {
+        // Default: timeline
+        currentView = 'timeline';
+        currentPostId = null;
+        currentConversationPeerId = null;
+        showTimelineView();
+        loadMessages(false);
+    }
+}
+
+window.addEventListener('hashchange', handleRoute);
 
 // ---------------------------------------------------------------------------
 // Relay status banner
@@ -118,17 +155,16 @@ function renderMessage(m) {
     const unreadClass = m.is_read ? '' : ' unread';
     const kindClass = m.message_kind || 'direct';
 
-    // Make public messages clickable to view detail
-    const isPublic = m.message_kind === 'public';
-    const isReplyToSomething = !!m.reply_to;
-    const clickableClass = (isPublic && !isReplyToSomething) ? ' clickable' : '';
-    const onclick = (isPublic && !isReplyToSomething)
-        ? `onclick="showPostDetail('${m.message_id}')"`
+    // Make public and group posts clickable to view detail (only root posts)
+    const isClickable = (m.message_kind === 'public' || m.message_kind === 'friend_group') && !m.reply_to;
+    const clickableClass = isClickable ? ' clickable' : '';
+    const onclick = isClickable
+        ? `onclick="navigateTo('post/${encodeURIComponent(m.message_id)}')"`
         : `onclick="markRead('${m.message_id}')"`;
 
     const attachmentsHtml = renderAttachments(m.attachments);
     const reactionsHtml = renderReactions(m);
-    const replyCountHtml = renderReplyCount(m);
+    const commentCountHtml = renderCommentCount(m);
 
     return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
         <div class="msg-header">
@@ -139,7 +175,7 @@ function renderMessage(m) {
         <div class="msg-body">${escapeHtml(m.body || '')}</div>
         ${attachmentsHtml}
         ${reactionsHtml}
-        ${replyCountHtml}
+        ${commentCountHtml}
     </div>`;
 }
 
@@ -209,13 +245,14 @@ function updateMessageReactions(messageId, upvotes, downvotes, myReaction) {
 }
 
 // ---------------------------------------------------------------------------
-// Reply count indicator (Phase 9)
+// Comment count indicator
 // ---------------------------------------------------------------------------
-function renderReplyCount(m) {
+function renderCommentCount(m) {
     const count = m.reply_count || 0;
+    // Only show on root posts (not on replies/comments themselves)
     if (count === 0 || m.reply_to) return '';
-    const label = count === 1 ? '1 reply' : count + ' replies';
-    return `<div class="msg-reply-count" onclick="event.stopPropagation();showPostDetail('${m.message_id}')">${label}</div>`;
+    const label = count === 1 ? '1 comment' : count + ' comments';
+    return `<div class="msg-reply-count" onclick="event.stopPropagation();navigateTo('post/${encodeURIComponent(m.message_id)}')">${label}</div>`;
 }
 
 function renderAttachments(attachments) {
@@ -264,18 +301,22 @@ function renderTimeline() {
 // ---------------------------------------------------------------------------
 async function loadMessages(append) {
     let url = `/api/messages?limit=${PAGE_SIZE}`;
+    // Timeline only shows public or friend_group posts
     if (currentFilter) url += `&kind=${currentFilter}`;
     if (append && oldestTimestamp) url += `&before=${oldestTimestamp}`;
 
     try {
         const data = await apiGet(url);
+        // Filter out replies/comments - only show root posts on the timeline
+        const rootPosts = data.filter(m => !m.reply_to);
         if (append) {
-            messages = messages.concat(data);
+            messages = messages.concat(rootPosts);
         } else {
-            messages = data;
+            messages = rootPosts;
         }
-        if (messages.length > 0) {
-            oldestTimestamp = messages[messages.length - 1].timestamp;
+        if (data.length > 0) {
+            // Use the oldest timestamp from the raw data for pagination
+            oldestTimestamp = data[data.length - 1].timestamp;
         }
         renderTimeline();
     } catch (e) {
@@ -295,16 +336,13 @@ document.querySelectorAll('.filters button').forEach(btn => {
         document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
 
-        if (btn.dataset.view === 'conversations') {
-            currentView = 'conversations';
-            showConversationsView();
-        } else {
-            currentView = 'timeline';
-            currentFilter = btn.dataset.kind;
-            oldestTimestamp = null;
-            showTimelineView();
-            loadMessages(false);
-        }
+        currentView = 'timeline';
+        currentFilter = btn.dataset.kind || 'public';
+        oldestTimestamp = null;
+        showTimelineView();
+        loadMessages(false);
+        // Update hash without triggering route
+        window.location.hash = '#/';
     });
 });
 
@@ -312,53 +350,109 @@ function hideAllViews() {
     document.getElementById('timeline').style.display = 'none';
     document.getElementById('load-more').style.display = 'none';
     document.getElementById('empty-state').style.display = 'none';
-    document.getElementById('conversations-list').style.display = 'none';
     document.getElementById('conversation-detail').classList.remove('visible');
     document.getElementById('post-detail').classList.remove('visible');
     document.getElementById('profile-view').classList.remove('visible');
     document.getElementById('profile-edit').classList.remove('visible');
+    document.getElementById('compose-box').style.display = '';
+    // Hide filters on non-timeline views
+    document.querySelector('.filters').style.display = '';
 }
 
 function showTimelineView() {
     hideAllViews();
     document.getElementById('timeline').style.display = '';
     document.getElementById('load-more').style.display = '';
-    document.getElementById('compose-kind').value = currentFilter || 'public';
-    updateComposeOptions();
+    document.querySelector('.filters').style.display = '';
+    document.getElementById('compose-box').style.display = '';
+    updateComposeForTimeline();
 }
 
-function showConversationsView() {
-    hideAllViews();
-    document.getElementById('conversations-list').style.display = '';
-    loadConversations();
+function updateComposeForTimeline() {
+    const select = document.getElementById('compose-kind');
+    select.innerHTML = '';
+
+    if (currentFilter === 'friend_group') {
+        const opt = document.createElement('option');
+        opt.value = 'group';
+        opt.textContent = 'Group';
+        select.appendChild(opt);
+    } else {
+        const opt = document.createElement('option');
+        opt.value = 'public';
+        opt.textContent = 'Public';
+        select.appendChild(opt);
+    }
 }
 
-function showConversationDetail(peerId) {
+// ---------------------------------------------------------------------------
+// Conversation detail (DMs with a friend)
+// ---------------------------------------------------------------------------
+function showConversationDetail(peerId, fromRoute) {
     currentView = 'conversation-detail';
     currentConversationPeerId = peerId;
     conversationOldestTimestamp = null;
+
     hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
+    // Hide the main compose box; DM view has its own compose
+    document.getElementById('compose-box').style.display = 'none';
     document.getElementById('conversation-detail').classList.add('visible');
 
     const peer = peers.find(p => p.peer_id === peerId);
     const peerName = peer?.display_name || peerId.substring(0, 12) + '...';
     document.getElementById('conversation-peer-name').textContent = peerName;
 
-    document.getElementById('compose-kind').value = 'direct';
-    updateComposeOptions();
+    renderDmPeerInfo(peerId);
     loadConversationMessages(peerId, false);
+
+    // Update URL if not already navigating from route
+    if (!fromRoute) {
+        window.location.hash = '#/peer/' + encodeURIComponent(peerId);
+    }
 }
 
-function backToConversations() {
-    currentView = 'conversations';
-    currentConversationPeerId = null;
-    showConversationsView();
+function renderDmPeerInfo(peerId) {
+    const el = document.getElementById('dm-peer-info');
+    const peer = peers.find(p => p.peer_id === peerId);
+    const name = peer?.display_name || peerId.substring(0, 12) + '...';
+    const initial = name[0].toUpperCase();
+    const onlineText = peer?.online ? 'Online' : (peer?.last_seen_online ? 'Last seen ' + timeAgo(peer.last_seen_online) : 'Offline');
+    const onlineClass = peer?.online ? ' online' : '';
+
+    el.innerHTML = `
+        <div class="dm-peer-header">
+            <div class="dm-peer-avatar">${initial}</div>
+            <div>
+                <div class="dm-peer-name">${escapeHtml(name)}</div>
+                <div class="dm-peer-id">${escapeHtml(peerId.substring(0, 24))}...</div>
+                <div class="dm-peer-status${onlineClass}">${onlineText}</div>
+            </div>
+        </div>
+    `;
+
+    // Try to load profile for bio
+    apiGet(`/api/peers/${encodeURIComponent(peerId)}/profile`).then(profile => {
+        if (profile.avatar_hash) {
+            el.querySelector('.dm-peer-avatar').innerHTML = `<img src="/api/attachments/${encodeURIComponent(profile.avatar_hash)}" alt="" />`;
+        }
+        if (profile.bio) {
+            const bioDiv = document.createElement('div');
+            bioDiv.className = 'dm-peer-bio';
+            bioDiv.textContent = profile.bio;
+            el.appendChild(bioDiv);
+        }
+    }).catch(() => {});
+}
+
+function openConversationWithPeer(peerId) {
+    navigateTo('peer/' + encodeURIComponent(peerId));
 }
 
 // ---------------------------------------------------------------------------
 // Post detail view
 // ---------------------------------------------------------------------------
-async function showPostDetail(messageId) {
+async function showPostDetail(messageId, fromRoute) {
     previousView = currentView;
     currentView = 'post-detail';
     currentPostId = messageId;
@@ -366,7 +460,14 @@ async function showPostDetail(messageId) {
     repliesOldestTimestamp = null;
 
     hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
+    document.getElementById('compose-box').style.display = 'none';
     document.getElementById('post-detail').classList.add('visible');
+
+    // Update URL if not already navigating from route
+    if (!fromRoute) {
+        window.location.hash = '#/post/' + encodeURIComponent(messageId);
+    }
 
     try {
         const post = await apiGet(`/api/messages/${encodeURIComponent(messageId)}`);
@@ -375,7 +476,7 @@ async function showPostDetail(messageId) {
         if (!post.is_read) {
             await apiPost(`/api/messages/${encodeURIComponent(messageId)}/read`, {});
         }
-        // Load replies (Phase 9)
+        // Load comments (up to 100)
         await loadReplies(messageId, false);
     } catch (e) {
         showToast('Failed to load post');
@@ -390,11 +491,15 @@ function renderPostDetail(post) {
     const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : post.sender_id.substring(0, 12) + '...';
     const senderClass = isSelf ? 'post-sender self' : 'post-sender';
     const timestamp = new Date(post.timestamp * 1000).toLocaleString();
+    const kindClass = post.message_kind || 'public';
     const attachmentsHtml = renderAttachments(post.attachments);
     const reactionsHtml = renderReactions(post);
 
     el.innerHTML = `
-        <div class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</div>
+        <div class="msg-header" style="margin-bottom:0.75rem;">
+            <span class="msg-badge ${kindClass}">${kindClass}</span>
+            <span class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</span>
+        </div>
         <div class="post-time">${timestamp}</div>
         <div class="post-body">${escapeHtml(post.body || '')}</div>
         ${attachmentsHtml}
@@ -402,31 +507,12 @@ function renderPostDetail(post) {
     `;
 }
 
-function backToPublicFeed() {
-    currentView = 'timeline';
-    currentPostId = null;
-    // Set filter to public to return to public feed
-    currentFilter = 'public';
-
-    // Update active filter button
-    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
-    document.querySelector('.filters button[data-kind="public"]').classList.add('active');
-
-    showTimelineView();
-    loadMessages(false);
-}
-
 function updateComposeOptions() {
+    // Kept for backward compatibility but no longer used for DM
     const select = document.getElementById('compose-kind');
     select.innerHTML = '';
 
-    if (currentView === 'conversation-detail') {
-        // In conversation detail, only show direct message option
-        const opt = document.createElement('option');
-        opt.value = 'direct';
-        opt.textContent = 'Direct to ' + (peers.find(p => p.peer_id === currentConversationPeerId)?.display_name || 'peer');
-        select.appendChild(opt);
-    } else if (currentFilter === 'friend_group') {
+    if (currentFilter === 'friend_group') {
         const opt = document.createElement('option');
         opt.value = 'group';
         opt.textContent = 'Group';
@@ -440,44 +526,8 @@ function updateComposeOptions() {
 }
 
 // ---------------------------------------------------------------------------
-// Conversations
+// Conversations (DM messages with a peer)
 // ---------------------------------------------------------------------------
-async function loadConversations() {
-    try {
-        conversations = await apiGet('/api/conversations');
-        renderConversationsList();
-    } catch (e) {
-        showToast('Failed to load conversations');
-        console.error(e);
-    }
-}
-
-function renderConversationsList() {
-    const el = document.getElementById('conversations-list');
-    if (conversations.length === 0) {
-        el.innerHTML = '<div class="empty"><div class="icon">&#128172;</div><div>No conversations yet</div></div>';
-        return;
-    }
-
-    el.innerHTML = conversations.map(c => {
-        const displayName = c.display_name || c.peer_id.substring(0, 12) + '...';
-        const preview = c.last_message ? escapeHtml(c.last_message.substring(0, 60)) : 'No messages yet';
-        const unreadClass = c.unread_count > 0 ? 'unread' : '';
-        const unreadBadge = c.unread_count > 0 ? `<span class="unread-badge">${c.unread_count}</span>` : '';
-
-        return `<div class="conversation-item ${unreadClass}" onclick="showConversationDetail('${c.peer_id}')">
-            <div class="conv-header">
-                <span class="conv-peer">${escapeHtml(displayName)}</span>
-                <div>
-                    ${unreadBadge}
-                    <span class="conv-time">${timeAgo(c.last_timestamp)}</span>
-                </div>
-            </div>
-            <div class="conv-preview">${preview}</div>
-        </div>`;
-    }).join('');
-}
-
 async function loadConversationMessages(peerId, append) {
     let url = `/api/conversations/${encodeURIComponent(peerId)}?limit=${PAGE_SIZE}`;
     if (append && conversationOldestTimestamp) {
@@ -506,13 +556,88 @@ function renderConversationMessages() {
     const loadMoreEl = document.getElementById('conversation-load-more');
 
     if (conversationMessages.length === 0) {
-        el.innerHTML = '<div class="empty"><div class="icon">&#128172;</div><div>No messages yet</div></div>';
+        el.innerHTML = '<div class="empty"><div class="icon">&#128172;</div><div>No messages yet. Send the first message!</div></div>';
         loadMoreEl.style.display = 'none';
-        return;
+    } else {
+        el.innerHTML = conversationMessages.map(renderDmMessage).join('');
+        loadMoreEl.style.display = conversationMessages.length >= PAGE_SIZE ? '' : 'none';
     }
 
-    el.innerHTML = conversationMessages.map(renderMessage).join('');
-    loadMoreEl.style.display = conversationMessages.length >= PAGE_SIZE ? '' : 'none';
+    // Always render the DM compose below messages
+    renderDmCompose();
+}
+
+function renderDmMessage(m) {
+    const isSelf = m.sender_id === myPeerId;
+    const peer = peers.find(p => p.peer_id === m.sender_id);
+    const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : m.sender_id.substring(0, 12) + '...';
+    const senderClass = isSelf ? 'msg-sender self' : 'msg-sender';
+    const unreadClass = m.is_read ? '' : ' unread';
+    const attachmentsHtml = renderAttachments(m.attachments);
+    const reactionsHtml = renderReactions(m);
+
+    return `<div class="message${unreadClass}" data-id="${m.message_id}" onclick="markRead('${m.message_id}')">
+        <div class="msg-header">
+            <span class="${senderClass}" title="${m.sender_id}">${senderLabel}</span>
+            <span class="msg-time">${timeAgo(m.timestamp)}</span>
+        </div>
+        <div class="msg-body">${escapeHtml(m.body || '')}</div>
+        ${attachmentsHtml}
+        ${reactionsHtml}
+    </div>`;
+}
+
+function renderDmCompose() {
+    // Check if DM compose already exists
+    let existing = document.getElementById('dm-compose-box');
+    if (existing) return;
+
+    const container = document.getElementById('conversation-detail');
+    const composeDiv = document.createElement('div');
+    composeDiv.className = 'dm-compose';
+    composeDiv.id = 'dm-compose-box';
+    composeDiv.innerHTML = `
+        <textarea id="dm-compose-body" placeholder="Write a message..."></textarea>
+        <div class="dm-compose-actions">
+            <button id="dm-compose-send" onclick="sendDmMessage()">Send</button>
+        </div>
+    `;
+    // Insert before the load-more button
+    const loadMore = document.getElementById('conversation-load-more');
+    container.insertBefore(composeDiv, loadMore);
+
+    // Ctrl+Enter to send in DM
+    document.getElementById('dm-compose-body').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            sendDmMessage();
+        }
+    });
+}
+
+async function sendDmMessage() {
+    const bodyEl = document.getElementById('dm-compose-body');
+    if (!bodyEl) return;
+    const body = bodyEl.value.trim();
+    if (!body || !currentConversationPeerId) return;
+
+    const btn = document.getElementById('dm-compose-send');
+    btn.disabled = true;
+
+    try {
+        await apiPost('/api/messages/direct', {
+            recipient_id: currentConversationPeerId,
+            body: body,
+            attachments: [],
+        });
+        bodyEl.value = '';
+        showToast('Message sent');
+        loadConversationMessages(currentConversationPeerId, false);
+    } catch (e) {
+        showToast('Send failed: ' + e.message);
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 function loadMoreConversationMessages() {
@@ -522,7 +647,7 @@ function loadMoreConversationMessages() {
 }
 
 // ---------------------------------------------------------------------------
-// Compose & send
+// Compose & send (for timeline: public/group posts)
 // ---------------------------------------------------------------------------
 async function sendMessage() {
     const body = document.getElementById('compose-body').value.trim();
@@ -548,9 +673,6 @@ async function sendMessage() {
         if (kind === 'public') {
             endpoint = '/api/messages/public';
             payload = { body: body || '', attachments: uploadedAttachments };
-        } else if (kind === 'direct' && currentConversationPeerId) {
-            endpoint = '/api/messages/direct';
-            payload = { recipient_id: currentConversationPeerId, body: body || '', attachments: uploadedAttachments };
         } else {
             showToast('Unsupported message kind for compose');
             btn.disabled = false;
@@ -560,11 +682,6 @@ async function sendMessage() {
         document.getElementById('compose-body').value = '';
         clearAttachments();
         showToast('Message sent');
-
-        // Reload conversation messages if in conversation detail view
-        if (currentView === 'conversation-detail' && currentConversationPeerId) {
-            loadConversationMessages(currentConversationPeerId, false);
-        }
     } catch (e) {
         showToast('Send failed: ' + e.message);
     } finally {
@@ -711,18 +828,11 @@ function renderFriendsList() {
         return `<div class="friend-item" data-peer-id="${p.peer_id}" onclick="openConversationWithPeer('${p.peer_id}')">
             <span class="online-dot ${onlineClass}"></span>
             <div class="friend-info">
-                <div class="friend-name" title="${p.peer_id}" onclick="event.stopPropagation();showPeerProfile('${p.peer_id}')">${escapeHtml(displayName)}</div>
+                <div class="friend-name" title="${p.peer_id}">${escapeHtml(displayName)}</div>
                 <div class="friend-last-seen">${p.online ? 'online' : 'last seen ' + lastSeen}</div>
             </div>
         </div>`;
     }).join('');
-}
-
-function openConversationWithPeer(peerId) {
-    // Switch to conversations view and open this specific conversation
-    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
-    document.querySelector('.filters button[data-view="conversations"]').classList.add('active');
-    showConversationDetail(peerId);
 }
 
 function toggleAddFriendForm() {
@@ -952,8 +1062,6 @@ function handleWsEvent(event) {
             }
         }
 
-        // Prepend to timeline if it matches current filter
-        const matchesFilter = !currentFilter || event.message_kind === currentFilter;
         const msg = {
             message_id: event.message_id,
             sender_id: event.sender_id,
@@ -961,23 +1069,30 @@ function handleWsEvent(event) {
             body: event.body,
             timestamp: event.timestamp,
             is_read: event.sender_id === myPeerId,
+            reply_to: event.reply_to || null,
         };
-        // Avoid duplicates
-        if (!messages.find(m => m.message_id === msg.message_id)) {
-            if (matchesFilter && currentView === 'timeline') {
+
+        // Only show on timeline if it's a root public/group post
+        const isTimelinePost = (event.message_kind === 'public' || event.message_kind === 'friend_group') && !msg.reply_to;
+        const matchesFilter = !currentFilter || event.message_kind === currentFilter;
+
+        if (isTimelinePost && matchesFilter && currentView === 'timeline') {
+            // Avoid duplicates
+            if (!messages.find(m => m.message_id === msg.message_id)) {
                 messages.unshift(msg);
                 renderTimeline();
             }
-            if (event.sender_id !== myPeerId) {
-                showToast('New message from ' + event.sender_id.substring(0, 12) + '...');
-            }
         }
 
-        // If it's a direct message, refresh conversations list or conversation detail
+        if (event.sender_id !== myPeerId) {
+            const senderPeer = peers.find(p => p.peer_id === event.sender_id);
+            const senderName = senderPeer?.display_name || event.sender_id.substring(0, 12) + '...';
+            showToast('New message from ' + senderName);
+        }
+
+        // If it's a direct message, refresh conversation detail if viewing that peer
         if (event.message_kind === 'direct') {
-            if (currentView === 'conversations') {
-                loadConversations();
-            } else if (currentView === 'conversation-detail') {
+            if (currentView === 'conversation-detail') {
                 const otherPeerId = event.sender_id === myPeerId ? msg.recipient_id : event.sender_id;
                 if (otherPeerId === currentConversationPeerId) {
                     loadConversationMessages(currentConversationPeerId, false);
@@ -994,6 +1109,10 @@ function handleWsEvent(event) {
             peer.online = true;
             peer.last_seen_online = Math.floor(Date.now() / 1000);
             renderFriendsList();
+            // Update DM peer info if viewing that peer
+            if (currentView === 'conversation-detail' && currentConversationPeerId === event.peer_id) {
+                renderDmPeerInfo(event.peer_id);
+            }
             const displayName = peer.display_name || peer.peer_id.substring(0, 12) + '...';
             showToast(displayName + ' is now online');
         }
@@ -1004,6 +1123,10 @@ function handleWsEvent(event) {
             peer.online = false;
             peer.last_seen_online = Math.floor(Date.now() / 1000);
             renderFriendsList();
+            // Update DM peer info if viewing that peer
+            if (currentView === 'conversation-detail' && currentConversationPeerId === event.peer_id) {
+                renderDmPeerInfo(event.peer_id);
+            }
         }
     } else if (event.type === 'friend_request_received') {
         showToast('New friend request from ' + event.from_peer_id.substring(0, 12) + '...');
@@ -1023,10 +1146,10 @@ function handleWsEvent(event) {
 }
 
 // ---------------------------------------------------------------------------
-// Replies (Phase 9)
+// Comments (Phase 9)
 // ---------------------------------------------------------------------------
 async function loadReplies(messageId, append) {
-    let url = `/api/messages/${encodeURIComponent(messageId)}/replies?limit=${PAGE_SIZE}`;
+    let url = `/api/messages/${encodeURIComponent(messageId)}/replies?limit=${COMMENTS_PAGE_SIZE}`;
     if (append && repliesOldestTimestamp) {
         url += `&before=${repliesOldestTimestamp}`;
     }
@@ -1043,7 +1166,7 @@ async function loadReplies(messageId, append) {
         }
         renderReplies();
     } catch (e) {
-        console.error('Failed to load replies:', e);
+        console.error('Failed to load comments:', e);
     }
 }
 
@@ -1058,7 +1181,7 @@ function renderReplies() {
     }
 
     el.innerHTML = currentPostReplies.map(renderReplyItem).join('');
-    loadMoreEl.style.display = currentPostReplies.length >= PAGE_SIZE ? '' : 'none';
+    loadMoreEl.style.display = currentPostReplies.length >= COMMENTS_PAGE_SIZE ? '' : 'none';
 }
 
 function renderReplyItem(m) {
@@ -1093,11 +1216,11 @@ async function sendReply() {
     try {
         await apiPost(`/api/messages/${encodeURIComponent(currentPostId)}/reply`, { body });
         document.getElementById('reply-body').value = '';
-        showToast('Reply sent');
-        // Reload replies
+        showToast('Comment sent');
+        // Reload comments
         await loadReplies(currentPostId, false);
     } catch (e) {
-        showToast('Reply failed: ' + e.message);
+        showToast('Comment failed: ' + e.message);
     }
 }
 
@@ -1152,6 +1275,7 @@ function showMyProfile() {
     viewingProfileId = myPeerId;
 
     hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
     document.getElementById('profile-edit').classList.add('visible');
     document.getElementById('compose-box').style.display = 'none';
 
@@ -1195,6 +1319,7 @@ async function showPeerProfile(peerId) {
     viewingProfileId = peerId;
 
     hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
     document.getElementById('profile-view').classList.add('visible');
     document.getElementById('compose-box').style.display = 'none';
 
@@ -1248,7 +1373,7 @@ function renderPeerProfile(profile, peerId) {
         fieldsHtml += '</dl>';
     }
 
-    // Add button to open conversation if they are a peer
+    // Add button to open DM conversation if they are a peer
     const peer = peers.find(p => p.peer_id === peerId);
     const actionHtml = peer
         ? `<div style="margin-top:1rem;"><button class="btn-primary" style="background:#5566cc;border:none;color:#fff;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-size:0.85rem;" onclick="backFromProfile();openConversationWithPeer('${peerId}')">Send Message</button></div>`
@@ -1281,18 +1406,15 @@ function backFromProfile() {
     document.getElementById('profile-edit').classList.remove('visible');
     document.getElementById('compose-box').style.display = '';
 
-    // Restore previous view
-    if (currentView === 'timeline') {
-        showTimelineView();
-        loadMessages(false);
-    } else if (currentView === 'conversations') {
-        showConversationsView();
-    } else if (currentView === 'conversation-detail' && currentConversationPeerId) {
-        showConversationDetail(currentConversationPeerId);
-    } else if (currentView === 'post-detail' && currentPostId) {
-        // Re-show post detail
-        hideAllViews();
-        document.getElementById('post-detail').classList.add('visible');
+    // Restore previous view based on current hash
+    const hash = window.location.hash || '#/';
+    const parts = hash.replace('#/', '').split('/');
+    const route = parts[0] || '';
+
+    if (route === 'peer' && parts[1]) {
+        showConversationDetail(decodeURIComponent(parts.slice(1).join('/')), true);
+    } else if (route === 'post' && parts[1]) {
+        showPostDetail(decodeURIComponent(parts.slice(1).join('/')), true);
     } else {
         showTimelineView();
         loadMessages(false);
@@ -1326,7 +1448,10 @@ async function init() {
     await loadPeers();
     await loadMyProfile();
     await loadFriendRequests();
-    await loadMessages(false);
+
+    // Route based on current hash
+    handleRoute();
+
     connectWs();
 }
 

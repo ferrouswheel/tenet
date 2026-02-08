@@ -82,11 +82,8 @@
         <div class="main-content">
             <!-- Filter tabs -->
             <div class="filters">
-                <button class="active" data-kind="">All</button>
-                <button data-kind="public">Public</button>
-                <button data-kind="direct">Direct</button>
+                <button class="active" data-kind="public">Public</button>
                 <button data-kind="friend_group">Groups</button>
-                <button data-view="conversations">Conversations</button>
             </div>
 
             <!-- Compose box -->
@@ -110,15 +107,14 @@
             <!-- Timeline -->
             <div id="timeline"></div>
 
-            <!-- Conversations list -->
-            <div id="conversations-list" style="display:none;"></div>
-
-            <!-- Conversation detail -->
+            <!-- Conversation detail (DMs with a friend, accessed from sidebar) -->
             <div id="conversation-detail" class="conversation-detail">
                 <div class="conversation-back">
-                    <button onclick="backToConversations()">&#8592; Back</button>
+                    <button onclick="navigateTo('timeline')">&#8592; Back to Feed</button>
                     <span class="peer-name" id="conversation-peer-name"></span>
                 </div>
+                <!-- Peer info header -->
+                <div class="dm-peer-info" id="dm-peer-info"></div>
                 <div id="conversation-messages"></div>
                 <div id="conversation-load-more" class="load-more" style="display:none;">
                     <button onclick="loadMoreConversationMessages()">Load older messages</button>
@@ -128,20 +124,20 @@
             <!-- Post detail -->
             <div id="post-detail" class="post-detail">
                 <div class="post-detail-back">
-                    <button onclick="backToPublicFeed()">&#8592; Back to Feed</button>
+                    <button onclick="navigateTo('timeline')">&#8592; Back to Feed</button>
                 </div>
                 <div id="post-detail-content"></div>
                 <!-- Reply compose (Phase 9) -->
                 <div class="reply-compose" id="reply-compose">
-                    <textarea id="reply-body" placeholder="Write a reply..."></textarea>
+                    <textarea id="reply-body" placeholder="Write a comment..."></textarea>
                     <div class="reply-compose-actions">
-                        <button onclick="sendReply()">Reply</button>
+                        <button onclick="sendReply()">Comment</button>
                     </div>
                 </div>
-                <!-- Replies list (Phase 9) -->
+                <!-- Comments list -->
                 <div id="post-replies"></div>
                 <div id="replies-load-more" class="load-more" style="display:none;">
-                    <button onclick="loadMoreReplies()">Load more replies</button>
+                    <button onclick="loadMoreReplies()">Load more comments</button>
                 </div>
             </div>
 
