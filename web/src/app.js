@@ -705,7 +705,9 @@ function renderFriendsList() {
     el.innerHTML = peers.map(p => {
         const displayName = p.display_name || p.peer_id.substring(0, 12) + '...';
         const onlineClass = p.online ? 'online' : '';
-        const lastSeen = p.last_seen_online ? timeAgo(p.last_seen_online) : 'never';
+        // Use last_seen_online, falling back to added_at (time of friend request/acceptance)
+        const lastSeenTs = p.last_seen_online || p.added_at;
+        const lastSeen = lastSeenTs ? timeAgo(lastSeenTs) : 'never';
         return `<div class="friend-item" data-peer-id="${p.peer_id}" onclick="openConversationWithPeer('${p.peer_id}')">
             <span class="online-dot ${onlineClass}"></span>
             <div class="friend-info">
@@ -938,6 +940,18 @@ function connectWs() {
 
 function handleWsEvent(event) {
     if (event.type === 'new_message') {
+        // Update last_seen_online for the sender in our local peers list
+        if (event.sender_id !== myPeerId) {
+            const senderPeer = peers.find(p => p.peer_id === event.sender_id);
+            if (senderPeer) {
+                const msgTs = event.timestamp || Math.floor(Date.now() / 1000);
+                if (!senderPeer.last_seen_online || msgTs > senderPeer.last_seen_online) {
+                    senderPeer.last_seen_online = msgTs;
+                    renderFriendsList();
+                }
+            }
+        }
+
         // Prepend to timeline if it matches current filter
         const matchesFilter = !currentFilter || event.message_kind === currentFilter;
         const msg = {
