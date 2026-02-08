@@ -622,12 +622,19 @@ async fn send_direct_handler(
 
         let _ = st.ws_tx.send(WsEvent::NewMessage {
             message_id: msg_id.clone(),
-            sender_id: keypair_id,
+            sender_id: keypair_id.clone(),
             message_kind: "direct".to_string(),
             body: Some(req.body.clone()),
             timestamp: now,
         });
     }
+
+    eprintln!(
+        "send: direct message to {} (id={}, relay={})",
+        req.recipient_id,
+        &msg_id[..msg_id.len().min(12)],
+        relay_delivered
+    );
 
     let json = serde_json::json!({
         "message_id": msg_id,
@@ -739,6 +746,12 @@ async fn send_public_handler(
             timestamp: now,
         });
     }
+
+    eprintln!(
+        "send: public message (id={}, relay={})",
+        &msg_id[..msg_id.len().min(12)],
+        relay_delivered
+    );
 
     let json = serde_json::json!({
         "message_id": msg_id,
@@ -867,6 +880,13 @@ async fn send_group_handler(
             timestamp: now,
         });
     }
+
+    eprintln!(
+        "send: group message to {} (id={}, relay={})",
+        req.group_id,
+        &msg_id[..msg_id.len().min(12)],
+        relay_delivered
+    );
 
     let json = serde_json::json!({
         "message_id": msg_id,
@@ -1239,11 +1259,27 @@ async fn accept_friend_request_handler(
         encryption_public_key: Some(fr.from_encryption_key.clone()),
         added_at: now,
         is_friend: true,
-        last_seen_online: None,
+        last_seen_online: Some(now),
         online: false,
     };
     if let Err(e) = st.storage.insert_peer(&peer_row) {
         eprintln!("failed to add peer from friend request: {}", e);
+    }
+
+    // Archive any outgoing request we sent to this peer (race condition)
+    if let Ok(Some(outgoing)) = st
+        .storage
+        .find_request_between(&keypair.id, &fr.from_peer_id)
+    {
+        if outgoing.status == "pending" {
+            eprintln!(
+                "friend-accept: archiving duplicate outgoing request to {} (id={})",
+                fr.from_peer_id, outgoing.id
+            );
+            let _ = st
+                .storage
+                .update_friend_request_status(outgoing.id, "accepted");
+        }
     }
 
     // Send FriendAccept meta message via relay
@@ -2792,6 +2828,93 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         eprintln!("sync: received friend_request from {}", from_peer_id);
                         let st = state.lock().await;
 
+                        // If already friends, treat as duplicate and skip
+                        if let Ok(Some(peer)) = st.storage.get_peer(&from_peer_id) {
+                            if peer.is_friend {
+                                eprintln!(
+                                    "sync: friend request from {} is a duplicate (already friends), ignoring",
+                                    from_peer_id
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Check if we have a pending OUTGOING request to this peer (race condition)
+                        let outgoing = st
+                            .storage
+                            .find_request_between(&keypair.id, &from_peer_id)
+                            .unwrap_or(None);
+
+                        if let Some(ref out_req) = outgoing {
+                            if out_req.status == "pending" {
+                                // Race condition: both peers sent friend requests to each other.
+                                // Auto-accept: mark our outgoing request as accepted, add them as a friend,
+                                // and archive the incoming request as a duplicate.
+                                eprintln!(
+                                    "sync: mutual friend request detected with {} — auto-accepting",
+                                    from_peer_id
+                                );
+                                let _ = st
+                                    .storage
+                                    .update_friend_request_status(out_req.id, "accepted");
+
+                                // Add peer as friend
+                                let peer_row = PeerRow {
+                                    peer_id: from_peer_id.clone(),
+                                    display_name: None,
+                                    signing_public_key: signing_public_key.clone(),
+                                    encryption_public_key: Some(encryption_public_key.clone()),
+                                    added_at: now,
+                                    is_friend: true,
+                                    last_seen_online: Some(now),
+                                    online: false,
+                                };
+                                let _ = st.storage.insert_peer(&peer_row);
+
+                                // Send FriendAccept back so the other peer also completes the handshake
+                                drop(st);
+                                {
+                                    let meta_msg = MetaMessage::FriendAccept {
+                                        peer_id: keypair.id.clone(),
+                                        signing_public_key: keypair.signing_public_key_hex.clone(),
+                                        encryption_public_key: keypair.public_key_hex.clone(),
+                                    };
+                                    if let Ok(payload) = build_meta_payload(&meta_msg) {
+                                        if let Ok(env) = build_envelope_from_payload(
+                                            keypair.id.clone(),
+                                            from_peer_id.clone(),
+                                            None,
+                                            None,
+                                            now,
+                                            DEFAULT_TTL_SECONDS,
+                                            MessageKind::Meta,
+                                            None,
+                                            payload,
+                                            &keypair.signing_private_key_hex,
+                                        ) {
+                                            if let Err(e) = post_to_relay(&relay_url, &env) {
+                                                eprintln!(
+                                                    "sync: failed to send auto-accept to {}: {}",
+                                                    from_peer_id, e
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "sync: sent auto-accept to {} via relay",
+                                                    from_peer_id
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                let st = state.lock().await;
+                                let _ = st.ws_tx.send(WsEvent::FriendRequestAccepted {
+                                    request_id: out_req.id,
+                                    from_peer_id: from_peer_id.clone(),
+                                });
+                                continue;
+                            }
+                        }
+
                         // Check for existing request from this peer
                         let existing = st
                             .storage
@@ -2882,6 +3005,18 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                     } => {
                         eprintln!("sync: received friend_accept from {}", from_peer_id);
                         let st = state.lock().await;
+
+                        // If already friends, treat as duplicate
+                        if let Ok(Some(peer)) = st.storage.get_peer(&from_peer_id) {
+                            if peer.is_friend {
+                                eprintln!(
+                                    "sync: friend_accept from {} is a duplicate (already friends), ignoring",
+                                    from_peer_id
+                                );
+                                continue;
+                            }
+                        }
+
                         let requests = st
                             .storage
                             .list_friend_requests(Some("pending"), Some("outgoing"))
@@ -2898,10 +3033,26 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                 encryption_public_key: Some(encryption_public_key),
                                 added_at: now,
                                 is_friend: true,
-                                last_seen_online: None,
+                                last_seen_online: Some(now),
                                 online: false,
                             };
                             let _ = st.storage.insert_peer(&peer_row);
+
+                            // Also archive any incoming friend request from this peer (race condition)
+                            if let Ok(Some(incoming)) =
+                                st.storage.find_request_between(&from_peer_id, &keypair.id)
+                            {
+                                if incoming.status == "pending" {
+                                    eprintln!(
+                                        "sync: archiving duplicate incoming request from {} (id={})",
+                                        from_peer_id, incoming.id
+                                    );
+                                    let _ = st
+                                        .storage
+                                        .update_friend_request_status(incoming.id, "accepted");
+                                }
+                            }
+
                             let _ = st.ws_tx.send(WsEvent::FriendRequestAccepted {
                                 request_id: req_id,
                                 from_peer_id: from_peer_id.clone(),
@@ -2975,10 +3126,106 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
             MessageKind::StoreForPeer => "store_for_peer",
         };
 
+        // Check if this is a profile update (body contains "type": "tenet.profile")
+        if let Some(ref body_str) = body {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body_str) {
+                if parsed.get("type").and_then(|t| t.as_str()) == Some("tenet.profile") {
+                    let profile_user_id = parsed
+                        .get("user_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(sender_id)
+                        .to_string();
+                    let updated_at = parsed
+                        .get("updated_at")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(envelope.header.timestamp);
+
+                    let profile_row = ProfileRow {
+                        user_id: profile_user_id.clone(),
+                        display_name: parsed
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        bio: parsed
+                            .get("bio")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        avatar_hash: parsed
+                            .get("avatar_hash")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        public_fields: parsed
+                            .get("public_fields")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string()),
+                        friends_fields: parsed
+                            .get("friends_fields")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string()),
+                        updated_at,
+                    };
+
+                    let st = state.lock().await;
+                    match st.storage.upsert_profile_if_newer(&profile_row) {
+                        Ok(true) => {
+                            eprintln!("sync: updated profile for {}", profile_user_id);
+                            // Update peer display name if it changed
+                            if let Some(ref display_name) = profile_row.display_name {
+                                if let Ok(Some(mut peer)) = st.storage.get_peer(&profile_user_id) {
+                                    if peer.display_name.as_deref() != Some(display_name) {
+                                        peer.display_name = Some(display_name.clone());
+                                        let _ = st.storage.insert_peer(&peer);
+                                        eprintln!(
+                                            "sync: updated display name for peer {}",
+                                            profile_user_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "sync: profile for {} is not newer, skipping",
+                                profile_user_id
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "sync: failed to update profile for {}: {}",
+                                profile_user_id, e
+                            );
+                        }
+                    }
+                    continue; // Don't store profile updates as timeline messages
+                }
+
+                // Also check for group key distribution messages — don't show in timeline
+                if parsed.get("type").and_then(|t| t.as_str()) == Some("group_key_distribution") {
+                    // Handle group key distribution (existing logic would go here)
+                    // For now, just skip showing in timeline
+                    continue;
+                }
+            }
+        }
+
         let st = state.lock().await;
         if st.storage.has_message(&message_id).unwrap_or(true) {
             continue;
         }
+
+        // Update last_seen_online for the sender when we receive a message from them
+        if let Ok(Some(_)) = st.storage.get_peer(sender_id) {
+            let _ = st
+                .storage
+                .update_peer_online(sender_id, false, envelope.header.timestamp);
+        }
+
+        eprintln!(
+            "sync: received {} message from {} (id={})",
+            kind_str,
+            sender_id,
+            &message_id[..message_id.len().min(12)]
+        );
 
         let row = MessageRow {
             message_id: message_id.clone(),
