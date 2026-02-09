@@ -407,6 +407,22 @@ pub fn decrypt_group_payload(
         .map_err(CryptoError::Aead)
 }
 
+/// Validate a hex-encoded key has the expected byte length.
+pub fn validate_hex_key(
+    hex_str: &str,
+    expected_len: usize,
+    field_name: &str,
+) -> Result<(), String> {
+    let bytes = hex::decode(hex_str).map_err(|_| format!("{field_name} is not valid hex"))?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "{field_name} must be {expected_len} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
