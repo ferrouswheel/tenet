@@ -283,6 +283,15 @@ async fn store_envelope(
             }
             (StatusCode::ACCEPTED, Json(StoreResponse { message_id })).into_response()
         }
+        Ok(StoreDecision::Broadcast {
+            message_id,
+            recipients,
+        }) => {
+            for rid in &recipients {
+                state.notify_subscribers(rid, ws_payload.clone()).await;
+            }
+            (StatusCode::ACCEPTED, Json(StoreResponse { message_id })).into_response()
+        }
         Ok(StoreDecision::Duplicate { message_id }) => {
             (StatusCode::ACCEPTED, Json(StoreResponse { message_id })).into_response()
         }
@@ -308,7 +317,7 @@ async fn store_envelopes_batch(
         .map(|p| (recipient_id_from(p), p.clone()))
         .collect();
 
-    let results = {
+    let (results, notify_targets): (Vec<_>, Vec<_>) = {
         let mut inner = match lock_with_retry(&state).await {
             Ok(inner) => inner,
             Err(status) => return (status, "relay busy").into_response(),
@@ -319,44 +328,80 @@ async fn store_envelopes_batch(
             .into_iter()
             .map(|payload| {
                 match store_envelope_locked(&state.config, &mut inner, payload, now, now_epoch) {
-                    Ok(StoreDecision::Accepted { message_id }) => BatchStoreResult {
-                        message_id: Some(message_id),
-                        status: BatchStoreStatus::Accepted,
-                        detail: None,
-                    },
-                    Ok(StoreDecision::Duplicate { message_id }) => BatchStoreResult {
-                        message_id: Some(message_id),
-                        status: BatchStoreStatus::Duplicate,
-                        detail: None,
-                    },
-                    Ok(StoreDecision::Expired { message_id }) => BatchStoreResult {
-                        message_id: Some(message_id),
-                        status: BatchStoreStatus::Expired,
-                        detail: None,
-                    },
-                    Ok(StoreDecision::TooLarge { message_id }) => BatchStoreResult {
-                        message_id: Some(message_id),
-                        status: BatchStoreStatus::TooLarge,
-                        detail: None,
-                    },
-                    Err(StoreError::MissingRecipient) => BatchStoreResult {
-                        message_id: None,
-                        status: BatchStoreStatus::Invalid,
-                        detail: Some("missing recipient_id".to_string()),
-                    },
-                    Err(StoreError::InvalidPayload(detail)) => BatchStoreResult {
-                        message_id: None,
-                        status: BatchStoreStatus::Invalid,
-                        detail: Some(detail),
-                    },
+                    Ok(StoreDecision::Accepted { message_id }) => (
+                        BatchStoreResult {
+                            message_id: Some(message_id),
+                            status: BatchStoreStatus::Accepted,
+                            detail: None,
+                        },
+                        None,
+                    ),
+                    Ok(StoreDecision::Broadcast {
+                        message_id,
+                        recipients,
+                    }) => (
+                        BatchStoreResult {
+                            message_id: Some(message_id),
+                            status: BatchStoreStatus::Accepted,
+                            detail: None,
+                        },
+                        Some(recipients),
+                    ),
+                    Ok(StoreDecision::Duplicate { message_id }) => (
+                        BatchStoreResult {
+                            message_id: Some(message_id),
+                            status: BatchStoreStatus::Duplicate,
+                            detail: None,
+                        },
+                        None,
+                    ),
+                    Ok(StoreDecision::Expired { message_id }) => (
+                        BatchStoreResult {
+                            message_id: Some(message_id),
+                            status: BatchStoreStatus::Expired,
+                            detail: None,
+                        },
+                        None,
+                    ),
+                    Ok(StoreDecision::TooLarge { message_id }) => (
+                        BatchStoreResult {
+                            message_id: Some(message_id),
+                            status: BatchStoreStatus::TooLarge,
+                            detail: None,
+                        },
+                        None,
+                    ),
+                    Err(StoreError::MissingRecipient) => (
+                        BatchStoreResult {
+                            message_id: None,
+                            status: BatchStoreStatus::Invalid,
+                            detail: Some("missing recipient_id".to_string()),
+                        },
+                        None,
+                    ),
+                    Err(StoreError::InvalidPayload(detail)) => (
+                        BatchStoreResult {
+                            message_id: None,
+                            status: BatchStoreStatus::Invalid,
+                            detail: Some(detail),
+                        },
+                        None,
+                    ),
                 }
             })
-            .collect::<Vec<_>>()
+            .unzip()
     };
 
     for (i, result) in results.iter().enumerate() {
         if matches!(result.status, BatchStoreStatus::Accepted) {
-            if let Some((Some(rid), payload)) = payload_copies.get(i) {
+            if let Some(Some(broadcast_recipients)) = notify_targets.get(i) {
+                // Broadcast: notify all recipient peers
+                if let Some((_, payload)) = payload_copies.get(i) {
+                    for rid in broadcast_recipients {
+                        state.notify_subscribers(rid, payload.clone()).await;
+                    }
+                }
+            } else if let Some((Some(rid), payload)) = payload_copies.get(i) {
                 state.notify_subscribers(rid, payload.clone()).await;
             }
         }
@@ -509,10 +554,22 @@ async fn lock_with_retry(
 }
 
 enum StoreDecision {
-    Accepted { message_id: String },
-    Duplicate { message_id: String },
-    Expired { message_id: String },
-    TooLarge { message_id: String },
+    Accepted {
+        message_id: String,
+    },
+    Broadcast {
+        message_id: String,
+        recipients: Vec<String>,
+    },
+    Duplicate {
+        message_id: String,
+    },
+    Expired {
+        message_id: String,
+    },
+    TooLarge {
+        message_id: String,
+    },
 }
 
 enum StoreError {
@@ -529,7 +586,10 @@ fn store_envelope_locked(
 ) -> Result<StoreDecision, StoreError> {
     let recipient_id = recipient_id_from(&payload).ok_or(StoreError::MissingRecipient)?;
     let sender_id = sender_id_from(&payload);
-    record_peer_connection(config, inner, &recipient_id, now);
+    let is_broadcast = recipient_id == "*";
+    if !is_broadcast {
+        record_peer_connection(config, inner, &recipient_id, now);
+    }
     if let Some(sender_id) = sender_id.as_deref() {
         record_peer_connection(config, inner, sender_id, now);
     }
@@ -548,12 +608,6 @@ fn store_envelope_locked(
         }
         ExpiresAt::Valid(expires_at) => expires_at,
     };
-    let stored = StoredEnvelope {
-        body: payload,
-        size_bytes,
-        expires_at,
-        message_id: message_id.clone(),
-    };
 
     prune_dedup(&mut inner.dedup);
     if inner
@@ -566,6 +620,64 @@ fn store_envelope_locked(
 
     inner.dedup.insert(message_id.clone(), expires_at);
 
+    if is_broadcast {
+        // Fan out to all known peers except the sender
+        let recipients: Vec<String> = inner
+            .peer_last_seen
+            .keys()
+            .filter(|pid| sender_id.as_deref() != Some(pid.as_str()))
+            .cloned()
+            .collect();
+
+        for rid in &recipients {
+            let stored = StoredEnvelope {
+                body: payload.clone(),
+                size_bytes,
+                expires_at,
+                message_id: message_id.clone(),
+            };
+            let queue = inner
+                .queues
+                .entry(rid.clone())
+                .or_insert_with(VecDeque::new);
+            let evicted_ids = prune_expired(queue, now);
+            for eid in evicted_ids {
+                inner.dedup.remove(&eid);
+            }
+            while queue.len() >= config.max_messages
+                || queue_bytes(queue) + size_bytes > config.max_bytes
+            {
+                if let Some(evicted) = queue.pop_front() {
+                    inner.dedup.remove(&evicted.message_id);
+                }
+            }
+            queue.push_back(stored);
+        }
+
+        if let Some(sender_id) = &sender_id {
+            log_message(
+                config,
+                format!(
+                    "relay: broadcast {} -> {} peers (message_id: {})",
+                    format_peer_id(sender_id),
+                    recipients.len(),
+                    format_message_id(&message_id)
+                ),
+            );
+        }
+
+        return Ok(StoreDecision::Broadcast {
+            message_id,
+            recipients,
+        });
+    }
+
+    let stored = StoredEnvelope {
+        body: payload,
+        size_bytes,
+        expires_at,
+        message_id: message_id.clone(),
+    };
     let mut evicted_ids = Vec::new();
     {
         let queue = inner
