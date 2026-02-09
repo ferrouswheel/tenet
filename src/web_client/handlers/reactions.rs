@@ -66,7 +66,7 @@ pub async fn react_handler(
         None,
         now,
         DEFAULT_TTL_SECONDS,
-        MessageKind::Public,
+        MessageKind::Meta,
         None,
         &body_str,
         salt,

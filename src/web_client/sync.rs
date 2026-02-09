@@ -175,6 +175,38 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
                     }
                     _ => {}
                 }
+            } else {
+                // If not a standard MetaMessage, check if it's a reaction
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&envelope.payload.body) {
+                    if let (Some(target_id), Some(reaction)) = (
+                        parsed.get("target_message_id").and_then(|v| v.as_str()),
+                        parsed.get("reaction").and_then(|v| v.as_str()),
+                    ) {
+                        // This is a reaction - store it
+                        let st = state.lock().await;
+                        let reaction_row = crate::storage::ReactionRow {
+                            message_id: envelope.header.message_id.0.clone(),
+                            target_id: target_id.to_string(),
+                            sender_id: envelope.header.sender_id.clone(),
+                            reaction: reaction.to_string(),
+                            timestamp: envelope.header.timestamp,
+                        };
+                        if let Err(e) = st.storage.upsert_reaction(&reaction_row) {
+                            crate::tlog!(
+                                "sync: failed to store reaction from {}: {}",
+                                crate::logging::peer_id(&envelope.header.sender_id),
+                                e
+                            );
+                        } else {
+                            crate::tlog!(
+                                "sync: received {} reaction from {} for message {}",
+                                reaction,
+                                crate::logging::peer_id(&envelope.header.sender_id),
+                                crate::logging::msg_id(target_id)
+                            );
+                        }
+                    }
+                }
             }
             continue; // Meta messages are not stored as regular messages
         }
