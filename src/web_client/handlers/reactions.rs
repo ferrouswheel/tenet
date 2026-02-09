@@ -68,6 +68,7 @@ pub async fn react_handler(
         DEFAULT_TTL_SECONDS,
         MessageKind::Meta,
         None,
+        None,
         &body_str,
         salt,
         &signing_key,

@@ -128,6 +128,7 @@ pub async fn reply_handler(
             DEFAULT_TTL_SECONDS,
             MessageKind::Public,
             None,
+            Some(parent_message_id.clone()),
             &req.body,
             salt,
             &signing_key,
@@ -158,6 +159,7 @@ pub async fn reply_handler(
             DEFAULT_TTL_SECONDS,
             MessageKind::FriendGroup,
             Some(group_id.to_string()),
+            Some(parent_message_id.clone()),
             payload,
             &signing_key,
         ) {
@@ -222,6 +224,7 @@ pub async fn reply_handler(
             message_kind,
             body: Some(req.body),
             timestamp: now,
+            reply_to: Some(parent_message_id.clone()),
         });
     }
 

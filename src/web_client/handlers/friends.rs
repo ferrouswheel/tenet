@@ -129,6 +129,7 @@ pub async fn send_friend_request_handler(
                 DEFAULT_TTL_SECONDS,
                 MessageKind::Meta,
                 None,
+                None,
                 payload,
                 &keypair.signing_private_key_hex,
             ) {
@@ -281,6 +282,7 @@ pub async fn accept_friend_request_handler(
                 now,
                 DEFAULT_TTL_SECONDS,
                 MessageKind::Meta,
+                None,
                 None,
                 payload,
                 &keypair.signing_private_key_hex,

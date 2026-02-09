@@ -400,6 +400,7 @@ impl RelayClient {
                     self.config.ttl_seconds(),
                     MessageKind::Public,
                     None,
+                    None,
                     message,
                     salt,
                     &self.keypair.signing_private_key_hex,
@@ -417,6 +418,7 @@ impl RelayClient {
                     timestamp,
                     self.config.ttl_seconds(),
                     MessageKind::Public,
+                    None,
                     None,
                     message,
                     salt,
@@ -622,6 +624,7 @@ impl RelayClient {
             self.config.ttl_seconds(),
             MessageKind::FriendGroup,
             Some(group_id.to_string()),
+            None,
             payload,
             &self.keypair.signing_private_key_hex,
         )?;
@@ -739,6 +742,7 @@ impl RelayClient {
                     self.config.ttl_seconds(),
                     MessageKind::Direct,
                     None,
+                    None,
                     message,
                     salt,
                     &self.keypair.signing_private_key_hex,
@@ -768,6 +772,7 @@ impl RelayClient {
                     timestamp,
                     self.config.ttl_seconds(),
                     MessageKind::Direct,
+                    None,
                     None,
                     payload,
                     &self.keypair.signing_private_key_hex,
@@ -968,6 +973,7 @@ impl Client for RelayClient {
                 timestamp,
                 context.ttl_seconds,
                 MessageKind::Direct,
+                None,
                 None,
                 message.payload.clone(),
                 &self.keypair.signing_private_key_hex,
@@ -1331,7 +1337,8 @@ impl SimulationClient {
             context.ttl_seconds,
             MessageKind::Public,
             None,
-            message,
+            None,
+                    message,
             [0u8; 16], // salt
             &context.keypairs.get(&self.id)?.signing_private_key_hex,
         )
@@ -1510,6 +1517,7 @@ impl SimulationClient {
             context.ttl_seconds,
             MessageKind::FriendGroup,
             Some(group_id.to_string()),
+            None,
             payload,
             &sender_keypair.signing_private_key_hex,
         )
@@ -1738,6 +1746,7 @@ impl SimulationClient {
             context.ttl_seconds,
             MessageKind::Meta,
             None,
+            None,
             payload,
             &sender_keypair.signing_private_key_hex,
         )
@@ -1850,6 +1859,7 @@ impl SimulationClient {
             timestamp,
             context.ttl_seconds,
             MessageKind::StoreForPeer,
+            None,
             None,
             outer_payload,
             &sender_keypair.signing_private_key_hex,
@@ -2084,6 +2094,7 @@ impl Client for SimulationClient {
                         context.ttl_seconds,
                         MessageKind::Public,
                         None,
+                        None,
                         message.payload.clone(),
                         &sender_keypair.signing_private_key_hex,
                     ) {
@@ -2109,6 +2120,7 @@ impl Client for SimulationClient {
                         context.ttl_seconds,
                         MessageKind::FriendGroup,
                         group_id, // group_id - required for FriendGroup
+                        None,
                         message.payload.clone(),
                         &sender_keypair.signing_private_key_hex,
                     ) {
@@ -2132,6 +2144,7 @@ impl Client for SimulationClient {
                         timestamp,
                         context.ttl_seconds,
                         MessageKind::Direct,
+                        None,
                         None,
                         message.payload.clone(),
                         &sender_keypair.signing_private_key_hex,
@@ -2653,7 +2666,8 @@ mod tests {
             3600,
             MessageKind::Public,
             None,
-            "Test message",
+            None,
+                    "Test message",
             &[0u8; 16],
             &alice_keypair.signing_private_key_hex,
         )
@@ -2715,7 +2729,8 @@ mod tests {
             3600,
             MessageKind::Public,
             None,
-            "Public announcement",
+            None,
+                    "Public announcement",
             &[0u8; 16],
             &keypairs["peer2"].signing_private_key_hex,
         )
@@ -2782,7 +2797,8 @@ mod tests {
             10, // TTL
             MessageKind::Public,
             None,
-            "Expired message",
+            None,
+                    "Expired message",
             &[0u8; 16],
             &keypairs["peer2"].signing_private_key_hex,
         )
@@ -2809,7 +2825,8 @@ mod tests {
             3600,
             MessageKind::Public,
             None,
-            "Forward me",
+            None,
+                    "Forward me",
             &[0u8; 16],
             &peer2_keypair.signing_private_key_hex,
         )

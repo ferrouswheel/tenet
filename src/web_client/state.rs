@@ -19,6 +19,8 @@ pub enum WsEvent {
         message_kind: String,
         body: Option<String>,
         timestamp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
     },
     PeerOnline {
         peer_id: String,
