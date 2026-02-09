@@ -72,10 +72,40 @@ See `docs/architecture.md` for detailed design and threat model documentation.
 | Module | Purpose |
 |--------|---------|
 | `src/protocol.rs` | Message types (`Envelope`, `Header`, `ContentId`), protocol version, TTL validation |
-| `src/crypto.rs` | HPKE key encapsulation, ChaCha20Poly1305 encryption, keypair management |
+| `src/crypto.rs` | HPKE key encapsulation, ChaCha20Poly1305 encryption, keypair management, `validate_hex_key()` |
+| `src/relay_transport.rs` | Client-side relay HTTP helpers: `post_envelope()`, `fetch_inbox()` |
 | `src/client.rs` | `RelayClient` (HTTP), `SimulationClient` (in-process), `Client` trait |
 | `src/relay.rs` | Axum-based HTTP relay server with TTL enforcement and deduplication |
+| `src/identity.rs` | Multi-identity management, config, legacy migration |
+| `src/storage.rs` | SQLite persistence layer (messages, peers, groups, profiles, etc.) |
+| `src/groups.rs` | Group messaging: `GroupInfo`, `GroupManager`, membership |
+| `src/web_client/` | Web server module (REST API + WebSocket + embedded SPA) |
 | `src/simulation/` | Simulation harness, scenario configuration, metrics tracking |
+
+### Web Client Submodules (`src/web_client/`)
+
+The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is organized as:
+
+| File | Purpose |
+|------|---------|
+| `mod.rs` | Entry point `run()`: CLI parsing, identity resolution, server startup |
+| `config.rs` | `Cli` (clap), `Config`, constants (`DEFAULT_TTL_SECONDS`, etc.) |
+| `state.rs` | `AppState`, `SharedState` (`Arc<Mutex<AppState>>`), `WsEvent` enum |
+| `router.rs` | `build_router()` — all Axum route definitions |
+| `sync.rs` | Background relay sync loop, envelope processing, online announcements |
+| `static_files.rs` | Embedded SPA serving via `rust-embed` |
+| `utils.rs` | `api_error()`, `message_to_json()`, `link_attachments()`, `now_secs()`, `SendAttachmentRef` |
+| `handlers/health.rs` | `GET /api/health` |
+| `handlers/messages.rs` | Message CRUD + send direct/public/group, mark read |
+| `handlers/peers.rs` | Peer CRUD + key validation |
+| `handlers/friends.rs` | Friend request lifecycle (send, list, accept, ignore, block) |
+| `handlers/groups.rs` | Group CRUD + symmetric key distribution |
+| `handlers/attachments.rs` | Multipart upload + content-addressed download |
+| `handlers/reactions.rs` | Upvote/downvote reactions |
+| `handlers/replies.rs` | Threaded replies to public/group messages |
+| `handlers/profiles.rs` | Profile management + broadcasting to friends |
+| `handlers/conversations.rs` | Direct message conversation listing |
+| `handlers/websocket.rs` | WebSocket upgrade + broadcast connection |
 
 ### Simulation Submodules
 
