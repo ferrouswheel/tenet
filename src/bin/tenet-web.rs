@@ -185,8 +185,10 @@ async fn main() {
     let cli = Cli::parse();
     let config = Config::from_cli_and_env(cli);
 
-    eprintln!("tenet-web starting");
-    eprintln!("  data directory: {}", config.data_dir.display());
+    tenet::logging::init();
+
+    tenet::tlog!("tenet-web starting");
+    tenet::tlog!("  data directory: {}", config.data_dir.display());
 
     // Resolve identity (handles migration, creation, and selection)
     let resolved = resolve_identity(&config.data_dir, config.identity.as_deref())
@@ -196,17 +198,18 @@ async fn main() {
     let storage = resolved.storage;
 
     if resolved.newly_created {
-        eprintln!(
+        tenet::tlog!(
             "  identities: 1 available (newly created), using: {}",
-            keypair.id
+            tenet::logging::peer_id(&keypair.id)
         );
     } else {
-        eprintln!(
+        tenet::tlog!(
             "  identities: {} available, using: {}",
-            resolved.total_identities, keypair.id
+            resolved.total_identities,
+            tenet::logging::peer_id(&keypair.id)
         );
     }
-    eprintln!("  database: {}", db_path(&resolved.identity_dir).display());
+    tenet::tlog!("  database: {}", db_path(&resolved.identity_dir).display());
 
     // Resolve relay URL: CLI/env > stored in identity DB > none
     let relay_url = config.relay_url.or(resolved.stored_relay_url);
@@ -217,8 +220,8 @@ async fn main() {
     }
 
     match &relay_url {
-        Some(url) => eprintln!("  relay: {}", url),
-        None => eprintln!("  relay: none configured (messages will be local-only)"),
+        Some(url) => tenet::tlog!("  relay: {}", url),
+        None => tenet::tlog!("  relay: none configured (messages will be local-only)"),
     }
 
     // Create WebSocket broadcast channel
@@ -243,12 +246,12 @@ async fn main() {
         match sync_once(&check_state).await {
             Ok(()) => {
                 relay_connected.store(true, Ordering::Relaxed);
-                eprintln!("  relay status: connected");
+                tenet::tlog!("  relay status: connected");
             }
             Err(e) => {
-                eprintln!("  WARNING: relay is unreachable: {}", e);
-                eprintln!("  The web UI will show the relay as unavailable.");
-                eprintln!("  Background sync will retry with exponential backoff.");
+                tenet::tlog!("  WARNING: relay is unreachable: {}", e);
+                tenet::tlog!("  The web UI will show the relay as unavailable.");
+                tenet::tlog!("  Background sync will retry with exponential backoff.");
             }
         }
 
@@ -261,7 +264,7 @@ async fn main() {
         let announce_state = Arc::clone(&state);
         tokio::spawn(async move {
             if let Err(e) = announce_online(announce_state).await {
-                eprintln!("failed to announce online status: {}", e);
+                tenet::tlog!("failed to announce online status: {}", e);
             }
         });
     }
@@ -358,7 +361,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .expect("failed to bind");
-    eprintln!("tenet-web listening on http://{}", config.bind_addr);
+    tenet::tlog!("tenet-web listening on http://{}", config.bind_addr);
 
     axum::serve(listener, app).await.expect("server error");
 }
@@ -584,7 +587,7 @@ async fn send_direct_handler(
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("failed to post direct message to relay: {}", e);
+                tenet::tlog!("failed to post direct message to relay: {}", e);
                 false
             }
         }
@@ -629,10 +632,10 @@ async fn send_direct_handler(
         });
     }
 
-    eprintln!(
+    tenet::tlog!(
         "send: direct message to {} (id={}, relay={})",
-        req.recipient_id,
-        &msg_id[..msg_id.len().min(12)],
+        tenet::logging::peer_id(&req.recipient_id),
+        tenet::logging::msg_id(&msg_id),
         relay_delivered
     );
 
@@ -702,7 +705,7 @@ async fn send_public_handler(
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("failed to post public message to relay: {}", e);
+                tenet::tlog!("failed to post public message to relay: {}", e);
                 false
             }
         }
@@ -747,9 +750,9 @@ async fn send_public_handler(
         });
     }
 
-    eprintln!(
+    tenet::tlog!(
         "send: public message (id={}, relay={})",
-        &msg_id[..msg_id.len().min(12)],
+        tenet::logging::msg_id(&msg_id),
         relay_delivered
     );
 
@@ -836,7 +839,7 @@ async fn send_group_handler(
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("failed to post group message to relay: {}", e);
+                tenet::tlog!("failed to post group message to relay: {}", e);
                 false
             }
         }
@@ -881,10 +884,10 @@ async fn send_group_handler(
         });
     }
 
-    eprintln!(
+    tenet::tlog!(
         "send: group message to {} (id={}, relay={})",
         req.group_id,
-        &msg_id[..msg_id.len().min(12)],
+        tenet::logging::msg_id(&msg_id),
         relay_delivered
     );
 
@@ -1108,9 +1111,10 @@ async fn send_friend_request_handler(
             ) {
                 return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
             }
-            eprintln!(
+            tenet::tlog!(
                 "friend-request: resending to {} (refreshed id={})",
-                peer_id, ex.id
+                tenet::logging::peer_id(&peer_id),
+                ex.id
             );
             ex.id
         } else {
@@ -1156,17 +1160,21 @@ async fn send_friend_request_handler(
                 &keypair.signing_private_key_hex,
             ) {
                 if let Err(e) = post_to_relay(relay, &envelope) {
-                    eprintln!(
+                    tenet::tlog!(
                         "friend-request: failed to send to relay for {}: {}",
-                        peer_id, e
+                        tenet::logging::peer_id(&peer_id),
+                        e
                     );
                 } else {
-                    eprintln!("friend-request: sent to {} via relay", peer_id);
+                    tenet::tlog!(
+                        "friend-request: sent to {} via relay",
+                        tenet::logging::peer_id(&peer_id)
+                    );
                 }
             }
         }
     } else {
-        eprintln!("friend-request: no relay configured, request stored locally only");
+        tenet::tlog!("friend-request: no relay configured, request stored locally only");
     }
 
     let json = serde_json::json!({
@@ -1263,7 +1271,7 @@ async fn accept_friend_request_handler(
         online: false,
     };
     if let Err(e) = st.storage.insert_peer(&peer_row) {
-        eprintln!("failed to add peer from friend request: {}", e);
+        tenet::tlog!("failed to add peer from friend request: {}", e);
     }
 
     // Archive any outgoing request we sent to this peer (race condition)
@@ -1272,9 +1280,10 @@ async fn accept_friend_request_handler(
         .find_request_between(&keypair.id, &fr.from_peer_id)
     {
         if outgoing.status == "pending" {
-            eprintln!(
+            tenet::tlog!(
                 "friend-accept: archiving duplicate outgoing request to {} (id={})",
-                fr.from_peer_id, outgoing.id
+                tenet::logging::peer_id(&fr.from_peer_id),
+                outgoing.id
             );
             let _ = st
                 .storage
@@ -1304,12 +1313,16 @@ async fn accept_friend_request_handler(
                 &keypair.signing_private_key_hex,
             ) {
                 if let Err(e) = post_to_relay(relay, &envelope) {
-                    eprintln!(
+                    tenet::tlog!(
                         "friend-accept: failed to send to relay for {}: {}",
-                        fr.from_peer_id, e
+                        tenet::logging::peer_id(&fr.from_peer_id),
+                        e
                     );
                 } else {
-                    eprintln!("friend-accept: sent to {} via relay", fr.from_peer_id);
+                    tenet::tlog!(
+                        "friend-accept: sent to {} via relay",
+                        tenet::logging::peer_id(&fr.from_peer_id)
+                    );
                 }
             }
         }
@@ -1517,9 +1530,9 @@ async fn create_group_handler(
         let recipient_enc_key = match enc_key {
             Some(k) => k.clone(),
             None => {
-                eprintln!(
+                tenet::tlog!(
                     "peer {} not found or has no encryption key; skipping",
-                    member_id
+                    tenet::logging::peer_id(member_id)
                 );
                 key_distribution_failed.push(member_id.clone());
                 continue;
@@ -1551,9 +1564,10 @@ async fn create_group_handler(
         ) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                tenet::tlog!(
                     "failed to encrypt key distribution for {}: {}",
-                    member_id, e
+                    tenet::logging::peer_id(member_id),
+                    e
                 );
                 key_distribution_failed.push(member_id.clone());
                 continue;
@@ -1574,7 +1588,11 @@ async fn create_group_handler(
         ) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("failed to build envelope for {}: {}", member_id, e);
+                tenet::tlog!(
+                    "failed to build envelope for {}: {}",
+                    tenet::logging::peer_id(member_id),
+                    e
+                );
                 key_distribution_failed.push(member_id.clone());
                 continue;
             }
@@ -1582,7 +1600,11 @@ async fn create_group_handler(
 
         if let Some(ref relay_url) = relay_url {
             if let Err(e) = post_to_relay(relay_url, &envelope) {
-                eprintln!("failed to distribute group key to {}: {}", member_id, e);
+                tenet::tlog!(
+                    "failed to distribute group key to {}: {}",
+                    tenet::logging::peer_id(member_id),
+                    e
+                );
                 key_distribution_failed.push(member_id.clone());
             }
         } else {
@@ -1726,7 +1748,11 @@ async fn add_group_member_handler(
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("failed to distribute group key to {}: {}", req.peer_id, e);
+                tenet::tlog!(
+                    "failed to distribute group key to {}: {}",
+                    tenet::logging::peer_id(&req.peer_id),
+                    e
+                );
                 false
             }
         }
@@ -1952,7 +1978,7 @@ async fn react_handler(
     // Post to relay (blocking I/O, no lock held)
     if let Some(ref relay_url) = relay_url {
         if let Err(e) = post_to_relay(relay_url, &envelope) {
-            eprintln!("failed to post reaction to relay: {}", e);
+            tenet::tlog!("failed to post reaction to relay: {}", e);
         }
     }
 
@@ -2211,7 +2237,7 @@ async fn reply_handler(
         match post_to_relay(relay_url, &envelope) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("failed to post reply to relay: {}", e);
+                tenet::tlog!("failed to post reply to relay: {}", e);
                 false
             }
         }
@@ -2402,7 +2428,7 @@ async fn update_own_profile_handler(
     ) {
         if let Some(ref relay_url) = relay_url {
             if let Err(e) = post_to_relay(relay_url, &envelope) {
-                eprintln!("failed to post public profile to relay: {}", e);
+                tenet::tlog!("failed to post public profile to relay: {}", e);
             }
         }
     }
@@ -2448,7 +2474,11 @@ async fn update_own_profile_handler(
             ) {
                 if let Some(ref relay_url) = relay_url {
                     if let Err(e) = post_to_relay(relay_url, &envelope) {
-                        eprintln!("failed to send friends profile to {}: {}", peer_id, e);
+                        tenet::tlog!(
+                            "failed to send friends profile to {}: {}",
+                            tenet::logging::peer_id(peer_id),
+                            e
+                        );
                     }
                 }
             }
@@ -2625,7 +2655,7 @@ async fn ws_connection(mut socket: WebSocket, state: SharedState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("ws client lagged, skipped {n} events");
+                        tenet::tlog!("ws client lagged, skipped {n} events");
                         // Notify client so it can refresh
                         let lag_msg = serde_json::json!({
                             "type": "events_missed",
@@ -2719,7 +2749,7 @@ async fn relay_sync_loop(state: SharedState) {
                 let was_connected = st.relay_connected.swap(true, Ordering::Relaxed);
                 if !was_connected || was_disconnected {
                     let relay_url = st.relay_url.clone();
-                    eprintln!(
+                    tenet::tlog!(
                         "relay connected: {}",
                         relay_url.as_deref().unwrap_or("unknown")
                     );
@@ -2738,7 +2768,7 @@ async fn relay_sync_loop(state: SharedState) {
                 let was_connected = st.relay_connected.swap(false, Ordering::Relaxed);
                 if was_connected || consecutive_failures == 1 {
                     let relay_url = st.relay_url.clone();
-                    eprintln!(
+                    tenet::tlog!(
                         "relay disconnected: {} (attempt {}, next retry in {}s): {}",
                         relay_url.as_deref().unwrap_or("unknown"),
                         consecutive_failures,
@@ -2750,9 +2780,11 @@ async fn relay_sync_loop(state: SharedState) {
                         relay_url,
                     });
                 } else {
-                    eprintln!(
+                    tenet::tlog!(
                         "relay sync error (attempt {}, next retry in {}s): {}",
-                        consecutive_failures, next_retry_secs, e
+                        consecutive_failures,
+                        next_retry_secs,
+                        e
                     );
                 }
             }
@@ -2791,7 +2823,7 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
         return Ok(());
     }
 
-    eprintln!("sync: fetched {} envelope(s) from relay", envelopes.len());
+    tenet::tlog!("sync: fetched {} envelope(s) from relay", envelopes.len());
 
     let now = now_secs();
     let mut stored_count = 0u32;
@@ -2807,7 +2839,10 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                             let _ = st.ws_tx.send(WsEvent::PeerOnline {
                                 peer_id: peer_id.clone(),
                             });
-                            eprintln!("sync: peer {} is now online", peer_id);
+                            tenet::tlog!(
+                                "sync: peer {} is now online",
+                                tenet::logging::peer_id(&peer_id)
+                            );
                         }
                     }
                     MetaMessage::Ack {
@@ -2825,15 +2860,18 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         encryption_public_key,
                         message,
                     } => {
-                        eprintln!("sync: received friend_request from {}", from_peer_id);
+                        tenet::tlog!(
+                            "sync: received friend_request from {}",
+                            tenet::logging::peer_id(&from_peer_id)
+                        );
                         let st = state.lock().await;
 
                         // If already friends, treat as duplicate and skip
                         if let Ok(Some(peer)) = st.storage.get_peer(&from_peer_id) {
                             if peer.is_friend {
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: friend request from {} is a duplicate (already friends), ignoring",
-                                    from_peer_id
+                                    tenet::logging::peer_id(&from_peer_id)
                                 );
                                 continue;
                             }
@@ -2850,9 +2888,9 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                 // Race condition: both peers sent friend requests to each other.
                                 // Auto-accept: mark our outgoing request as accepted, add them as a friend,
                                 // and archive the incoming request as a duplicate.
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: mutual friend request detected with {} — auto-accepting",
-                                    from_peer_id
+                                    tenet::logging::peer_id(&from_peer_id)
                                 );
                                 let _ = st
                                     .storage
@@ -2893,14 +2931,15 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                             &keypair.signing_private_key_hex,
                                         ) {
                                             if let Err(e) = post_to_relay(&relay_url, &env) {
-                                                eprintln!(
+                                                tenet::tlog!(
                                                     "sync: failed to send auto-accept to {}: {}",
-                                                    from_peer_id, e
+                                                    tenet::logging::peer_id(&from_peer_id),
+                                                    e
                                                 );
                                             } else {
-                                                eprintln!(
+                                                tenet::tlog!(
                                                     "sync: sent auto-accept to {} via relay",
-                                                    from_peer_id
+                                                    tenet::logging::peer_id(&from_peer_id)
                                                 );
                                             }
                                         }
@@ -2924,9 +2963,10 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         if let Some(ref ex) = existing {
                             // If blocked or ignored, silently drop
                             if ex.status == "blocked" || ex.status == "ignored" {
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: friend request from {} is {}, not resurfacing",
-                                    from_peer_id, ex.status
+                                    tenet::logging::peer_id(&from_peer_id),
+                                    ex.status
                                 );
                                 continue;
                             }
@@ -2938,14 +2978,16 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                     &signing_public_key,
                                     &encryption_public_key,
                                 ) {
-                                    eprintln!(
+                                    tenet::tlog!(
                                         "sync: failed to refresh friend request from {}: {}",
-                                        from_peer_id, e
+                                        tenet::logging::peer_id(&from_peer_id),
+                                        e
                                     );
                                 } else {
-                                    eprintln!(
+                                    tenet::tlog!(
                                         "sync: refreshed existing friend request from {} (id={})",
-                                        from_peer_id, ex.id
+                                        tenet::logging::peer_id(&from_peer_id),
+                                        ex.id
                                     );
                                     let _ = st.ws_tx.send(WsEvent::FriendRequestReceived {
                                         request_id: ex.id,
@@ -2957,9 +2999,9 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                             }
                             // If accepted, they are already friends — skip
                             if ex.status == "accepted" {
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: friend request from {} already accepted, skipping",
-                                    from_peer_id
+                                    tenet::logging::peer_id(&from_peer_id)
                                 );
                                 continue;
                             }
@@ -2985,15 +3027,17 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                     from_peer_id: from_peer_id.clone(),
                                     message: message.clone(),
                                 });
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: stored incoming friend request from {} (id={})",
-                                    from_peer_id, request_id
+                                    tenet::logging::peer_id(&from_peer_id),
+                                    request_id
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: failed to store friend request from {}: {}",
-                                    from_peer_id, e
+                                    tenet::logging::peer_id(&from_peer_id),
+                                    e
                                 );
                             }
                         }
@@ -3003,15 +3047,18 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                         signing_public_key,
                         encryption_public_key,
                     } => {
-                        eprintln!("sync: received friend_accept from {}", from_peer_id);
+                        tenet::tlog!(
+                            "sync: received friend_accept from {}",
+                            tenet::logging::peer_id(&from_peer_id)
+                        );
                         let st = state.lock().await;
 
                         // If already friends, treat as duplicate
                         if let Ok(Some(peer)) = st.storage.get_peer(&from_peer_id) {
                             if peer.is_friend {
-                                eprintln!(
+                                tenet::tlog!(
                                     "sync: friend_accept from {} is a duplicate (already friends), ignoring",
-                                    from_peer_id
+                                    tenet::logging::peer_id(&from_peer_id)
                                 );
                                 continue;
                             }
@@ -3043,9 +3090,9 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                 st.storage.find_request_between(&from_peer_id, &keypair.id)
                             {
                                 if incoming.status == "pending" {
-                                    eprintln!(
+                                    tenet::tlog!(
                                         "sync: archiving duplicate incoming request from {} (id={})",
-                                        from_peer_id, incoming.id
+                                        tenet::logging::peer_id(&from_peer_id), incoming.id
                                     );
                                     let _ = st
                                         .storage
@@ -3057,14 +3104,15 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                                 request_id: req_id,
                                 from_peer_id: from_peer_id.clone(),
                             });
-                            eprintln!(
+                            tenet::tlog!(
                                 "sync: friend request accepted by {} (id={})",
-                                from_peer_id, req_id
+                                tenet::logging::peer_id(&from_peer_id),
+                                req_id
                             );
                         } else {
-                            eprintln!(
+                            tenet::tlog!(
                                 "sync: received friend_accept from {} but no matching pending request",
-                                from_peer_id
+                                tenet::logging::peer_id(&from_peer_id)
                             );
                         }
                     }
@@ -3079,7 +3127,10 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
         let peer = match peer_map.get(sender_id) {
             Some(p) => p,
             None => {
-                eprintln!("sync: skipping message from unknown sender {}", sender_id);
+                tenet::tlog!(
+                    "sync: skipping message from unknown sender {}",
+                    tenet::logging::peer_id(sender_id)
+                );
                 continue;
             }
         };
@@ -3088,7 +3139,11 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
             .header
             .verify_signature(envelope.version, &peer.signing_public_key)
         {
-            eprintln!("sync: invalid signature from {}: {:?}", sender_id, e);
+            tenet::tlog!(
+                "sync: invalid signature from {}: {:?}",
+                tenet::logging::peer_id(sender_id),
+                e
+            );
             continue;
         }
 
@@ -3104,12 +3159,20 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                     Ok(plaintext) => match String::from_utf8(plaintext) {
                         Ok(s) => Some(s),
                         Err(e) => {
-                            eprintln!("sync: utf-8 decode error from {}: {}", sender_id, e);
+                            tenet::tlog!(
+                                "sync: utf-8 decode error from {}: {}",
+                                tenet::logging::peer_id(sender_id),
+                                e
+                            );
                             continue;
                         }
                     },
                     Err(e) => {
-                        eprintln!("sync: decrypt error from {}: {}", sender_id, e);
+                        tenet::tlog!(
+                            "sync: decrypt error from {}: {}",
+                            tenet::logging::peer_id(sender_id),
+                            e
+                        );
                         continue;
                     }
                 }
@@ -3168,31 +3231,35 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                     let st = state.lock().await;
                     match st.storage.upsert_profile_if_newer(&profile_row) {
                         Ok(true) => {
-                            eprintln!("sync: updated profile for {}", profile_user_id);
+                            tenet::tlog!(
+                                "sync: updated profile for {}",
+                                tenet::logging::peer_id(&profile_user_id)
+                            );
                             // Update peer display name if it changed
                             if let Some(ref display_name) = profile_row.display_name {
                                 if let Ok(Some(mut peer)) = st.storage.get_peer(&profile_user_id) {
                                     if peer.display_name.as_deref() != Some(display_name) {
                                         peer.display_name = Some(display_name.clone());
                                         let _ = st.storage.insert_peer(&peer);
-                                        eprintln!(
+                                        tenet::tlog!(
                                             "sync: updated display name for peer {}",
-                                            profile_user_id
+                                            tenet::logging::peer_id(&profile_user_id)
                                         );
                                     }
                                 }
                             }
                         }
                         Ok(false) => {
-                            eprintln!(
+                            tenet::tlog!(
                                 "sync: profile for {} is not newer, skipping",
-                                profile_user_id
+                                tenet::logging::peer_id(&profile_user_id)
                             );
                         }
                         Err(e) => {
-                            eprintln!(
+                            tenet::tlog!(
                                 "sync: failed to update profile for {}: {}",
-                                profile_user_id, e
+                                tenet::logging::peer_id(&profile_user_id),
+                                e
                             );
                         }
                     }
@@ -3220,11 +3287,11 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
                 .update_peer_online(sender_id, false, envelope.header.timestamp);
         }
 
-        eprintln!(
+        tenet::tlog!(
             "sync: received {} message from {} (id={})",
             kind_str,
-            sender_id,
-            &message_id[..message_id.len().min(12)]
+            tenet::logging::peer_id(sender_id),
+            tenet::logging::msg_id(&message_id)
         );
 
         let row = MessageRow {
@@ -3259,7 +3326,7 @@ async fn sync_once(state: &SharedState) -> Result<(), String> {
     }
 
     if stored_count > 0 {
-        eprintln!("sync: stored {} message(s)", stored_count);
+        tenet::tlog!("sync: stored {} message(s)", stored_count);
     }
 
     Ok(())
@@ -3310,11 +3377,15 @@ async fn announce_online(state: SharedState) -> Result<(), String> {
 
         // Post to relay
         if let Err(e) = post_to_relay(&relay_url, &envelope) {
-            eprintln!("failed to announce online to {}: {}", peer.peer_id, e);
+            tenet::tlog!(
+                "failed to announce online to {}: {}",
+                tenet::logging::peer_id(&peer.peer_id),
+                e
+            );
         }
     }
 
-    eprintln!("announced online status to {} peers", peers.len());
+    tenet::tlog!("announced online status to {} peers", peers.len());
     Ok(())
 }
 

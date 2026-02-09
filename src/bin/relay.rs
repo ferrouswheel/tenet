@@ -5,6 +5,7 @@ use tenet::relay::{app, RelayConfig, RelayState};
 
 #[tokio::main]
 async fn main() {
+    tenet::logging::init();
     let config = RelayConfig {
         ttl: Duration::from_secs(env_u64("TENET_RELAY_TTL_SECS", 86_400)),
         max_messages: env_usize("TENET_RELAY_MAX_MESSAGES", 1_000),
@@ -33,7 +34,7 @@ async fn main() {
         .unwrap_or_else(|error| panic!("failed to bind {bind}: {error}"));
 
     let local_addr = listener.local_addr().expect("failed to get local address");
-    eprintln!("tenet-relay listening on http://{}", local_addr);
+    tenet::tlog!("tenet-relay listening on http://{}", local_addr);
 
     axum::serve(listener, app)
         .await

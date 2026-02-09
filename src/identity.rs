@@ -179,7 +179,7 @@ pub fn migrate_legacy_layout(data_dir: &Path) -> Result<Option<PathBuf>, Identit
     let new_db = db_path(&identity_dir);
     if !new_db.exists() {
         fs::rename(&legacy_db, &new_db)?;
-        eprintln!("  migrated legacy database to identities/{}/", sid);
+        crate::tlog!("  migrated legacy database to identities/{}/", sid);
     }
 
     Ok(Some(identity_dir))
@@ -388,7 +388,7 @@ fn migrate_legacy_json_to_identities(data_dir: &Path) -> Result<(), IdentityErro
     // Run full JSON migration (handles peers, inbox, outbox too)
     let _ = storage.migrate_from_json(data_dir);
 
-    eprintln!("  migrated legacy JSON files to identities/{}/", sid);
+    crate::tlog!("  migrated legacy JSON files to identities/{}/", sid);
 
     Ok(())
 }

@@ -2,6 +2,7 @@ pub mod client;
 pub mod crypto;
 pub mod groups;
 pub mod identity;
+pub mod logging;
 pub mod protocol;
 pub mod relay;
 pub mod simulation;
