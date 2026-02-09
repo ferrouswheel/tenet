@@ -1344,10 +1344,11 @@ impl Storage {
         Ok(row)
     }
 
-    /// Update a profile only if the incoming update is newer.
+    /// Update a profile only if the incoming update is newer (or same timestamp,
+    /// which allows a richer friends-only profile to overwrite a public-only one).
     pub fn upsert_profile_if_newer(&self, row: &ProfileRow) -> Result<bool, StorageError> {
         if let Some(existing) = self.get_profile(&row.user_id)? {
-            if existing.updated_at >= row.updated_at {
+            if existing.updated_at > row.updated_at {
                 return Ok(false);
             }
         }
@@ -2512,5 +2513,20 @@ mod tests {
         assert!(storage.upsert_profile_if_newer(&newer).unwrap());
         let loaded = storage.get_profile("user-1").unwrap().unwrap();
         assert_eq!(loaded.display_name, Some("Newest Alice".to_string()));
+
+        // upsert_if_newer: same-timestamp update should succeed (allows richer
+        // friends-only profile to overwrite a public-only profile)
+        let same_ts_richer = ProfileRow {
+            user_id: "user-1".to_string(),
+            display_name: Some("Newest Alice".to_string()),
+            bio: None,
+            avatar_hash: None,
+            public_fields: "{}".to_string(),
+            friends_fields: r#"{"email":"alice@secret.com"}"#.to_string(),
+            updated_at: now + 100,
+        };
+        assert!(storage.upsert_profile_if_newer(&same_ts_richer).unwrap());
+        let loaded = storage.get_profile("user-1").unwrap().unwrap();
+        assert_eq!(loaded.friends_fields, r#"{"email":"alice@secret.com"}"#);
     }
 }

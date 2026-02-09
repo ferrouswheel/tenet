@@ -795,22 +795,21 @@ fn log_message(config: &RelayConfig, message: String) {
     if let Some(log_sink) = &config.log_sink {
         log_sink(message);
     } else {
-        println!("{message}");
+        let ts = crate::logging::format_timestamp();
+        if crate::logging::colour_enabled() {
+            println!("\x1b[2m{ts}\x1b[0m {message}");
+        } else {
+            println!("{ts} - {message}");
+        }
     }
 }
 
-const LOG_ID_TRUNCATE_LEN: usize = 7;
-
 fn format_peer_id(peer_id: &str) -> String {
-    format!("p-{}", truncate_id(peer_id))
+    crate::logging::peer_id(peer_id)
 }
 
 fn format_message_id(message_id: &str) -> String {
-    format!("m-{}", truncate_id(message_id))
-}
-
-fn truncate_id(id: &str) -> String {
-    id.chars().take(LOG_ID_TRUNCATE_LEN).collect()
+    crate::logging::msg_id(message_id)
 }
 
 fn count_recent_peers(inner: &RelayStateInner, now: Instant, window: Duration) -> usize {
