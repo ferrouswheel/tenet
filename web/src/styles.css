@@ -30,6 +30,26 @@ body {
     max-width: 200px; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* Header nav icons */
+.header-nav {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+.header-nav-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #666;
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    transition: background 0.2s, color 0.2s;
+    display: flex;
+    align-items: center;
+}
+.header-nav-btn:hover { background: #2a2d37; color: #ccc; }
+.header-nav-btn.active { color: #fff; }
+
 /* Relay status banner */
 .relay-banner {
     background: #3a2a10;
@@ -47,6 +67,20 @@ body {
     border-bottom-color: #2a5a2a;
     color: #4caf50;
 }
+.relay-retry-btn {
+    margin-left: auto;
+    background: none;
+    border: 1px solid currentColor;
+    color: inherit;
+    border-radius: 4px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    opacity: 0.8;
+}
+.relay-retry-btn:hover { opacity: 1; }
+.relay-retry-btn:disabled { cursor: default; opacity: 0.5; }
+.relay-banner.connected .relay-retry-btn { display: none; }
 
 /* Layout */
 .container {
