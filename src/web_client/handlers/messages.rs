@@ -140,6 +140,7 @@ pub async fn send_direct_handler(
         DEFAULT_TTL_SECONDS,
         MessageKind::Direct,
         None,
+        None,
         payload,
         &signing_key,
     ) {
@@ -196,6 +197,7 @@ pub async fn send_direct_handler(
             message_kind: "direct".to_string(),
             body: Some(req.body.clone()),
             timestamp: now,
+            reply_to: None,
         });
     }
 
@@ -257,6 +259,7 @@ pub async fn send_public_handler(
         DEFAULT_TTL_SECONDS,
         MessageKind::Public,
         None,
+        None,
         &req.body,
         salt,
         &signing_key,
@@ -314,6 +317,7 @@ pub async fn send_public_handler(
             message_kind: "public".to_string(),
             body: Some(req.body.clone()),
             timestamp: now,
+            reply_to: None,
         });
     }
 
@@ -392,6 +396,7 @@ pub async fn send_group_handler(
         DEFAULT_TTL_SECONDS,
         MessageKind::FriendGroup,
         Some(req.group_id.clone()),
+        None,
         payload,
         &signing_key,
     ) {
@@ -448,6 +453,7 @@ pub async fn send_group_handler(
             message_kind: "friend_group".to_string(),
             body: Some(req.body.clone()),
             timestamp: now,
+            reply_to: None,
         });
     }
 

@@ -88,6 +88,8 @@ pub struct Header {
     pub ttl_seconds: u64,
     pub payload_size: u64,
     pub signature: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -104,6 +106,7 @@ struct CanonicalHeader<'a> {
     group_id: Option<&'a str>,
     ttl_seconds: u64,
     payload_size: u64,
+    reply_to: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +167,7 @@ impl Header {
             group_id: self.group_id.as_deref(),
             ttl_seconds: self.ttl_seconds,
             payload_size: self.payload_size,
+            reply_to: self.reply_to.as_deref(),
         };
         serde_json::to_vec(&canonical)
     }
@@ -385,6 +389,7 @@ pub fn build_envelope_from_payload(
     ttl_seconds: u64,
     message_kind: MessageKind,
     group_id: Option<String>,
+    reply_to: Option<String>,
     payload: Payload,
     signing_private_key_hex: &str,
 ) -> Result<Envelope, EnvelopeBuildError> {
@@ -401,6 +406,7 @@ pub fn build_envelope_from_payload(
         ttl_seconds,
         payload_size: payload.body.len() as u64,
         signature: None,
+        reply_to,
     };
     header.validate_message_kind()?;
     let signature = header.compute_signature(ProtocolVersion::V1, signing_private_key_hex)?;
@@ -422,6 +428,7 @@ pub fn build_plaintext_envelope(
     ttl_seconds: u64,
     message_kind: MessageKind,
     group_id: Option<String>,
+    reply_to: Option<String>,
     body: impl Into<String>,
     salt: impl AsRef<[u8]>,
     signing_private_key_hex: &str,
@@ -436,6 +443,7 @@ pub fn build_plaintext_envelope(
         ttl_seconds,
         message_kind,
         group_id,
+        reply_to,
         payload,
         signing_private_key_hex,
     )

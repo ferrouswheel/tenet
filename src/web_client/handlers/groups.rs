@@ -196,6 +196,7 @@ pub async fn create_group_handler(
             DEFAULT_TTL_SECONDS,
             MessageKind::Direct,
             None,
+            None,
             payload,
             &signing_key,
         ) {
@@ -348,6 +349,7 @@ pub async fn add_group_member_handler(
         now,
         DEFAULT_TTL_SECONDS,
         MessageKind::Direct,
+        None,
         None,
         payload,
         &signing_key,

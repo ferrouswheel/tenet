@@ -29,6 +29,7 @@ fn envelope_roundtrips_via_json() {
         group_id: None,
         ttl_seconds: 3_600,
         payload_size: payload.body.len() as u64,
+        reply_to: None,
         signature: None,
     };
     header.signature = Some(
@@ -64,6 +65,7 @@ fn header_signature_fails_with_invalid_signature() {
         group_id: None,
         ttl_seconds: 120,
         payload_size: 42,
+        reply_to: None,
         signature: Some("bad-signature".to_string()),
     };
 
@@ -104,7 +106,8 @@ fn header_roundtrips_and_validates_message_kinds() {
             group_id: group_id.map(str::to_string),
             ttl_seconds: 3_600,
             payload_size: 128,
-            signature: None,
+            reply_to: None,
+        signature: None,
         };
         header.signature = Some(
             header
@@ -137,6 +140,7 @@ fn header_rejects_invalid_message_kind_combinations() {
         group_id: None,
         ttl_seconds: 120,
         payload_size: 42,
+        reply_to: None,
         signature: None,
     };
     header.signature = Some(
@@ -179,6 +183,7 @@ fn header_signature_changes_with_message_kind() {
         group_id: None,
         ttl_seconds: 300,
         payload_size: 64,
+        reply_to: None,
         signature: None,
     };
     header.signature = Some(

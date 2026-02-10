@@ -325,7 +325,7 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
             ttl_seconds: DEFAULT_TTL_SECONDS,
             is_read: false,
             raw_envelope: None,
-            reply_to: None,
+            reply_to: envelope.header.reply_to.clone(),
         };
         if st.storage.insert_message(&row).is_ok() {
             let _ = st.ws_tx.send(WsEvent::NewMessage {
@@ -334,6 +334,7 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
                 message_kind: kind_str.to_string(),
                 body: row.body.clone(),
                 timestamp: envelope.header.timestamp,
+                reply_to: row.reply_to.clone(),
             });
             stored_count += 1;
         }
@@ -429,6 +430,7 @@ async fn process_incoming_friend_request(
                         now,
                         DEFAULT_TTL_SECONDS,
                         MessageKind::Meta,
+                        None,
                         None,
                         payload,
                         &keypair.signing_private_key_hex,
@@ -735,6 +737,7 @@ pub async fn announce_online(state: SharedState) -> Result<(), String> {
             now,
             DEFAULT_TTL_SECONDS,
             MessageKind::Meta,
+            None,
             None,
             payload.clone(),
             &keypair.signing_private_key_hex,
