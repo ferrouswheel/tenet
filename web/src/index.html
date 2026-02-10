@@ -15,12 +15,12 @@
             <span class="status-dot" id="status-dot"></span>
         </div>
         <div style="display:flex;align-items:center;gap:1rem;">
+            <div class="peer-id" id="peer-id" title=""></div>
             <!-- Notification bell (Phase 11) -->
             <div class="notification-bell" id="notification-bell" onclick="toggleNotificationPanel()">
                 <span class="bell-icon">&#128276;</span>
                 <span class="notification-badge" id="notification-badge" style="display:none;">0</span>
             </div>
-            <div class="peer-id" id="peer-id" title=""></div>
         </div>
     </div>
 
@@ -131,9 +131,11 @@
                 </div>
                 <!-- Peer info header -->
                 <div class="dm-peer-info" id="dm-peer-info"></div>
-                <div id="conversation-messages"></div>
-                <div id="conversation-load-more" class="load-more" style="display:none;">
-                    <button onclick="loadMoreConversationMessages()">Load older messages</button>
+                <div class="dm-messages-area" id="dm-messages-area">
+                    <div id="conversation-load-more" class="load-more" style="display:none;">
+                        <button onclick="loadMoreConversationMessages()">Load older messages</button>
+                    </div>
+                    <div id="conversation-messages"></div>
                 </div>
             </div>
 

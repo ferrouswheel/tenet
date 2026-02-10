@@ -247,6 +247,9 @@ pub struct NotificationRow {
     pub message_id: String,
     pub sender_id: String,
     pub created_at: u64,
+    /// Whether the user has opened the notification panel and seen this item.
+    pub seen: bool,
+    /// Whether the user has clicked through and acted on this notification.
     pub read: bool,
 }
 
@@ -257,23 +260,38 @@ pub struct NotificationRow {
 /// Main storage handle wrapping a SQLite connection.
 pub struct Storage {
     conn: Connection,
+    /// Directory on disk where attachment files are stored.
+    pub attachment_dir: PathBuf,
 }
 
 impl Storage {
     /// Open or create a database at the given path. Creates schema if needed.
+    /// Attachments are stored as files in an `attachments/` subdirectory
+    /// alongside the database file.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let storage = Self { conn };
+        let attachment_dir = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("attachments");
+        std::fs::create_dir_all(&attachment_dir)?;
+        let storage = Self { conn, attachment_dir };
         storage.create_schema()?;
         Ok(storage)
     }
 
-    /// Create an in-memory database (useful for testing).
-    pub fn open_in_memory() -> Result<Self, StorageError> {
+    /// Create an in-memory database with an explicit attachment directory.
+    /// The caller is responsible for providing an appropriate path; this
+    /// function never chooses a location autonomously.
+    pub fn open_in_memory(attachment_dir: &Path) -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        let storage = Self { conn };
+        std::fs::create_dir_all(attachment_dir)?;
+        let storage = Self {
+            conn,
+            attachment_dir: attachment_dir.to_path_buf(),
+        };
         storage.create_schema()?;
         Ok(storage)
     }
@@ -357,7 +375,6 @@ impl Storage {
                 content_hash    TEXT PRIMARY KEY,
                 content_type    TEXT NOT NULL,
                 size_bytes      INTEGER NOT NULL,
-                data            BLOB NOT NULL,
                 created_at      INTEGER NOT NULL
             );
 
@@ -416,6 +433,7 @@ impl Storage {
                 message_id      TEXT NOT NULL,
                 sender_id       TEXT NOT NULL,
                 created_at      INTEGER NOT NULL,
+                seen            INTEGER NOT NULL DEFAULT 0,
                 read            INTEGER NOT NULL DEFAULT 0
             );
 
@@ -440,7 +458,79 @@ impl Storage {
             "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to);",
         )?;
 
+        // Migration: add seen column to notifications if not present (existing DBs won't have it)
+        let has_seen_col: bool = self
+            .conn
+            .prepare("SELECT seen FROM notifications LIMIT 0")
+            .is_ok();
+        if !has_seen_col {
+            self.conn.execute_batch(
+                "ALTER TABLE notifications ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_notifications_unseen ON notifications(seen, created_at);",
+        )?;
+
+        // Migration: move any existing attachment blobs from DB to filesystem,
+        // then drop the legacy `data` column. Runs only if the column still exists.
+        let has_data_col = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('attachments') WHERE name='data'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if has_data_col {
+            let mut stmt = self.conn.prepare(
+                "SELECT content_hash, content_type, data FROM attachments
+                 WHERE data IS NOT NULL AND length(data) > 0",
+            )?;
+            let rows: Vec<(String, String, Vec<u8>)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            for (hash, ct, data) in rows {
+                let path = self.attachment_path(&hash, &ct);
+                if !path.exists() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&path, &data);
+                }
+            }
+            let _ = self
+                .conn
+                .execute_batch("ALTER TABLE attachments DROP COLUMN data;");
+        }
+
         Ok(())
+    }
+
+    /// Derive the filesystem path for an attachment file.
+    ///
+    /// Uses a two-level directory prefix (`hash[0..2] / hash[2..4]`) to avoid
+    /// large flat directories, and appends an extension derived from the
+    /// content type.
+    fn attachment_path(&self, content_hash: &str, content_type: &str) -> PathBuf {
+        let ext = content_type_to_ext(content_type);
+        let (d1, d2) = if content_hash.len() >= 4 {
+            (&content_hash[..2], &content_hash[2..4])
+        } else {
+            (&content_hash[..content_hash.len().min(2)], "xx")
+        };
+        self.attachment_dir
+            .join(d1)
+            .join(d2)
+            .join(format!("{content_hash}.{ext}"))
     }
 
     // -----------------------------------------------------------------------
@@ -1082,44 +1172,68 @@ impl Storage {
     // Attachments CRUD (Phase 7)
     // -----------------------------------------------------------------------
 
-    /// Insert an attachment. Uses INSERT OR IGNORE for content-addressed dedup.
+    /// Insert an attachment. Writes data to the filesystem and stores
+    /// metadata in the database. Content-addressed, so duplicate inserts
+    /// are silently ignored.
     pub fn insert_attachment(&self, row: &AttachmentRow) -> Result<(), StorageError> {
+        let path = self.attachment_path(&row.content_hash, &row.content_type);
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &row.data)?;
+        }
         self.conn.execute(
             "INSERT OR IGNORE INTO attachments
-             (content_hash, content_type, size_bytes, data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (content_hash, content_type, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 row.content_hash,
                 row.content_type,
                 row.size_bytes as i64,
-                row.data,
                 row.created_at as i64,
             ],
         )?;
         Ok(())
     }
 
-    /// Retrieve an attachment by its content hash.
+    /// Retrieve an attachment by its content hash. Returns `None` if not
+    /// found in the database or if the file is missing from disk.
     pub fn get_attachment(
         &self,
         content_hash: &str,
     ) -> Result<Option<AttachmentRow>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT content_hash, content_type, size_bytes, data, created_at
+            "SELECT content_hash, content_type, size_bytes, created_at
              FROM attachments WHERE content_hash = ?1",
         )?;
-        let row = stmt
+        let meta = stmt
             .query_row(params![content_hash], |row| {
-                Ok(AttachmentRow {
-                    content_hash: row.get(0)?,
-                    content_type: row.get(1)?,
-                    size_bytes: row.get::<_, i64>(2)? as u64,
-                    data: row.get(3)?,
-                    created_at: row.get::<_, i64>(4)? as u64,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
             })
             .optional()?;
-        Ok(row)
+        match meta {
+            None => Ok(None),
+            Some((content_hash, content_type, size_bytes, created_at)) => {
+                let path = self.attachment_path(&content_hash, &content_type);
+                match std::fs::read(&path) {
+                    Ok(data) => Ok(Some(AttachmentRow {
+                        content_hash,
+                        content_type,
+                        size_bytes,
+                        data,
+                        created_at,
+                    })),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(StorageError::Io(e)),
+                }
+            }
+        }
     }
 
     /// Link an attachment to a message.
@@ -1589,13 +1703,14 @@ impl Storage {
     /// Insert a new notification. Returns the new notification ID.
     pub fn insert_notification(&self, row: &NotificationRow) -> Result<i64, StorageError> {
         self.conn.execute(
-            "INSERT INTO notifications (type, message_id, sender_id, created_at, read)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO notifications (type, message_id, sender_id, created_at, seen, read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 row.notification_type,
                 row.message_id,
                 row.sender_id,
                 row.created_at as i64,
+                row.seen as i32,
                 row.read as i32,
             ],
         )?;
@@ -1605,7 +1720,7 @@ impl Storage {
     /// Get a notification by ID.
     pub fn get_notification(&self, id: i64) -> Result<Option<NotificationRow>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, type, message_id, sender_id, created_at, read
+            "SELECT id, type, message_id, sender_id, created_at, seen, read
              FROM notifications WHERE id = ?1",
         )?;
         let row = stmt
@@ -1616,7 +1731,8 @@ impl Storage {
                     message_id: row.get(2)?,
                     sender_id: row.get(3)?,
                     created_at: row.get::<_, i64>(4)? as u64,
-                    read: row.get::<_, i32>(5)? != 0,
+                    seen: row.get::<_, i32>(5)? != 0,
+                    read: row.get::<_, i32>(6)? != 0,
                 })
             })
             .optional()?;
@@ -1630,11 +1746,11 @@ impl Storage {
         limit: u32,
     ) -> Result<Vec<NotificationRow>, StorageError> {
         let sql = if unread_only {
-            "SELECT id, type, message_id, sender_id, created_at, read
+            "SELECT id, type, message_id, sender_id, created_at, seen, read
              FROM notifications WHERE read = 0
              ORDER BY created_at DESC LIMIT ?"
         } else {
-            "SELECT id, type, message_id, sender_id, created_at, read
+            "SELECT id, type, message_id, sender_id, created_at, seen, read
              FROM notifications
              ORDER BY created_at DESC LIMIT ?"
         };
@@ -1647,7 +1763,8 @@ impl Storage {
                 message_id: row.get(2)?,
                 sender_id: row.get(3)?,
                 created_at: row.get::<_, i64>(4)? as u64,
-                read: row.get::<_, i32>(5)? != 0,
+                seen: row.get::<_, i32>(5)? != 0,
+                read: row.get::<_, i32>(6)? != 0,
             })
         })?;
 
@@ -1684,6 +1801,25 @@ impl Storage {
             |row| row.get(0),
         )?;
         Ok(count as u32)
+    }
+
+    /// Count unseen notifications (not yet viewed in the notification panel).
+    pub fn count_unseen_notifications(&self) -> Result<u32, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notifications WHERE seen = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Mark all notifications as seen (user opened the notification panel).
+    pub fn mark_all_notifications_seen(&self) -> Result<u32, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE notifications SET seen = 1 WHERE seen = 0",
+            [],
+        )?;
+        Ok(affected as u32)
     }
 
     /// Check if a notification already exists (to avoid duplicates).
@@ -1917,6 +2053,32 @@ fn dirs_or_default() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Map a MIME content type to a lowercase file extension.
+/// Used to construct attachment filenames on disk.
+fn content_type_to_ext(content_type: &str) -> &str {
+    let base = content_type.split(';').next().unwrap_or(content_type).trim();
+    match base {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/html" => "html",
+        "text/css" => "css",
+        "application/json" => "json",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" => "wav",
+        _ => "bin",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1932,9 +2094,22 @@ mod tests {
             .as_secs()
     }
 
+    /// Create an in-memory storage with a per-invocation temp directory for
+    /// attachment files. Each call gets a unique directory so parallel tests
+    /// don't collide.
+    fn test_storage() -> Storage {
+        let pid = std::process::id();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tenet-test-{pid}-{ts}"));
+        Storage::open_in_memory(&dir).unwrap()
+    }
+
     #[test]
     fn test_schema_creation() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         // Schema should already be created — verify by inserting data
         let row = RelayRow {
             url: "http://localhost:8080".to_string(),
@@ -1947,7 +2122,7 @@ mod tests {
 
     #[test]
     fn test_identity_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
 
         // No identity initially
         assert!(storage.get_identity().unwrap().is_none());
@@ -1970,7 +2145,7 @@ mod tests {
 
     #[test]
     fn test_peer_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let peer = PeerRow {
@@ -2008,7 +2183,7 @@ mod tests {
 
     #[test]
     fn test_message_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let msg = MessageRow {
@@ -2058,7 +2233,7 @@ mod tests {
 
     #[test]
     fn test_message_list_filters() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         // Insert messages at different timestamps
@@ -2109,7 +2284,7 @@ mod tests {
 
     #[test]
     fn test_group_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let group = GroupRow {
@@ -2156,7 +2331,7 @@ mod tests {
 
     #[test]
     fn test_outbox_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let entry = OutboxRow {
@@ -2179,7 +2354,7 @@ mod tests {
 
     #[test]
     fn test_relay_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let relay = RelayRow {
@@ -2240,7 +2415,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_message_ignored() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let msg = MessageRow {
@@ -2314,7 +2489,7 @@ mod tests {
         drop(inbox);
 
         // Run migration
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let report = storage.migrate_from_json(&dir).unwrap();
 
         assert!(report.identity_migrated);
@@ -2343,7 +2518,7 @@ mod tests {
 
     #[test]
     fn test_attachment_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         let attachment = AttachmentRow {
@@ -2376,7 +2551,7 @@ mod tests {
 
     #[test]
     fn test_message_attachments() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         // Create a message first
@@ -2448,7 +2623,7 @@ mod tests {
 
     #[test]
     fn test_reactions_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         // Create a target message
@@ -2526,7 +2701,7 @@ mod tests {
 
     #[test]
     fn test_replies() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         // Create parent post
@@ -2595,7 +2770,7 @@ mod tests {
 
     #[test]
     fn test_profiles_crud() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = test_storage();
         let now = now_secs();
 
         // No profile initially

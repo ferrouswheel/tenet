@@ -458,33 +458,102 @@ body {
     line-height: 1.4;
 }
 
+/* DM messages scrollable area */
+.dm-messages-area {
+    background: #0f1117;
+    border: 1px solid #2a2d37;
+    border-radius: 8px;
+    padding: 0.5rem;
+    min-height: 200px;
+    max-height: 60vh;
+    overflow-y: auto;
+    margin-bottom: 0;
+}
+
+/* DM bubble messages */
+.dm-message {
+    display: flex;
+    margin-bottom: 0.15rem;
+    max-width: 100%;
+}
+.dm-message.sent {
+    justify-content: flex-end;
+}
+.dm-message.received {
+    justify-content: flex-start;
+}
+.dm-bubble {
+    max-width: 70%;
+    padding: 0.3rem 0.55rem;
+    border-radius: 14px;
+}
+.dm-message.sent .dm-bubble {
+    background: #2a3a6a;
+    border: 1px solid #5566cc;
+    color: #e0e0e0;
+    border-bottom-right-radius: 3px;
+}
+.dm-message.received .dm-bubble {
+    background: #1a1d27;
+    border: 1px solid #2a2d37;
+    color: #e0e0e0;
+    border-bottom-left-radius: 3px;
+}
+.dm-message.unread.received .dm-bubble {
+    border-left: 3px solid #5566cc;
+}
+.dm-bubble .msg-body {
+    font-size: 0.875rem;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.dm-bubble-sender {
+    font-size: 0.65rem;
+    color: #aaa;
+    margin-bottom: 0.1rem;
+}
+.dm-bubble-meta {
+    font-size: 0.65rem;
+    color: #666;
+    margin-top: 0.1rem;
+    text-align: right;
+}
+.dm-message.received .dm-bubble-meta {
+    text-align: left;
+}
+
 /* DM compose box */
 .dm-compose {
     background: #1a1d27;
     border: 1px solid #2a2d37;
     border-radius: 8px;
-    padding: 1rem;
+    padding: 0.5rem 0.75rem;
     margin-top: 1rem;
+    position: sticky;
+    bottom: 0;
+    z-index: 10;
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-end;
 }
 .dm-compose textarea {
-    width: 100%;
+    flex: 1;
     background: #0f1117;
     border: 1px solid #2a2d37;
     color: #e0e0e0;
     border-radius: 6px;
-    padding: 0.5rem;
+    padding: 0.4rem 0.5rem;
     font-family: inherit;
     font-size: 0.85rem;
-    resize: vertical;
-    min-height: 50px;
+    resize: none;
+    min-height: 36px;
+    max-height: 120px;
+    overflow-y: auto;
 }
 .dm-compose textarea:focus { outline: none; border-color: #5566cc; }
 .dm-compose-actions {
-    display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
+    flex-shrink: 0;
 }
 .dm-compose-actions button {
     background: #5566cc;

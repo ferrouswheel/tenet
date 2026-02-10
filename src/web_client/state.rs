@@ -51,6 +51,12 @@ pub enum WsEvent {
         sender_id: String,
         created_at: u64,
     },
+    ProfileUpdated {
+        peer_id: String,
+        display_name: Option<String>,
+        bio: Option<String>,
+        avatar_hash: Option<String>,
+    },
 }
 
 pub struct AppState {

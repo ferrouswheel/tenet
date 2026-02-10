@@ -34,6 +34,7 @@ pub async fn list_notifications_handler(
                         "message_id": n.message_id,
                         "sender_id": n.sender_id,
                         "created_at": n.created_at,
+                        "seen": n.seen,
                         "read": n.read,
                     })
                 })
@@ -44,14 +45,14 @@ pub async fn list_notifications_handler(
     }
 }
 
-/// GET /api/notifications/count - Get unread notification count.
+/// GET /api/notifications/count - Get unseen notification count.
 pub async fn count_notifications_handler(State(state): State<SharedState>) -> Response {
     let st = state.lock().await;
 
-    match st.storage.count_unread_notifications() {
+    match st.storage.count_unseen_notifications() {
         Ok(count) => {
             let json = serde_json::json!({
-                "unread": count,
+                "unseen": count,
             });
             (StatusCode::OK, axum::Json(json)).into_response()
         }
@@ -75,6 +76,22 @@ pub async fn mark_read_handler(
             (StatusCode::OK, axum::Json(json)).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "notification not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// POST /api/notifications/seen-all - Mark all notifications as seen.
+pub async fn mark_all_seen_handler(State(state): State<SharedState>) -> Response {
+    let st = state.lock().await;
+
+    match st.storage.mark_all_notifications_seen() {
+        Ok(count) => {
+            let json = serde_json::json!({
+                "status": "ok",
+                "marked_seen": count,
+            });
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

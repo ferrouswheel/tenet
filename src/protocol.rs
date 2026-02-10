@@ -272,6 +272,13 @@ pub struct AttachmentRef {
     pub content_id: ContentId,
     pub content_type: String,
     pub size: u64,
+    /// Original filename, if provided by the sender.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filename: Option<String>,
+    /// Binary attachment data, base64 URL-safe no-pad encoded.
+    /// Populated by the sender so the recipient can store it locally.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data: Option<String>,
 }
 
 /// Encrypted user data with optional attachment references.

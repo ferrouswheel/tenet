@@ -21,7 +21,7 @@ let viewingProfileId = null;
 let previousView = 'timeline';
 let relayConnected = null; // null = unknown, true/false = status
 let notifications = []; // Phase 11
-let unreadNotificationCount = 0; // Phase 11
+let unseenNotificationCount = 0; // Phase 11 - resets to 0 when bell is clicked
 let notificationPanelOpen = false; // Phase 11
 const PAGE_SIZE = 50;
 const COMMENTS_PAGE_SIZE = 100;
@@ -147,6 +147,21 @@ function timeAgo(ts) {
     return new Date(ts * 1000).toLocaleDateString();
 }
 
+function exactTime(ts) {
+    return new Date(ts * 1000).toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+}
+
+function msgTimeTitle(m) {
+    const sent = exactTime(m.timestamp);
+    const recv = exactTime(m.received_at);
+    return m.received_at && m.received_at !== m.timestamp
+        ? `Sent: ${sent}\nReceived: ${recv}`
+        : `Sent: ${sent}`;
+}
+
 // ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
@@ -173,7 +188,7 @@ function renderMessage(m) {
         <div class="msg-header">
             <span class="msg-badge ${kindClass}">${kindClass}</span>
             <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${senderLabel}</span>
-            <span class="msg-time">${timeAgo(m.timestamp)}</span>
+            <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
         </div>
         <div class="msg-body">${escapeHtml(m.body || '')}</div>
         ${attachmentsHtml}
@@ -241,7 +256,7 @@ function updateMessageReactions(messageId, upvotes, downvotes, myReaction) {
         convMsg.my_reaction = myReaction;
     }
     // Re-render the specific message reactions in place
-    const el = document.querySelector(`.message[data-id="${messageId}"] .msg-reactions`);
+    const el = document.querySelector(`.message[data-id="${messageId}"] .msg-reactions, .dm-message[data-id="${messageId}"] .msg-reactions`);
     if (el) {
         el.outerHTML = renderReactions({ message_id: messageId, upvotes, downvotes, my_reaction: myReaction });
     }
@@ -547,46 +562,62 @@ async function loadConversationMessages(peerId, append) {
         if (conversationMessages.length > 0) {
             conversationOldestTimestamp = conversationMessages[conversationMessages.length - 1].timestamp;
         }
-        renderConversationMessages();
+        renderConversationMessages(append);
     } catch (e) {
         showToast('Failed to load conversation');
         console.error(e);
     }
 }
 
-function renderConversationMessages() {
+function renderConversationMessages(wasAppend) {
     const el = document.getElementById('conversation-messages');
     const loadMoreEl = document.getElementById('conversation-load-more');
+    const messagesArea = document.getElementById('dm-messages-area');
+
+    // Capture scroll state before re-rendering (for append / load-older case)
+    const prevScrollHeight = messagesArea ? messagesArea.scrollHeight : 0;
+    const prevScrollTop = messagesArea ? messagesArea.scrollTop : 0;
 
     if (conversationMessages.length === 0) {
         el.innerHTML = '<div class="empty"><div class="icon">&#128172;</div><div>No messages yet. Send the first message!</div></div>';
         loadMoreEl.style.display = 'none';
     } else {
-        el.innerHTML = conversationMessages.map(renderDmMessage).join('');
+        // Render in chronological order (oldest first, newest at bottom)
+        el.innerHTML = conversationMessages.slice().reverse().map(renderDmMessage).join('');
         loadMoreEl.style.display = conversationMessages.length >= PAGE_SIZE ? '' : 'none';
     }
 
     // Always render the DM compose below messages
     renderDmCompose();
+
+    // Scroll to bottom on fresh load; preserve position when loading older messages
+    requestAnimationFrame(() => {
+        if (messagesArea) {
+            if (wasAppend) {
+                messagesArea.scrollTop = prevScrollTop + messagesArea.scrollHeight - prevScrollHeight;
+            } else {
+                messagesArea.scrollTop = messagesArea.scrollHeight;
+            }
+        }
+    });
 }
 
 function renderDmMessage(m) {
     const isSelf = m.sender_id === myPeerId;
     const peer = peers.find(p => p.peer_id === m.sender_id);
     const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : m.sender_id.substring(0, 12) + '...';
-    const senderClass = isSelf ? 'msg-sender self' : 'msg-sender';
+    const bubbleClass = isSelf ? 'sent' : 'received';
     const unreadClass = m.is_read ? '' : ' unread';
     const attachmentsHtml = renderAttachments(m.attachments);
-    const reactionsHtml = renderReactions(m);
+    const senderHtml = !isSelf ? `<div class="dm-bubble-sender">${escapeHtml(senderLabel)}</div>` : '';
 
-    return `<div class="message${unreadClass}" data-id="${m.message_id}" onclick="markRead('${m.message_id}')">
-        <div class="msg-header">
-            <span class="${senderClass}" title="${m.sender_id}">${senderLabel}</span>
-            <span class="msg-time">${timeAgo(m.timestamp)}</span>
+    return `<div class="dm-message ${bubbleClass}${unreadClass}" data-id="${m.message_id}" onclick="markRead('${m.message_id}')">
+        <div class="dm-bubble">
+            ${senderHtml}
+            <div class="msg-body">${escapeHtml(m.body || '')}</div>
+            ${attachmentsHtml}
+            <div class="dm-bubble-meta" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</div>
         </div>
-        <div class="msg-body">${escapeHtml(m.body || '')}</div>
-        ${attachmentsHtml}
-        ${reactionsHtml}
     </div>`;
 }
 
@@ -600,18 +631,17 @@ function renderDmCompose() {
     composeDiv.className = 'dm-compose';
     composeDiv.id = 'dm-compose-box';
     composeDiv.innerHTML = `
-        <textarea id="dm-compose-body" placeholder="Write a message..."></textarea>
+        <textarea id="dm-compose-body" placeholder="Write a message... (Enter to send, Shift+Enter for newline)"></textarea>
         <div class="dm-compose-actions">
             <button id="dm-compose-send" onclick="sendDmMessage()">Send</button>
         </div>
     `;
-    // Insert before the load-more button
-    const loadMore = document.getElementById('conversation-load-more');
-    container.insertBefore(composeDiv, loadMore);
+    // Append after messages (load-more is now at the top of the conversation)
+    container.appendChild(composeDiv);
 
-    // Ctrl+Enter to send in DM
+    // Enter to send; Shift+Enter for newline
     document.getElementById('dm-compose-body').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendDmMessage();
         }
@@ -794,7 +824,7 @@ document.getElementById('compose-body').addEventListener('keydown', (e) => {
 // Mark as read
 // ---------------------------------------------------------------------------
 async function markRead(messageId) {
-    const el = document.querySelector(`.message[data-id="${messageId}"]`);
+    const el = document.querySelector(`.message[data-id="${messageId}"], .dm-message[data-id="${messageId}"]`);
     if (el && el.classList.contains('unread')) {
         el.classList.remove('unread');
         try {
@@ -1103,7 +1133,7 @@ function handleWsEvent(event) {
             }
         }
     } else if (event.type === 'message_read') {
-        const el = document.querySelector(`.message[data-id="${event.message_id}"]`);
+        const el = document.querySelector(`.message[data-id="${event.message_id}"], .dm-message[data-id="${event.message_id}"]`);
         if (el) el.classList.remove('unread');
     } else if (event.type === 'peer_online') {
         // Update peer online status
@@ -1145,22 +1175,37 @@ function handleWsEvent(event) {
         } else if (!event.connected && relayConnected !== false) {
             showToast('Relay disconnected');
         }
+    } else if (event.type === 'profile_updated') {
+        const peer = peers.find(p => p.peer_id === event.peer_id);
+        if (peer) {
+            if (event.display_name !== undefined) peer.display_name = event.display_name;
+            renderFriendsList();
+            if (currentView === 'conversation-detail' && currentConversationPeerId === event.peer_id) {
+                renderDmPeerInfo(event.peer_id);
+            }
+        }
     } else if (event.type === 'notification') {
         // New notification received (Phase 11)
-        unreadNotificationCount++;
-        updateNotificationBadge();
-        // Add to local notifications if panel is open
-        if (notificationPanelOpen) {
-            const newNotif = {
-                id: event.id,
-                type: event.notification_type,
-                message_id: event.message_id,
-                sender_id: event.sender_id,
-                created_at: event.created_at,
-                read: false,
-            };
-            notifications.unshift(newNotif);
-            renderNotificationList();
+        // Skip if the user is already viewing the relevant DM conversation
+        const activelyViewingDm = event.notification_type === 'direct_message'
+            && currentView === 'conversation-detail'
+            && currentConversationPeerId === event.sender_id;
+        if (!activelyViewingDm) {
+            if (!notificationPanelOpen) {
+                unseenNotificationCount++;
+                updateNotificationBadge();
+            } else {
+                const newNotif = {
+                    id: event.id,
+                    type: event.notification_type,
+                    message_id: event.message_id,
+                    sender_id: event.sender_id,
+                    created_at: event.created_at,
+                    read: false,
+                };
+                notifications.unshift(newNotif);
+                renderNotificationList();
+            }
         }
     }
 }
@@ -1215,7 +1260,7 @@ function renderReplyItem(m) {
     return `<div class="reply-item" data-id="${m.message_id}">
         <div class="msg-header">
             <span class="${senderClass}" title="${m.sender_id}" onclick="showPeerProfile('${m.sender_id}')">${senderLabel}</span>
-            <span class="msg-time">${timeAgo(m.timestamp)}</span>
+            <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
         </div>
         <div class="msg-body">${escapeHtml(m.body || '')}</div>
         ${attachmentsHtml}
@@ -1456,7 +1501,7 @@ async function loadNotifications() {
 async function loadNotificationCount() {
     try {
         const data = await apiGet('/api/notifications/count');
-        unreadNotificationCount = data.unread || 0;
+        unseenNotificationCount = data.unseen || 0;
         updateNotificationBadge();
     } catch (e) {
         console.error('Failed to load notification count:', e);
@@ -1465,8 +1510,8 @@ async function loadNotificationCount() {
 
 function updateNotificationBadge() {
     const badge = document.getElementById('notification-badge');
-    if (unreadNotificationCount > 0) {
-        badge.textContent = unreadNotificationCount > 99 ? '99+' : unreadNotificationCount;
+    if (unseenNotificationCount > 0) {
+        badge.textContent = unseenNotificationCount > 99 ? '99+' : unseenNotificationCount;
         badge.style.display = '';
     } else {
         badge.style.display = 'none';
@@ -1478,7 +1523,10 @@ function toggleNotificationPanel() {
     const panel = document.getElementById('notification-panel');
     if (notificationPanelOpen) {
         panel.classList.add('visible');
+        unseenNotificationCount = 0;
+        updateNotificationBadge();
         loadNotifications();
+        apiPost('/api/notifications/seen-all', {}).catch(() => {});
     } else {
         panel.classList.remove('visible');
     }
@@ -1523,7 +1571,7 @@ function renderNotificationItem(n) {
             <span class="notification-type-icon">${getNotificationIcon(n.type)}</span>
             <div class="notification-text">
                 <div class="notification-message">${escapeHtml(message)}</div>
-                <div class="notification-time">${timeAgo(n.created_at)}</div>
+                <div class="notification-time" title="${exactTime(n.created_at)}">${timeAgo(n.created_at)}</div>
             </div>
         </div>
     </div>`;
@@ -1556,7 +1604,6 @@ async function handleNotificationClick(id, type, messageId, senderId) {
         const notif = notifications.find(n => n.id === id);
         if (notif) notif.read = true;
         renderNotificationList();
-        loadNotificationCount();
     } catch (e) {
         console.error('Failed to mark notification read:', e);
     }
@@ -1584,7 +1631,7 @@ async function markAllNotificationsRead() {
         await apiPost('/api/notifications/read-all', {});
         notifications.forEach(n => n.read = true);
         renderNotificationList();
-        unreadNotificationCount = 0;
+        unseenNotificationCount = 0;
         updateNotificationBadge();
         showToast('All notifications marked as read');
     } catch (e) {

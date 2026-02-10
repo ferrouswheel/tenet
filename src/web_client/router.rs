@@ -144,6 +144,10 @@ pub fn build_router(state: SharedState) -> Router {
             get(handlers::notifications::count_notifications_handler),
         )
         .route(
+            "/api/notifications/seen-all",
+            post(handlers::notifications::mark_all_seen_handler),
+        )
+        .route(
             "/api/notifications/read-all",
             post(handlers::notifications::mark_all_read_handler),
         )

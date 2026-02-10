@@ -14,6 +14,8 @@ fn envelope_roundtrips_via_json() {
             content_id: ContentId::from_bytes(b"attachment-1"),
             content_type: "image/png".to_string(),
             size: 128,
+            filename: None,
+            data: None,
         }],
     };
 

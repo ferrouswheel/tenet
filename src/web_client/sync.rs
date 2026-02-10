@@ -8,8 +8,10 @@ use crate::protocol::{
     build_envelope_from_payload, build_meta_payload, decode_meta_payload,
     decrypt_encrypted_payload, MessageKind, MetaMessage,
 };
+use base64::Engine as _;
+
 use crate::relay_transport::{fetch_inbox, post_envelope};
-use crate::storage::{FriendRequestRow, MessageRow, NotificationRow, PeerRow, ProfileRow};
+use crate::storage::{AttachmentRow, FriendRequestRow, MessageAttachmentRow, MessageRow, NotificationRow, PeerRow, ProfileRow};
 use crate::web_client::config::{
     DEFAULT_TTL_SECONDS, SYNC_INTERVAL_SECS, WEB_HPKE_INFO, WEB_PAYLOAD_AAD,
 };
@@ -214,6 +216,7 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
                                         message_id: envelope.header.message_id.0.clone(),
                                         sender_id: envelope.header.sender_id.clone(),
                                         created_at: now,
+                                        seen: false,
                                         read: false,
                                     };
                                     if let Ok(notif_id) = st.storage.insert_notification(&notif) {
@@ -351,6 +354,30 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
             reply_to: envelope.header.reply_to.clone(),
         };
         if st.storage.insert_message(&row).is_ok() {
+            // Store any inline attachment data so it can be served locally
+            for (i, att_ref) in envelope.payload.attachments.iter().enumerate() {
+                if let Some(ref data_b64) = att_ref.data {
+                    if let Ok(data) =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64)
+                    {
+                        let att_row = AttachmentRow {
+                            content_hash: att_ref.content_id.0.clone(),
+                            content_type: att_ref.content_type.clone(),
+                            size_bytes: att_ref.size,
+                            data,
+                            created_at: now,
+                        };
+                        let _ = st.storage.insert_attachment(&att_row);
+                        let _ = st.storage.insert_message_attachment(&MessageAttachmentRow {
+                            message_id: message_id.clone(),
+                            content_hash: att_ref.content_id.0.clone(),
+                            filename: att_ref.filename.clone(),
+                            position: i as u32,
+                        });
+                    }
+                }
+            }
+
             let _ = st.ws_tx.send(WsEvent::NewMessage {
                 message_id: message_id.clone(),
                 sender_id: sender_id.clone(),
@@ -390,6 +417,7 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
                     message_id: message_id.clone(),
                     sender_id: sender_id.clone(),
                     created_at: now,
+                    seen: false,
                     read: false,
                 };
                 if let Ok(notif_id) = st.storage.insert_notification(&notif) {
@@ -605,6 +633,7 @@ async fn process_incoming_friend_request(
                 message_id: format!("friend_request_{}", request_id),
                 sender_id: from_peer_id.to_string(),
                 created_at: now,
+                seen: false,
                 read: false,
             };
             if let Ok(notif_id) = st.storage.insert_notification(&notif) {
@@ -771,6 +800,12 @@ async fn process_profile_update(
                     }
                 }
             }
+            let _ = st.ws_tx.send(crate::web_client::state::WsEvent::ProfileUpdated {
+                peer_id: profile_user_id.clone(),
+                display_name: profile_row.display_name.clone(),
+                bio: profile_row.bio.clone(),
+                avatar_hash: profile_row.avatar_hash.clone(),
+            });
         }
         Ok(false) => {
             crate::tlog!(

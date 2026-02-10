@@ -6,8 +6,11 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::crypto::{generate_content_key, NONCE_SIZE};
+use base64::Engine as _;
+
 use crate::protocol::{
-    build_encrypted_payload, build_envelope_from_payload, build_plaintext_envelope, MessageKind,
+    build_encrypted_payload, build_envelope_from_payload, build_group_message_payload,
+    build_plaintext_payload, AttachmentRef, ContentId, MessageKind,
 };
 use crate::relay_transport::post_envelope;
 use crate::storage::MessageRow;
@@ -85,7 +88,7 @@ pub async fn send_direct_handler(
     let now = now_secs();
 
     // Short lock: extract data needed for envelope construction
-    let (keypair_id, signing_key, recipient_enc_key, relay_url) = {
+    let (keypair_id, signing_key, recipient_enc_key, relay_url, attachment_refs) = {
         let st = state.lock().await;
 
         let peer = match st.storage.get_peer(&req.recipient_id) {
@@ -104,11 +107,13 @@ pub async fn send_direct_handler(
             }
         };
 
+        let attachment_refs = build_attachment_refs(&st.storage, &req.attachments);
         (
             st.keypair.id.clone(),
             st.keypair.signing_private_key_hex.clone(),
             enc_key,
             st.relay_url.clone(),
+            attachment_refs,
         )
     };
     // Lock released
@@ -118,7 +123,7 @@ pub async fn send_direct_handler(
     let mut nonce = [0u8; NONCE_SIZE];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
 
-    let payload = match build_encrypted_payload(
+    let mut payload = match build_encrypted_payload(
         req.body.as_bytes(),
         &recipient_enc_key,
         WEB_PAYLOAD_AAD,
@@ -130,6 +135,7 @@ pub async fn send_direct_handler(
         Ok(p) => p,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
     };
+    payload.attachments = attachment_refs;
 
     let envelope = match build_envelope_from_payload(
         keypair_id.clone(),
@@ -235,13 +241,15 @@ pub async fn send_public_handler(
 
     let now = now_secs();
 
-    // Short lock: extract identity data
-    let (keypair_id, signing_key, relay_url) = {
+    // Short lock: extract identity data and attachment blobs
+    let (keypair_id, signing_key, relay_url, attachment_refs) = {
         let st = state.lock().await;
+        let attachment_refs = build_attachment_refs(&st.storage, &req.attachments);
         (
             st.keypair.id.clone(),
             st.keypair.signing_private_key_hex.clone(),
             st.relay_url.clone(),
+            attachment_refs,
         )
     };
     // Lock released
@@ -250,9 +258,12 @@ pub async fn send_public_handler(
     let mut salt = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
-    let envelope = match build_plaintext_envelope(
-        &keypair_id,
-        "*",
+    let mut payload = build_plaintext_payload(&req.body, salt);
+    payload.attachments = attachment_refs;
+
+    let envelope = match build_envelope_from_payload(
+        keypair_id.clone(),
+        "*".to_string(),
         None,
         None,
         now,
@@ -260,8 +271,7 @@ pub async fn send_public_handler(
         MessageKind::Public,
         None,
         None,
-        &req.body,
-        salt,
+        payload,
         &signing_key,
     ) {
         Ok(e) => e,
@@ -356,7 +366,7 @@ pub async fn send_group_handler(
     let now = now_secs();
 
     // Short lock: extract group key and identity
-    let (keypair_id, signing_key, group_key, relay_url) = {
+    let (keypair_id, signing_key, group_key, relay_url, attachment_refs) = {
         let st = state.lock().await;
 
         let group = match st.storage.get_group(&req.group_id) {
@@ -370,22 +380,25 @@ pub async fn send_group_handler(
             Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
         };
 
+        let attachment_refs = build_attachment_refs(&st.storage, &req.attachments);
         (
             st.keypair.id.clone(),
             st.keypair.signing_private_key_hex.clone(),
             gk,
             st.relay_url.clone(),
+            attachment_refs,
         )
     };
     // Lock released
 
     // Build envelope (CPU-only, no lock needed)
     let aad = req.group_id.as_bytes();
-    let payload =
-        match crate::protocol::build_group_message_payload(req.body.as_bytes(), &group_key, aad) {
+    let mut payload =
+        match build_group_message_payload(req.body.as_bytes(), &group_key, aad) {
             Ok(p) => p,
             Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
         };
+    payload.attachments = attachment_refs;
 
     let envelope = match build_envelope_from_payload(
         keypair_id.clone(),
@@ -493,4 +506,26 @@ pub async fn mark_read_handler(
         Ok(false) => api_error(StatusCode::NOT_FOUND, "message not found"),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// Fetch attachment blobs from storage and build `AttachmentRef`s with inline data.
+fn build_attachment_refs(
+    storage: &crate::storage::Storage,
+    attachments: &[SendAttachmentRef],
+) -> Vec<AttachmentRef> {
+    attachments
+        .iter()
+        .filter_map(|att| {
+            let row = storage.get_attachment(&att.content_hash).ok()??;
+            let data_b64 =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&row.data);
+            Some(AttachmentRef {
+                content_id: ContentId(row.content_hash),
+                content_type: row.content_type,
+                size: row.size_bytes,
+                filename: att.filename.clone(),
+                data: Some(data_b64),
+            })
+        })
+        .collect()
 }
