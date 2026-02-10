@@ -1,11 +1,52 @@
-Simulation scenarios
-====================
+Simulation
+==========
 
-Simulation scenarios are TOML files consumed by `tenet-sim`. Each scenario has a `[simulation]`
-section that describes the network behavior and a `[relay]` section that configures the in-process
-relay used during the run. You can find ready-made scenarios in `scenarios/`.
+Tenet's simulator (`tenet-sim`) models a peer-to-peer network using an **event-based execution
+model**: all activity — message sends, online/offline transitions, inbox polls, and store-and-forward
+operations — is represented as discrete events scheduled at continuous simulated timestamps and
+processed in chronological order.
 
-## Top-level layout
+Each simulation run consumes a TOML scenario file that describes the network topology, node
+behaviour, and relay configuration. Ready-made scenarios are in `scenarios/`.
+
+## Running the simulator
+
+```bash
+# Non-interactive (fast-forward, prints a JSON report at the end)
+cargo run --bin tenet-sim -- scenarios/basic.toml
+
+# Interactive TUI
+cargo run --bin tenet-sim -- --tui scenarios/basic.toml
+```
+
+## Execution model
+
+### Event-based loop
+
+Simulation time is a continuous `f64` (seconds since the start of the run). At initialisation the
+scenario builder populates a priority queue with scheduled events. The main loop dequeues the
+earliest event, advances the simulation clock to that event's time, processes it, and records it to
+an append-only event log. Processing one event may schedule further events (e.g. a
+`MessageDeliver` event is created when a `MessageSend` is processed).
+
+Event types:
+
+| Event | What it does |
+|-------|-------------|
+| `MessageSend` | Builds an envelope for the sender, posts it to the relay (or attempts direct delivery), then schedules a `MessageDeliver` event at `send_time + latency`. |
+| `MessageDeliver` | Adds the envelope to the recipient's inbox and records the end-to-end latency. |
+| `OnlineTransition` | Flips a client's online state. When going online, schedules an `InboxPoll` and an `OnlineAnnounce`. |
+| `InboxPoll` | Fetches the relay inbox for an online client and processes any waiting messages. |
+| `OnlineAnnounce` | Broadcasts the client's online status to peers and triggers store-and-forward delivery. |
+
+### Time control
+
+In fast-forward mode (the default) the clock jumps directly to each event's timestamp — no real
+time is consumed. In real-time mode the loop sleeps between events to maintain a configured
+`speed_factor` (simulated seconds per wall-clock second). The TUI exposes `+`/`-` keys to adjust
+the speed factor at runtime.
+
+## Scenario format
 
 ```toml
 [simulation]
@@ -23,8 +64,8 @@ the relay.
 ## Store-and-forward example
 
 To exercise peer-assisted store-and-forward, use a small encrypted scenario with three nodes.
-When node B is offline, node A will wrap the message for storage at node C and C will forward it
-once B comes online.
+When node B is offline, node A wraps the message for storage at node C and C forwards it once B
+comes online.
 
 ```toml
 [simulation]
@@ -97,8 +138,11 @@ The full scenario is available as `scenarios/store_and_forward_3.toml`.
 - `availability` (optional): legacy online/offline behavior when no cohorts are defined.
 - `cohorts` (optional): cohort definitions for online behavior (see below).
 - `message_size_distribution`: message size generator (see below).
+- `message_type_weights` (optional): relative weights for direct, public, and group messages (see below).
 - `clustering` (optional): cluster layout for dense subgraphs with sparse cross-links.
 - `encryption` (optional): message payload handling (`plaintext` or `encrypted`).
+- `groups` (optional): group creation and membership configuration (see below).
+- `reaction_config` (optional): probability and delay for reply reactions (see below).
 
 ### `friends_per_node`
 
@@ -220,6 +264,18 @@ min = 40
 max = 400
 ```
 
+### `message_type_weights` (optional)
+
+Controls the relative proportion of direct, public, and group messages. Values are normalised at
+runtime so only relative magnitudes matter. Defaults to direct-only.
+
+```toml
+[simulation.message_type_weights]
+direct = 3.0
+public = 1.0
+group = 1.0
+```
+
 ### `encryption` (optional)
 
 ```toml
@@ -244,6 +300,47 @@ Clusters are assigned in order from `node_ids`. The `cluster_sizes` list is cons
 with any remaining nodes appended as a final cluster. `friends_per_node` is sampled within each
 cluster. `inter_cluster_friend_probability` controls the chance of creating a cross-cluster
 connection for each node pair from different clusters.
+
+### `groups` (optional)
+
+Configures automatic group creation and membership assignment across nodes.
+
+```toml
+[simulation.groups]
+count = 3
+
+[simulation.groups.size_distribution]
+type = "fraction_of_nodes"
+min_fraction = 0.2
+max_fraction = 0.5
+
+[simulation.groups.memberships_per_node]
+type = "fixed"
+count = 1
+```
+
+`size_distribution` variants: `uniform` (with `min`/`max` absolute member counts) or
+`fraction_of_nodes` (with `min_fraction`/`max_fraction` relative to total node count).
+
+`memberships_per_node` variants: `fixed` (with `count`) or `uniform` (with `min`/`max`).
+
+### `reaction_config` (optional)
+
+When set, receiving a message may trigger an automatic reply after a configurable delay.
+
+```toml
+[simulation.reaction_config]
+reply_probability = 0.3
+
+[simulation.reaction_config.reply_delay_distribution]
+type = "uniform"
+min = 30.0
+max = 300.0
+```
+
+`reply_delay_distribution` uses the same variants as latency distributions: `fixed` (with
+`seconds`), `uniform` (with `min`/`max`), `normal` (with `mean`/`std_dev`), and `log_normal`
+(with `mean`/`std_dev`).
 
 ## `[relay]` fields
 
@@ -306,16 +403,17 @@ scenarios primarily emit direct messages and store-and-forward traffic, so `publ
 messages are emitted for online broadcasts, acknowledgements, and missed-message requests; if the
 `meta` kind remains at zero it indicates a simulation bug rather than an optional feature.
 
-## Manual TUI test
+## TUI controls
 
-### TUI key bindings
-
-When running `tenet-sim --tui`, use these keys to adjust the simulation while it runs:
+When running `tenet-sim --tui`, use these keys to control the simulation:
 
 - `a`: add a peer (type an id, or press Enter for an auto-generated id).
 - `f`: add a friendship (enter two peer ids separated by space or comma).
 - `+` / `=`: speed up simulated time.
 - `-`: slow down simulated time.
+- `q`: quit once the simulation has finished.
+
+### Manual TUI test
 
 1. Run a simulation with the TUI enabled: `cargo run --bin tenet-sim -- --tui scenarios/basic.toml`.
 2. Wait for the simulation to complete and confirm the status panel displays the completion prompt.
