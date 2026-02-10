@@ -131,7 +131,7 @@ pub async fn update_own_profile_handler(
     let mut salt = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
-    if let Ok(envelope) = build_plaintext_envelope(
+    let public_profile_delivered = if let Ok(envelope) = build_plaintext_envelope(
         &keypair_id,
         "*",
         None,
@@ -146,11 +146,19 @@ pub async fn update_own_profile_handler(
         &signing_key,
     ) {
         if let Some(ref relay_url) = relay_url {
-            if let Err(e) = post_envelope(relay_url, &envelope) {
-                crate::tlog!("failed to post public profile to relay: {}", e);
+            match post_envelope(relay_url, &envelope) {
+                Ok(()) => true,
+                Err(e) => {
+                    crate::tlog!("failed to post public profile to relay: {}", e);
+                    false
+                }
             }
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
 
     // Send friends-only profile to each friend (crypto + I/O, no lock held)
     let friends_profile = serde_json::json!({
@@ -164,6 +172,7 @@ pub async fn update_own_profile_handler(
         "updated_at": now,
     });
     let friends_body = serde_json::to_string(&friends_profile).unwrap_or_default();
+    let mut friends_delivered = 0usize;
 
     for (peer_id, enc_key) in &friend_enc_keys {
         let content_key = generate_content_key();
@@ -203,7 +212,15 @@ pub async fn update_own_profile_handler(
                 }
             }
         }
+        friends_delivered += 1;
     }
+
+    crate::tlog!(
+        "send: profile update (public_relay={}, friends={}/{})",
+        public_profile_delivered,
+        friends_delivered,
+        friend_enc_keys.len()
+    );
 
     let json = serde_json::json!({
         "user_id": keypair_id,

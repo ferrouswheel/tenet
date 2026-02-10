@@ -6,6 +6,7 @@ pub mod friends;
 pub mod groups;
 pub mod health;
 pub mod messages;
+pub mod notifications;
 pub mod peers;
 pub mod profiles;
 pub mod reactions;

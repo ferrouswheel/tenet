@@ -78,13 +78,27 @@ pub async fn react_handler(
     };
 
     // Post to relay (blocking I/O, no lock held)
-    if let Some(ref relay_url) = relay_url {
-        if let Err(e) = post_envelope(relay_url, &envelope) {
-            crate::tlog!("failed to post reaction to relay: {}", e);
+    let relay_delivered = if let Some(ref relay_url) = relay_url {
+        match post_envelope(relay_url, &envelope) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::tlog!("failed to post reaction to relay: {}", e);
+                false
+            }
         }
-    }
+    } else {
+        false
+    };
 
     let reaction_msg_id = envelope.header.message_id.0.clone();
+
+    crate::tlog!(
+        "send: {} reaction to {} (id={}, relay={})",
+        req.reaction,
+        crate::logging::msg_id(&message_id),
+        crate::logging::msg_id(&reaction_msg_id),
+        relay_delivered
+    );
 
     // Short lock: persist reaction and count
     let st = state.lock().await;

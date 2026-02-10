@@ -1177,6 +1177,115 @@ body {
     line-height: 1.4;
 }
 
+/* Notifications (Phase 11) */
+.notification-bell {
+    position: relative;
+    cursor: pointer;
+    padding: 0.25rem;
+    border-radius: 4px;
+    transition: background 0.2s;
+}
+.notification-bell:hover { background: #2a2d37; }
+.bell-icon {
+    font-size: 1.2rem;
+}
+.notification-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: #f44336;
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 0.1rem 0.3rem;
+    border-radius: 8px;
+    min-width: 16px;
+    text-align: center;
+}
+.notification-panel {
+    position: fixed;
+    top: 50px;
+    right: 1rem;
+    width: 320px;
+    max-height: 400px;
+    background: #1a1d27;
+    border: 1px solid #2a2d37;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    z-index: 150;
+    display: none;
+    overflow: hidden;
+}
+.notification-panel.visible { display: block; }
+.notification-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #2a2d37;
+    background: #1a1d27;
+}
+.notification-panel-header span {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #e0e0e0;
+}
+.notification-panel-header button {
+    background: none;
+    border: none;
+    color: #5566cc;
+    font-size: 0.75rem;
+    cursor: pointer;
+}
+.notification-panel-header button:hover { text-decoration: underline; }
+.notification-list {
+    max-height: 340px;
+    overflow-y: auto;
+}
+.notification-empty {
+    text-align: center;
+    color: #666;
+    font-size: 0.85rem;
+    padding: 2rem 1rem;
+}
+.notification-item {
+    display: flex;
+    align-items: flex-start;
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid #2a2d37;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.notification-item:hover { background: #0f1117; }
+.notification-item.unread { background: #1a2a3a; }
+.notification-item.unread:hover { background: #1a3040; }
+.notification-content {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    flex: 1;
+}
+.notification-type-icon {
+    font-size: 1rem;
+    flex-shrink: 0;
+    width: 24px;
+    text-align: center;
+}
+.notification-text {
+    flex: 1;
+    min-width: 0;
+}
+.notification-message {
+    font-size: 0.8rem;
+    color: #e0e0e0;
+    line-height: 1.4;
+}
+.notification-time {
+    font-size: 0.7rem;
+    color: #666;
+    margin-top: 0.2rem;
+}
+
 /* Toast notification */
 .toast {
     position: fixed;

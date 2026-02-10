@@ -241,6 +241,15 @@ pub async fn create_group_handler(
         );
     }
 
+    let keys_sent = member_enc_keys.len() - key_distribution_failed.len();
+    crate::tlog!(
+        "send: created group {} with {} members (keys_distributed={}/{})",
+        req.group_id,
+        all_members.len(),
+        keys_sent,
+        member_enc_keys.len()
+    );
+
     (StatusCode::CREATED, axum::Json(json)).into_response()
 }
 
@@ -374,6 +383,13 @@ pub async fn add_group_member_handler(
     } else {
         false
     };
+
+    crate::tlog!(
+        "send: group key to {} for {} (relay={})",
+        crate::logging::peer_id(&req.peer_id),
+        group_id,
+        relay_delivered
+    );
 
     let json = serde_json::json!({
         "status": "added",

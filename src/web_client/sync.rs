@@ -9,7 +9,7 @@ use crate::protocol::{
     decrypt_encrypted_payload, MessageKind, MetaMessage,
 };
 use crate::relay_transport::{fetch_inbox, post_envelope};
-use crate::storage::{FriendRequestRow, MessageRow, PeerRow, ProfileRow};
+use crate::storage::{FriendRequestRow, MessageRow, NotificationRow, PeerRow, ProfileRow};
 use crate::web_client::config::{
     DEFAULT_TTL_SECONDS, SYNC_INTERVAL_SECS, WEB_HPKE_INFO, WEB_PAYLOAD_AAD,
 };
@@ -204,6 +204,29 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
                                 crate::logging::peer_id(&envelope.header.sender_id),
                                 crate::logging::msg_id(target_id)
                             );
+
+                            // Create notification if reaction is to our own message
+                            if let Ok(Some(target_msg)) = st.storage.get_message(target_id) {
+                                if target_msg.sender_id == keypair.id {
+                                    let notif = NotificationRow {
+                                        id: 0,
+                                        notification_type: "reaction".to_string(),
+                                        message_id: envelope.header.message_id.0.clone(),
+                                        sender_id: envelope.header.sender_id.clone(),
+                                        created_at: now,
+                                        read: false,
+                                    };
+                                    if let Ok(notif_id) = st.storage.insert_notification(&notif) {
+                                        let _ = st.ws_tx.send(WsEvent::Notification {
+                                            id: notif_id,
+                                            notification_type: "reaction".to_string(),
+                                            message_id: envelope.header.message_id.0.clone(),
+                                            sender_id: envelope.header.sender_id.clone(),
+                                            created_at: now,
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -337,6 +360,48 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
                 reply_to: row.reply_to.clone(),
             });
             stored_count += 1;
+
+            // Create notifications for direct messages and replies
+            let notification_type = if row.reply_to.is_some() {
+                // Check if this is a reply to our own message
+                if let Some(ref parent_id) = row.reply_to {
+                    if let Ok(Some(parent_msg)) = st.storage.get_message(parent_id) {
+                        if parent_msg.sender_id == keypair.id {
+                            Some("reply")
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if kind_str == "direct" {
+                Some("direct_message")
+            } else {
+                None
+            };
+
+            if let Some(notif_type) = notification_type {
+                let notif = NotificationRow {
+                    id: 0,
+                    notification_type: notif_type.to_string(),
+                    message_id: message_id.clone(),
+                    sender_id: sender_id.clone(),
+                    created_at: now,
+                    read: false,
+                };
+                if let Ok(notif_id) = st.storage.insert_notification(&notif) {
+                    let _ = st.ws_tx.send(WsEvent::Notification {
+                        id: notif_id,
+                        notification_type: notif_type.to_string(),
+                        message_id: message_id.clone(),
+                        sender_id: sender_id.clone(),
+                        created_at: now,
+                    });
+                }
+            }
         }
     }
 
@@ -532,6 +597,26 @@ async fn process_incoming_friend_request(
                 from_peer_id: from_peer_id.to_string(),
                 message: message.clone(),
             });
+
+            // Create notification for friend request
+            let notif = NotificationRow {
+                id: 0,
+                notification_type: "friend_request".to_string(),
+                message_id: format!("friend_request_{}", request_id),
+                sender_id: from_peer_id.to_string(),
+                created_at: now,
+                read: false,
+            };
+            if let Ok(notif_id) = st.storage.insert_notification(&notif) {
+                let _ = st.ws_tx.send(WsEvent::Notification {
+                    id: notif_id,
+                    notification_type: "friend_request".to_string(),
+                    message_id: format!("friend_request_{}", request_id),
+                    sender_id: from_peer_id.to_string(),
+                    created_at: now,
+                });
+            }
+
             crate::tlog!(
                 "sync: stored incoming friend request from {} (id={})",
                 crate::logging::peer_id(from_peer_id),

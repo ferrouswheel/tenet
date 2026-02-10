@@ -134,6 +134,23 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/conversations/:peer_id",
             get(handlers::conversations::get_conversation_handler),
         )
+        // Notifications API
+        .route(
+            "/api/notifications",
+            get(handlers::notifications::list_notifications_handler),
+        )
+        .route(
+            "/api/notifications/count",
+            get(handlers::notifications::count_notifications_handler),
+        )
+        .route(
+            "/api/notifications/read-all",
+            post(handlers::notifications::mark_all_read_handler),
+        )
+        .route(
+            "/api/notifications/:id/read",
+            post(handlers::notifications::mark_read_handler),
+        )
         // WebSocket
         .route("/api/ws", get(handlers::websocket::ws_handler))
         // Static fallback

@@ -14,7 +14,23 @@
             <h1>Tenet</h1>
             <span class="status-dot" id="status-dot"></span>
         </div>
-        <div class="peer-id" id="peer-id" title=""></div>
+        <div style="display:flex;align-items:center;gap:1rem;">
+            <!-- Notification bell (Phase 11) -->
+            <div class="notification-bell" id="notification-bell" onclick="toggleNotificationPanel()">
+                <span class="bell-icon">&#128276;</span>
+                <span class="notification-badge" id="notification-badge" style="display:none;">0</span>
+            </div>
+            <div class="peer-id" id="peer-id" title=""></div>
+        </div>
+    </div>
+
+    <!-- Notification panel (Phase 11) -->
+    <div class="notification-panel" id="notification-panel">
+        <div class="notification-panel-header">
+            <span>Notifications</span>
+            <button onclick="markAllNotificationsRead()">Mark all read</button>
+        </div>
+        <div class="notification-list" id="notification-list"></div>
     </div>
 
     <!-- Relay status banner -->

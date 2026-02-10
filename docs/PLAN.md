@@ -556,7 +556,7 @@ GET    /api/peers/:peer_id/profile       -- view peer's profile
 
 ---
 
-## Phase 11 — Notifications
+## Phase 11 — Notifications [DONE]
 
 **Goal**: In-app notification system for unread messages and replies.
 

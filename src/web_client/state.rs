@@ -44,6 +44,13 @@ pub enum WsEvent {
         request_id: i64,
         from_peer_id: String,
     },
+    Notification {
+        id: i64,
+        notification_type: String,
+        message_id: String,
+        sender_id: String,
+        created_at: u64,
+    },
 }
 
 pub struct AppState {

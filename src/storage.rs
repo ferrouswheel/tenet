@@ -238,6 +238,18 @@ pub struct FriendRequestRow {
     pub updated_at: u64,
 }
 
+/// Notification row stored in the database (Phase 11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRow {
+    pub id: i64,
+    /// "direct_message", "reply", "reaction", "friend_request"
+    pub notification_type: String,
+    pub message_id: String,
+    pub sender_id: String,
+    pub created_at: u64,
+    pub read: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Storage handle
 // ---------------------------------------------------------------------------
@@ -396,6 +408,19 @@ impl Storage {
                 friends_fields  TEXT NOT NULL DEFAULT '{}',
                 updated_at      INTEGER NOT NULL
             );
+
+            -- Notifications (Phase 11)
+            CREATE TABLE IF NOT EXISTS notifications (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                type            TEXT NOT NULL,
+                message_id      TEXT NOT NULL,
+                sender_id       TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                read            INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_notifications_unread
+                ON notifications(read, created_at);
             ",
         )?;
 
@@ -1552,6 +1577,120 @@ impl Storage {
             "SELECT COUNT(*) FROM friend_requests
              WHERE from_peer_id = ?1 AND status = 'blocked'",
             params![peer_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifications CRUD (Phase 11)
+    // -----------------------------------------------------------------------
+
+    /// Insert a new notification. Returns the new notification ID.
+    pub fn insert_notification(&self, row: &NotificationRow) -> Result<i64, StorageError> {
+        self.conn.execute(
+            "INSERT INTO notifications (type, message_id, sender_id, created_at, read)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.notification_type,
+                row.message_id,
+                row.sender_id,
+                row.created_at as i64,
+                row.read as i32,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get a notification by ID.
+    pub fn get_notification(&self, id: i64) -> Result<Option<NotificationRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, type, message_id, sender_id, created_at, read
+             FROM notifications WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id], |row| {
+                Ok(NotificationRow {
+                    id: row.get(0)?,
+                    notification_type: row.get(1)?,
+                    message_id: row.get(2)?,
+                    sender_id: row.get(3)?,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                    read: row.get::<_, i32>(5)? != 0,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List notifications with optional filters.
+    pub fn list_notifications(
+        &self,
+        unread_only: bool,
+        limit: u32,
+    ) -> Result<Vec<NotificationRow>, StorageError> {
+        let sql = if unread_only {
+            "SELECT id, type, message_id, sender_id, created_at, read
+             FROM notifications WHERE read = 0
+             ORDER BY created_at DESC LIMIT ?"
+        } else {
+            "SELECT id, type, message_id, sender_id, created_at, read
+             FROM notifications
+             ORDER BY created_at DESC LIMIT ?"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(NotificationRow {
+                id: row.get(0)?,
+                notification_type: row.get(1)?,
+                message_id: row.get(2)?,
+                sender_id: row.get(3)?,
+                created_at: row.get::<_, i64>(4)? as u64,
+                read: row.get::<_, i32>(5)? != 0,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Mark a notification as read.
+    pub fn mark_notification_read(&self, id: i64) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE notifications SET read = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Mark all notifications as read.
+    pub fn mark_all_notifications_read(&self) -> Result<u32, StorageError> {
+        let affected = self.conn.execute(
+            "UPDATE notifications SET read = 1 WHERE read = 0",
+            [],
+        )?;
+        Ok(affected as u32)
+    }
+
+    /// Count unread notifications.
+    pub fn count_unread_notifications(&self) -> Result<u32, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notifications WHERE read = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Check if a notification already exists (to avoid duplicates).
+    pub fn has_notification(&self, notification_type: &str, message_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notifications WHERE type = ?1 AND message_id = ?2",
+            params![notification_type, message_id],
             |row| row.get(0),
         )?;
         Ok(count > 0)

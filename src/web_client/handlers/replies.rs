@@ -228,6 +228,13 @@ pub async fn reply_handler(
         });
     }
 
+    crate::tlog!(
+        "send: reply to {} (id={}, relay={})",
+        crate::logging::msg_id(&parent_message_id),
+        crate::logging::msg_id(&msg_id),
+        relay_delivered
+    );
+
     let json = serde_json::json!({
         "message_id": msg_id,
         "status": "sent",

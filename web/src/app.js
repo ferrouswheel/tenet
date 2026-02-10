@@ -20,6 +20,9 @@ let myProfile = null;
 let viewingProfileId = null;
 let previousView = 'timeline';
 let relayConnected = null; // null = unknown, true/false = status
+let notifications = []; // Phase 11
+let unreadNotificationCount = 0; // Phase 11
+let notificationPanelOpen = false; // Phase 11
 const PAGE_SIZE = 50;
 const COMMENTS_PAGE_SIZE = 100;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -1142,6 +1145,23 @@ function handleWsEvent(event) {
         } else if (!event.connected && relayConnected !== false) {
             showToast('Relay disconnected');
         }
+    } else if (event.type === 'notification') {
+        // New notification received (Phase 11)
+        unreadNotificationCount++;
+        updateNotificationBadge();
+        // Add to local notifications if panel is open
+        if (notificationPanelOpen) {
+            const newNotif = {
+                id: event.id,
+                type: event.notification_type,
+                message_id: event.message_id,
+                sender_id: event.sender_id,
+                created_at: event.created_at,
+                read: false,
+            };
+            notifications.unshift(newNotif);
+            renderNotificationList();
+        }
     }
 }
 
@@ -1422,6 +1442,167 @@ function backFromProfile() {
 }
 
 // ---------------------------------------------------------------------------
+// Notifications (Phase 11)
+// ---------------------------------------------------------------------------
+async function loadNotifications() {
+    try {
+        notifications = await apiGet('/api/notifications?limit=50');
+        renderNotificationList();
+    } catch (e) {
+        console.error('Failed to load notifications:', e);
+    }
+}
+
+async function loadNotificationCount() {
+    try {
+        const data = await apiGet('/api/notifications/count');
+        unreadNotificationCount = data.unread || 0;
+        updateNotificationBadge();
+    } catch (e) {
+        console.error('Failed to load notification count:', e);
+    }
+}
+
+function updateNotificationBadge() {
+    const badge = document.getElementById('notification-badge');
+    if (unreadNotificationCount > 0) {
+        badge.textContent = unreadNotificationCount > 99 ? '99+' : unreadNotificationCount;
+        badge.style.display = '';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+function toggleNotificationPanel() {
+    notificationPanelOpen = !notificationPanelOpen;
+    const panel = document.getElementById('notification-panel');
+    if (notificationPanelOpen) {
+        panel.classList.add('visible');
+        loadNotifications();
+    } else {
+        panel.classList.remove('visible');
+    }
+}
+
+function renderNotificationList() {
+    const el = document.getElementById('notification-list');
+    if (notifications.length === 0) {
+        el.innerHTML = '<div class="notification-empty">No notifications</div>';
+        return;
+    }
+    el.innerHTML = notifications.map(renderNotificationItem).join('');
+}
+
+function renderNotificationItem(n) {
+    const unreadClass = n.read ? '' : ' unread';
+    const typeLabel = getNotificationTypeLabel(n.type);
+    const senderShort = n.sender_id ? n.sender_id.substring(0, 12) + '...' : 'Someone';
+    const peer = peers.find(p => p.peer_id === n.sender_id);
+    const senderName = peer?.display_name || senderShort;
+
+    let message = '';
+    switch (n.type) {
+        case 'direct_message':
+            message = `${senderName} sent you a message`;
+            break;
+        case 'reply':
+            message = `${senderName} commented on your post`;
+            break;
+        case 'reaction':
+            message = `${senderName} reacted to your post`;
+            break;
+        case 'friend_request':
+            message = `${senderName} sent a friend request`;
+            break;
+        default:
+            message = `${senderName} - ${typeLabel}`;
+    }
+
+    return `<div class="notification-item${unreadClass}" data-id="${n.id}" onclick="handleNotificationClick(${n.id}, '${n.type}', '${n.message_id}', '${n.sender_id}')">
+        <div class="notification-content">
+            <span class="notification-type-icon">${getNotificationIcon(n.type)}</span>
+            <div class="notification-text">
+                <div class="notification-message">${escapeHtml(message)}</div>
+                <div class="notification-time">${timeAgo(n.created_at)}</div>
+            </div>
+        </div>
+    </div>`;
+}
+
+function getNotificationTypeLabel(type) {
+    switch (type) {
+        case 'direct_message': return 'Message';
+        case 'reply': return 'Comment';
+        case 'reaction': return 'Reaction';
+        case 'friend_request': return 'Friend Request';
+        default: return 'Notification';
+    }
+}
+
+function getNotificationIcon(type) {
+    switch (type) {
+        case 'direct_message': return '&#128172;'; // speech bubble
+        case 'reply': return '&#128172;'; // speech bubble
+        case 'reaction': return '&#9650;'; // upvote arrow
+        case 'friend_request': return '&#128100;'; // person
+        default: return '&#128276;'; // bell
+    }
+}
+
+async function handleNotificationClick(id, type, messageId, senderId) {
+    // Mark as read
+    try {
+        await apiPost(`/api/notifications/${id}/read`, {});
+        const notif = notifications.find(n => n.id === id);
+        if (notif) notif.read = true;
+        renderNotificationList();
+        loadNotificationCount();
+    } catch (e) {
+        console.error('Failed to mark notification read:', e);
+    }
+
+    // Navigate based on type
+    toggleNotificationPanel();
+    if (type === 'direct_message') {
+        navigateTo('peer/' + encodeURIComponent(senderId));
+    } else if (type === 'reply' || type === 'reaction') {
+        if (messageId) {
+            navigateTo('post/' + encodeURIComponent(messageId));
+        }
+    } else if (type === 'friend_request') {
+        // Expand friend requests panel
+        const content = document.getElementById('friend-requests-content');
+        if (!content.classList.contains('visible')) {
+            content.classList.add('visible');
+            loadFriendRequests();
+        }
+    }
+}
+
+async function markAllNotificationsRead() {
+    try {
+        await apiPost('/api/notifications/read-all', {});
+        notifications.forEach(n => n.read = true);
+        renderNotificationList();
+        unreadNotificationCount = 0;
+        updateNotificationBadge();
+        showToast('All notifications marked as read');
+    } catch (e) {
+        showToast('Failed to mark notifications read');
+    }
+}
+
+// Close notification panel when clicking outside
+document.addEventListener('click', (e) => {
+    const panel = document.getElementById('notification-panel');
+    const bell = document.getElementById('notification-bell');
+    if (notificationPanelOpen && !panel.contains(e.target) && !bell.contains(e.target)) {
+        notificationPanelOpen = false;
+        panel.classList.remove('visible');
+    }
+});
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 async function init() {
@@ -1448,6 +1629,7 @@ async function init() {
     await loadPeers();
     await loadMyProfile();
     await loadFriendRequests();
+    await loadNotificationCount(); // Phase 11
 
     // Route based on current hash
     handleRoute();
