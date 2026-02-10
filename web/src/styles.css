@@ -1250,13 +1250,18 @@ body {
 .notification-bell {
     position: relative;
     cursor: pointer;
-    padding: 0.25rem;
-    border-radius: 4px;
-    transition: background 0.2s;
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    background: #1a1d27;
+    border: 1px solid #2a2d37;
+    display: flex;
+    align-items: center;
+    transition: background 0.2s, border-color 0.2s;
 }
-.notification-bell:hover { background: #2a2d37; }
+.notification-bell:hover { background: #2a2d37; border-color: #555; }
 .bell-icon {
-    font-size: 1.2rem;
+    font-size: 1rem;
+    filter: grayscale(1) brightness(1.8);
 }
 .notification-badge {
     position: absolute;

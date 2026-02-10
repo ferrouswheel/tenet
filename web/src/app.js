@@ -430,7 +430,7 @@ function showConversationDetail(peerId, fromRoute) {
     }
 }
 
-function renderDmPeerInfo(peerId) {
+async function renderDmPeerInfo(peerId) {
     const el = document.getElementById('dm-peer-info');
     const peer = peers.find(p => p.peer_id === peerId);
     const name = peer?.display_name || peerId.substring(0, 12) + '...';
@@ -438,29 +438,29 @@ function renderDmPeerInfo(peerId) {
     const onlineText = peer?.online ? 'Online' : (peer?.last_seen_online ? 'Last seen ' + timeAgo(peer.last_seen_online) : 'Offline');
     const onlineClass = peer?.online ? ' online' : '';
 
+    let profile = null;
+    try {
+        profile = await apiGet(`/api/peers/${encodeURIComponent(peerId)}/profile`);
+    } catch (_) {}
+
+    const avatarContent = profile?.avatar_hash
+        ? `<img src="/api/attachments/${encodeURIComponent(profile.avatar_hash)}" alt="" />`
+        : initial;
+    const bioHtml = profile?.bio
+        ? `<div class="dm-peer-bio">${escapeHtml(profile.bio)}</div>`
+        : '';
+
     el.innerHTML = `
         <div class="dm-peer-header">
-            <div class="dm-peer-avatar">${initial}</div>
+            <div class="dm-peer-avatar">${avatarContent}</div>
             <div>
                 <div class="dm-peer-name">${escapeHtml(name)}</div>
                 <div class="dm-peer-id">${escapeHtml(peerId.substring(0, 24))}...</div>
                 <div class="dm-peer-status${onlineClass}">${onlineText}</div>
             </div>
         </div>
+        ${bioHtml}
     `;
-
-    // Try to load profile for bio
-    apiGet(`/api/peers/${encodeURIComponent(peerId)}/profile`).then(profile => {
-        if (profile.avatar_hash) {
-            el.querySelector('.dm-peer-avatar').innerHTML = `<img src="/api/attachments/${encodeURIComponent(profile.avatar_hash)}" alt="" />`;
-        }
-        if (profile.bio) {
-            const bioDiv = document.createElement('div');
-            bioDiv.className = 'dm-peer-bio';
-            bioDiv.textContent = profile.bio;
-            el.appendChild(bioDiv);
-        }
-    }).catch(() => {});
 }
 
 function openConversationWithPeer(peerId) {
