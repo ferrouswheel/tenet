@@ -302,13 +302,13 @@ body {
 }
 .message:hover { border-color: #3a3d47; }
 .message.unread { border-left: 3px solid #5566cc; }
-.message .msg-header {
+.msg-header {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     margin-bottom: 0.4rem;
 }
-.message .msg-badge {
+.msg-badge {
     font-size: 0.7rem;
     padding: 0.1rem 0.4rem;
     border-radius: 4px;
@@ -319,15 +319,15 @@ body {
 .msg-badge.direct { background: #1a2a3a; color: #42a5f5; }
 .msg-badge.friend_group { background: #3a2a1a; color: #ff9800; }
 .msg-badge.meta { background: #2a2a2a; color: #888; }
-.message .msg-sender {
+.msg-sender {
     font-size: 0.8rem;
     color: #aaa;
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 160px;
 }
-.message .msg-sender.self { color: #5566cc; }
-.message .msg-time {
+.msg-sender.self { color: #5566cc; }
+.msg-time {
     font-size: 0.75rem;
     color: #666;
     margin-left: auto;
@@ -629,17 +629,7 @@ body {
     border-radius: 8px;
     padding: 1.5rem;
 }
-.post-detail-content .post-sender {
-    font-size: 0.9rem;
-    color: #aaa;
-    margin-bottom: 0.5rem;
-}
-.post-detail-content .post-sender.self { color: #5566cc; }
-.post-detail-content .post-time {
-    font-size: 0.8rem;
-    color: #666;
-    margin-bottom: 1rem;
-}
+
 .post-detail-content .post-body {
     font-size: 1rem;
     line-height: 1.6;

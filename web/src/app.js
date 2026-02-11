@@ -89,6 +89,8 @@ function handleRoute() {
         // DM conversation: #/peer/{peerId}
         const peerId = decodeURIComponent(parts.slice(1).join('/'));
         showConversationDetail(peerId, true);
+    } else if (route === 'profile') {
+        showMyProfile(true);
     } else {
         // Default: timeline
         currentView = 'timeline';
@@ -271,6 +273,13 @@ function updateMessageReactions(messageId, upvotes, downvotes, myReaction) {
     const el = document.querySelector(`.message[data-id="${messageId}"] .msg-reactions, .dm-message[data-id="${messageId}"] .msg-reactions`);
     if (el) {
         el.outerHTML = renderReactions({ message_id: messageId, upvotes, downvotes, my_reaction: myReaction });
+    }
+    // Also update the post detail view if it's showing this post
+    if (currentView === 'post-detail' && currentPostId === messageId) {
+        const detailEl = document.querySelector('#post-detail-content .msg-reactions');
+        if (detailEl) {
+            detailEl.outerHTML = renderReactions({ message_id: messageId, upvotes, downvotes, my_reaction: myReaction });
+        }
     }
 }
 
@@ -519,8 +528,7 @@ function renderPostDetail(post) {
     const isSelf = post.sender_id === myPeerId;
     const peer = peers.find(p => p.peer_id === post.sender_id);
     const senderLabel = isSelf ? 'You' : (peer && peer.display_name) ? peer.display_name : post.sender_id.substring(0, 12) + '...';
-    const senderClass = isSelf ? 'post-sender self' : 'post-sender';
-    const timestamp = new Date(post.timestamp * 1000).toLocaleString();
+    const senderClass = isSelf ? 'msg-sender self' : 'msg-sender';
     const kindClass = post.message_kind || 'public';
     const attachmentsHtml = renderAttachments(post.attachments);
     const reactionsHtml = renderReactions(post);
@@ -529,8 +537,8 @@ function renderPostDetail(post) {
         <div class="msg-header" style="margin-bottom:0.75rem;">
             <span class="msg-badge ${kindClass}">${kindClass}</span>
             <span class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</span>
+            <span class="msg-time" title="${msgTimeTitle(post)}">${timeAgo(post.timestamp)}</span>
         </div>
-        <div class="post-time">${timestamp}</div>
         <div class="post-body">${escapeHtml(post.body || '')}</div>
         ${attachmentsHtml}
         ${reactionsHtml}
@@ -1387,7 +1395,7 @@ function navToProfile() {
     showMyProfile();
 }
 
-function showMyProfile() {
+function showMyProfile(fromRoute) {
     previousView = currentView;
     currentView = 'profile-edit';
     viewingProfileId = myPeerId;
@@ -1397,6 +1405,10 @@ function showMyProfile() {
     document.getElementById('profile-edit').classList.add('visible');
     document.getElementById('compose-box').style.display = 'none';
     setActiveHeaderNav('nav-profile');
+
+    if (!fromRoute) {
+        window.location.hash = '#/profile';
+    }
 
     // Show peer ID
     const editPeerId = document.getElementById('profile-edit-peer-id');
