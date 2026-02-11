@@ -26,7 +26,8 @@ pub async fn relay_sync_loop(state: SharedState) {
             SYNC_INTERVAL_SECS
         } else {
             // Exponential backoff: 30s * 2^failures, capped at 5 minutes
-            let backoff = SYNC_INTERVAL_SECS * 2u64.pow(consecutive_failures);
+            let backoff =
+                SYNC_INTERVAL_SECS.saturating_mul(2u64.saturating_pow(consecutive_failures));
             backoff.min(MAX_BACKOFF_SECS)
         };
 
@@ -53,8 +54,9 @@ pub async fn relay_sync_loop(state: SharedState) {
             }
             Err(e) => {
                 consecutive_failures += 1;
-                let next_retry_secs =
-                    (SYNC_INTERVAL_SECS * 2u64.pow(consecutive_failures)).min(MAX_BACKOFF_SECS);
+                let next_retry_secs = SYNC_INTERVAL_SECS
+                    .saturating_mul(2u64.saturating_pow(consecutive_failures))
+                    .min(MAX_BACKOFF_SECS);
 
                 let st = state.lock().await;
                 let was_connected = st.relay_connected.swap(false, Ordering::Relaxed);
