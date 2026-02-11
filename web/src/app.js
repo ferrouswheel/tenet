@@ -124,6 +124,18 @@ function updateRelayBanner(connected, relayUrl) {
     relayConnected = connected;
 }
 
+async function retryRelayConnection() {
+    const btn = document.getElementById('relay-retry-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Retrying...'; }
+    try {
+        await apiPost('/api/sync', {});
+    } catch (_) {
+        // Status update arrives via WebSocket; ignore fetch errors here
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry now'; }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Toast
 // ---------------------------------------------------------------------------
@@ -1334,6 +1346,47 @@ function renderMyProfileCard() {
     }
 }
 
+function setActiveHeaderNav(activeId) {
+    ['nav-feed', 'nav-groups', 'nav-friends', 'nav-profile'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', id === activeId);
+    });
+}
+
+function navToFeed() {
+    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+    document.querySelector('.filters button[data-kind="public"]').classList.add('active');
+    currentFilter = 'public';
+    oldestTimestamp = null;
+    showTimelineView();
+    loadMessages(false);
+    setActiveHeaderNav('nav-feed');
+}
+
+function navToGroups() {
+    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+    document.querySelector('.filters button[data-kind="friend_group"]').classList.add('active');
+    currentFilter = 'friend_group';
+    oldestTimestamp = null;
+    showTimelineView();
+    loadMessages(false);
+    setActiveHeaderNav('nav-groups');
+}
+
+function navToFriends() {
+    if (currentView !== 'timeline') {
+        navigateTo('timeline');
+    }
+    setActiveHeaderNav('nav-friends');
+    setTimeout(() => {
+        document.querySelector('.friends-panel').scrollIntoView({ behavior: 'smooth' });
+    }, 50);
+}
+
+function navToProfile() {
+    showMyProfile();
+}
+
 function showMyProfile() {
     previousView = currentView;
     currentView = 'profile-edit';
@@ -1343,6 +1396,7 @@ function showMyProfile() {
     document.querySelector('.filters').style.display = 'none';
     document.getElementById('profile-edit').classList.add('visible');
     document.getElementById('compose-box').style.display = 'none';
+    setActiveHeaderNav('nav-profile');
 
     // Show peer ID
     const editPeerId = document.getElementById('profile-edit-peer-id');
@@ -1483,6 +1537,7 @@ function backFromProfile() {
     } else {
         showTimelineView();
         loadMessages(false);
+        setActiveHeaderNav(currentFilter === 'friend_group' ? 'nav-groups' : 'nav-feed');
     }
 }
 

@@ -12,8 +12,9 @@ use crate::web_client::static_files::static_handler;
 /// Build the complete Axum router with all API routes and static file serving.
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
-        // Health
+        // Health / sync
         .route("/api/health", get(handlers::health::health_handler))
+        .route("/api/sync", post(handlers::health::sync_now_handler))
         // Messages API
         .route(
             "/api/messages",
