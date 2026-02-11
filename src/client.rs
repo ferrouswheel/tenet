@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{generate_content_key, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
-    build_plaintext_envelope, decrypt_encrypted_payload, Envelope, EnvelopeBuildError, MessageKind,
-    MetaMessage, PayloadCryptoError,
+    build_plaintext_envelope, decode_meta_payload, decrypt_encrypted_payload, Envelope,
+    EnvelopeBuildError, MessageKind, MetaMessage, PayloadCryptoError,
 };
 
 use crate::simulation::{
@@ -221,11 +221,72 @@ pub struct ClientMessage {
     pub body: String,
 }
 
-#[derive(Debug, Clone)]
+/// A single event produced by `sync_inbox()` for one envelope.
+#[derive(Debug)]
+pub struct SyncEvent {
+    pub envelope: Envelope,
+    pub outcome: SyncEventOutcome,
+}
+
+/// The outcome of processing a single envelope during `sync_inbox()`.
+#[derive(Debug)]
+pub enum SyncEventOutcome {
+    /// Verified and decrypted successfully. Ready to store.
+    Message(ClientMessage),
+
+    /// A structured meta-message (Online, Ack, FriendRequest, FriendAccept, etc.).
+    Meta(MetaMessage),
+
+    /// A raw meta payload that couldn't be parsed as a `MetaMessage`.
+    /// The body string is passed through for custom dispatch (reactions, profiles, etc.).
+    RawMeta { body: String },
+
+    /// Message was already seen (deduplicated).
+    Duplicate,
+
+    /// Sender is not in the peer registry.
+    UnknownSender,
+
+    /// Signature verification failed.
+    InvalidSignature { reason: String },
+
+    /// Decryption failed.
+    DecryptFailed { reason: String },
+
+    /// Message TTL has expired.
+    TtlExpired,
+}
+
+/// A trait for receiving typed events during `sync_inbox()`.
+///
+/// All methods have default no-op implementations so callers only override
+/// what they need.
+pub trait MessageHandler: Send {
+    /// Called for each successfully verified and decrypted message.
+    fn on_message(&mut self, _envelope: &Envelope, _message: &ClientMessage) {}
+
+    /// Called for each structured meta-message (Online, Ack, FriendRequest, etc.).
+    fn on_meta(&mut self, _meta: &MetaMessage) {}
+
+    /// Called for raw meta payloads that couldn't be parsed as `MetaMessage`.
+    /// The body string is the raw payload for custom dispatch (reactions, etc.).
+    fn on_raw_meta(&mut self, _envelope: &Envelope, _body: &str) {}
+
+    /// Called when a message is rejected (bad signature, unknown sender, etc.).
+    fn on_rejected(&mut self, _envelope: &Envelope, _reason: &str) {}
+}
+
+/// Result of `RelayClient::sync_inbox()`.
+#[derive(Debug)]
 pub struct SyncOutcome {
-    pub messages: Vec<ClientMessage>,
-    pub errors: Vec<String>,
+    /// Per-envelope events, including duplicates, errors, and successes.
+    pub events: Vec<SyncEvent>,
+    /// Number of envelopes fetched from the relay (before deduplication).
     pub fetched: usize,
+    /// Convenience view: all successfully decoded messages (from `SyncEventOutcome::Message`).
+    pub messages: Vec<ClientMessage>,
+    /// Convenience view: human-readable rejection reasons.
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -265,7 +326,6 @@ impl From<EnvelopeBuildError> for ClientError {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct RelayClient {
     keypair: StoredKeypair,
     config: ClientConfig,
@@ -276,6 +336,44 @@ pub struct RelayClient {
     public_message_cache: Vec<Envelope>,
     public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
     group_manager: GroupManager,
+    handler: Option<Box<dyn MessageHandler>>,
+}
+
+impl std::fmt::Debug for RelayClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayClient")
+            .field("keypair", &self.keypair)
+            .field("config", &self.config)
+            .field("online", &self.online)
+            .field("feed", &self.feed)
+            .field("seen", &self.seen)
+            .field("peer_registry", &self.peer_registry)
+            .field("public_message_cache", &self.public_message_cache)
+            .field("public_message_metadata", &self.public_message_metadata)
+            .field("group_manager", &self.group_manager)
+            .field(
+                "handler",
+                &self.handler.as_ref().map(|_| "<MessageHandler>"),
+            )
+            .finish()
+    }
+}
+
+impl Clone for RelayClient {
+    fn clone(&self) -> Self {
+        Self {
+            keypair: self.keypair.clone(),
+            config: self.config.clone(),
+            online: self.online,
+            feed: self.feed.clone(),
+            seen: self.seen.clone(),
+            peer_registry: self.peer_registry.clone(),
+            public_message_cache: self.public_message_cache.clone(),
+            public_message_metadata: self.public_message_metadata.clone(),
+            group_manager: self.group_manager.clone(),
+            handler: None, // handlers are not cloned
+        }
+    }
 }
 
 impl RelayClient {
@@ -290,7 +388,18 @@ impl RelayClient {
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
             group_manager: GroupManager::new(),
+            handler: None,
         }
+    }
+
+    /// Register a handler that receives typed events during `sync_inbox()`.
+    pub fn set_handler(&mut self, handler: Box<dyn MessageHandler>) {
+        self.handler = Some(handler);
+    }
+
+    /// Remove any registered handler.
+    pub fn clear_handler(&mut self) {
+        self.handler = None;
     }
 
     pub fn add_peer(&mut self, peer_id: String, signing_public_key_hex: String) {
@@ -792,85 +901,202 @@ impl RelayClient {
         let fetched = envelopes.len();
         if fetched == 0 {
             return Ok(SyncOutcome {
+                events: Vec::new(),
+                fetched: 0,
                 messages: Vec::new(),
                 errors: Vec::new(),
-                fetched: 0,
             });
         }
 
+        // Take the handler out temporarily so we can mutate self (seen, feed)
+        // while also calling handler methods, then put it back afterwards.
+        let mut handler = self.handler.take();
+
+        let mut events = Vec::new();
         let mut messages = Vec::new();
         let mut errors = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         for envelope in envelopes {
+            // --- Deduplication ---
             if self.seen.contains(&envelope.header.message_id.0) {
+                events.push(SyncEvent {
+                    envelope,
+                    outcome: SyncEventOutcome::Duplicate,
+                });
                 continue;
             }
-            let result = self.decode_envelope(&envelope);
-            match result {
-                Ok(message) => {
+
+            // --- TTL check ---
+            let expires_at = envelope
+                .header
+                .timestamp
+                .saturating_add(envelope.header.ttl_seconds);
+            if now > expires_at {
+                events.push(SyncEvent {
+                    envelope,
+                    outcome: SyncEventOutcome::TtlExpired,
+                });
+                continue;
+            }
+
+            // --- Meta messages: process from any sender (no signature required) ---
+            if envelope.header.message_kind == MessageKind::Meta {
+                let outcome = match decode_meta_payload(&envelope.payload) {
+                    Ok(meta) => {
+                        if let Some(ref mut h) = handler {
+                            h.on_meta(&meta);
+                        }
+                        SyncEventOutcome::Meta(meta)
+                    }
+                    Err(_) => {
+                        let body = envelope.payload.body.clone();
+                        if let Some(ref mut h) = handler {
+                            h.on_raw_meta(&envelope, &body);
+                        }
+                        SyncEventOutcome::RawMeta { body }
+                    }
+                };
+                events.push(SyncEvent { envelope, outcome });
+                continue;
+            }
+
+            // --- Non-meta: verify signature from known peer ---
+            let signing_key = self
+                .peer_registry
+                .get_signing_key(&envelope.header.sender_id)
+                .map(|s| s.to_string());
+
+            let signing_key = match signing_key {
+                Some(k) => k,
+                None => {
+                    let reason = format!(
+                        "unknown sender: {} (cannot verify signature)",
+                        envelope.header.sender_id
+                    );
+                    if let Some(ref mut h) = handler {
+                        h.on_rejected(&envelope, &reason);
+                    }
+                    errors.push(reason.clone());
+                    events.push(SyncEvent {
+                        envelope,
+                        outcome: SyncEventOutcome::UnknownSender,
+                    });
+                    continue;
+                }
+            };
+
+            if let Err(e) = envelope
+                .header
+                .verify_signature(envelope.version, &signing_key)
+            {
+                let reason = format!("invalid header signature: {e:?}");
+                if let Some(ref mut h) = handler {
+                    h.on_rejected(&envelope, &reason);
+                }
+                errors.push(reason.clone());
+                events.push(SyncEvent {
+                    envelope,
+                    outcome: SyncEventOutcome::InvalidSignature { reason },
+                });
+                continue;
+            }
+
+            // --- Decrypt / extract body based on message kind ---
+            let body_result = self.extract_body(&envelope);
+
+            match body_result {
+                Err(reason) => {
+                    if let Some(ref mut h) = handler {
+                        h.on_rejected(&envelope, &reason);
+                    }
+                    errors.push(reason.clone());
+                    events.push(SyncEvent {
+                        envelope,
+                        outcome: SyncEventOutcome::DecryptFailed { reason },
+                    });
+                }
+                Ok(body) => {
+                    let message = ClientMessage {
+                        message_id: envelope.header.message_id.0.clone(),
+                        sender_id: envelope.header.sender_id.clone(),
+                        timestamp: envelope.header.timestamp,
+                        body,
+                    };
                     self.seen.insert(envelope.header.message_id.0.clone());
                     self.feed.push(message.clone());
-                    messages.push(message);
-                }
-                Err(error) => {
-                    errors.push(error);
+                    messages.push(message.clone());
+                    if let Some(ref mut h) = handler {
+                        h.on_message(&envelope, &message);
+                    }
+                    events.push(SyncEvent {
+                        envelope,
+                        outcome: SyncEventOutcome::Message(message),
+                    });
                 }
             }
         }
 
+        // Restore the handler.
+        self.handler = handler;
+
         Ok(SyncOutcome {
+            events,
+            fetched,
             messages,
             errors,
-            fetched,
         })
     }
 
-    fn decode_envelope(&self, envelope: &Envelope) -> Result<ClientMessage, String> {
-        // Verify signature using sender's public key
-        if let Some(sender_signing_key) = self
-            .peer_registry
-            .get_signing_key(&envelope.header.sender_id)
-        {
-            envelope
-                .header
-                .verify_signature(envelope.version, sender_signing_key)
-                .map_err(|error| format!("invalid header signature: {error:?}"))?;
-        } else {
-            return Err(format!(
-                "unknown sender: {} (cannot verify signature)",
-                envelope.header.sender_id
-            ));
-        }
-
-        if envelope.header.message_kind != MessageKind::Direct {
-            return Err(format!(
-                "unexpected message kind: {:?}",
-                envelope.header.message_kind
-            ));
-        }
-
-        let body = match self.config.encryption() {
-            ClientEncryption::Plaintext => envelope.payload.body.clone(),
-            ClientEncryption::Encrypted {
-                hpke_info,
-                payload_aad,
-            } => {
-                let plaintext = decrypt_encrypted_payload(
-                    &envelope.payload,
-                    &self.keypair.private_key_hex,
-                    payload_aad,
+    /// Extract the plaintext body from an envelope based on its message kind.
+    ///
+    /// Assumes the signature has already been verified.
+    fn extract_body(&self, envelope: &Envelope) -> Result<String, String> {
+        match envelope.header.message_kind {
+            MessageKind::Direct => match self.config.encryption() {
+                ClientEncryption::Plaintext => Ok(envelope.payload.body.clone()),
+                ClientEncryption::Encrypted {
                     hpke_info,
+                    payload_aad,
+                } => {
+                    let plaintext = decrypt_encrypted_payload(
+                        &envelope.payload,
+                        &self.keypair.private_key_hex,
+                        payload_aad,
+                        hpke_info,
+                    )
+                    .map_err(|e| format!("decrypt failed: {e}"))?;
+                    String::from_utf8(plaintext).map_err(|e| format!("utf-8 error: {e}"))
+                }
+            },
+            MessageKind::Public | MessageKind::StoreForPeer => Ok(envelope.payload.body.clone()),
+            MessageKind::FriendGroup => {
+                let group_id = envelope
+                    .header
+                    .group_id
+                    .as_deref()
+                    .ok_or_else(|| "friend_group message missing group_id".to_string())?;
+                let group = self
+                    .group_manager
+                    .get_group(group_id)
+                    .ok_or_else(|| format!("unknown group: {group_id}"))?;
+                let aad = group_id.as_bytes();
+                let plaintext = crate::protocol::decrypt_group_message_payload(
+                    &envelope.payload,
+                    &group.group_key,
+                    aad,
                 )
-                .map_err(|error| format!("{error}"))?;
-                String::from_utf8(plaintext).map_err(|error| format!("utf-8 error: {error}"))?
+                .map_err(|e| format!("group decrypt failed: {e}"))?;
+                String::from_utf8(plaintext).map_err(|e| format!("utf-8 error: {e}"))
             }
-        };
-
-        Ok(ClientMessage {
-            message_id: envelope.header.message_id.0.clone(),
-            sender_id: envelope.header.sender_id.clone(),
-            timestamp: envelope.header.timestamp,
-            body,
-        })
+            MessageKind::Meta => {
+                // Should never reach here; meta is handled before this function is called.
+                Err("unexpected meta message kind".to_string())
+            }
+        }
     }
 
     fn post_envelope(&self, envelope: &Envelope) -> Result<(), ClientError> {
@@ -1003,8 +1229,15 @@ impl Client for RelayClient {
             if self.seen.contains(&envelope.header.message_id.0) {
                 continue;
             }
-            match self.decode_envelope(&envelope) {
-                Ok(message) => {
+            let body_result = self.extract_body(&envelope);
+            match body_result {
+                Ok(body) => {
+                    let message = ClientMessage {
+                        message_id: envelope.header.message_id.0.clone(),
+                        sender_id: envelope.header.sender_id.clone(),
+                        timestamp: envelope.header.timestamp,
+                        body,
+                    };
                     self.seen.insert(envelope.header.message_id.0.clone());
                     self.feed.push(message);
                     received = received.saturating_add(1);
@@ -1338,7 +1571,7 @@ impl SimulationClient {
             MessageKind::Public,
             None,
             None,
-                    message,
+            message,
             [0u8; 16], // salt
             &context.keypairs.get(&self.id)?.signing_private_key_hex,
         )
@@ -2667,7 +2900,7 @@ mod tests {
             MessageKind::Public,
             None,
             None,
-                    "Test message",
+            "Test message",
             &[0u8; 16],
             &alice_keypair.signing_private_key_hex,
         )
@@ -2730,7 +2963,7 @@ mod tests {
             MessageKind::Public,
             None,
             None,
-                    "Public announcement",
+            "Public announcement",
             &[0u8; 16],
             &keypairs["peer2"].signing_private_key_hex,
         )
@@ -2798,7 +3031,7 @@ mod tests {
             MessageKind::Public,
             None,
             None,
-                    "Expired message",
+            "Expired message",
             &[0u8; 16],
             &keypairs["peer2"].signing_private_key_hex,
         )
@@ -2826,7 +3059,7 @@ mod tests {
             MessageKind::Public,
             None,
             None,
-                    "Forward me",
+            "Forward me",
             &[0u8; 16],
             &peer2_keypair.signing_private_key_hex,
         )

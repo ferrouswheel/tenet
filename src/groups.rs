@@ -189,6 +189,35 @@ impl GroupManager {
     pub fn remove_group(&mut self, group_id: &str) -> Option<GroupInfo> {
         self.groups.remove(group_id)
     }
+
+    /// Register a group key loaded from external storage.
+    ///
+    /// Creates a minimal `GroupInfo` with the given `group_id` and `group_key`
+    /// and no members, suitable for decryption purposes.  If the group already
+    /// exists it is left unchanged.
+    ///
+    /// `group_key` must be exactly 32 bytes; if it is not, this is a no-op.
+    pub fn add_group_key(&mut self, group_id: String, group_key: Vec<u8>) {
+        if self.groups.contains_key(&group_id) {
+            return;
+        }
+        let Ok(key_bytes): Result<[u8; 32], _> = group_key.try_into() else {
+            return;
+        };
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let info = GroupInfo {
+            group_id: group_id.clone(),
+            group_key: key_bytes,
+            members: std::collections::HashSet::new(),
+            created_at: timestamp,
+            key_version: 1,
+            creator_id: String::new(),
+        };
+        self.groups.insert(group_id, info);
+    }
 }
 
 impl Default for GroupManager {

@@ -271,12 +271,12 @@ impl Storage {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let attachment_dir = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("attachments");
+        let attachment_dir = path.parent().unwrap_or(Path::new(".")).join("attachments");
         std::fs::create_dir_all(&attachment_dir)?;
-        let storage = Self { conn, attachment_dir };
+        let storage = Self {
+            conn,
+            attachment_dir,
+        };
         storage.create_schema()?;
         Ok(storage)
     }
@@ -1786,10 +1786,9 @@ impl Storage {
 
     /// Mark all notifications as read.
     pub fn mark_all_notifications_read(&self) -> Result<u32, StorageError> {
-        let affected = self.conn.execute(
-            "UPDATE notifications SET read = 1 WHERE read = 0",
-            [],
-        )?;
+        let affected = self
+            .conn
+            .execute("UPDATE notifications SET read = 1 WHERE read = 0", [])?;
         Ok(affected as u32)
     }
 
@@ -1815,15 +1814,18 @@ impl Storage {
 
     /// Mark all notifications as seen (user opened the notification panel).
     pub fn mark_all_notifications_seen(&self) -> Result<u32, StorageError> {
-        let affected = self.conn.execute(
-            "UPDATE notifications SET seen = 1 WHERE seen = 0",
-            [],
-        )?;
+        let affected = self
+            .conn
+            .execute("UPDATE notifications SET seen = 1 WHERE seen = 0", [])?;
         Ok(affected as u32)
     }
 
     /// Check if a notification already exists (to avoid duplicates).
-    pub fn has_notification(&self, notification_type: &str, message_id: &str) -> Result<bool, StorageError> {
+    pub fn has_notification(
+        &self,
+        notification_type: &str,
+        message_id: &str,
+    ) -> Result<bool, StorageError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM notifications WHERE type = ?1 AND message_id = ?2",
             params![notification_type, message_id],
@@ -2056,7 +2058,11 @@ fn dirs_or_default() -> PathBuf {
 /// Map a MIME content type to a lowercase file extension.
 /// Used to construct attachment filenames on disk.
 fn content_type_to_ext(content_type: &str) -> &str {
-    let base = content_type.split(';').next().unwrap_or(content_type).trim();
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
     match base {
         "image/png" => "png",
         "image/jpeg" | "image/jpg" => "jpg",

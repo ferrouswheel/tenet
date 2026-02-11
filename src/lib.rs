@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod groups;
 pub mod identity;
 pub mod logging;
+pub mod message_handler;
 pub mod protocol;
 pub mod relay;
 pub mod relay_transport;

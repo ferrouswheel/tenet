@@ -4,14 +4,11 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::protocol::{
-    build_envelope_from_payload, build_meta_payload, decode_meta_payload,
-    decrypt_encrypted_payload, MessageKind, MetaMessage,
-};
 use base64::Engine as _;
 
-use crate::relay_transport::{fetch_inbox, post_envelope};
-use crate::storage::{AttachmentRow, FriendRequestRow, MessageAttachmentRow, MessageRow, NotificationRow, PeerRow, ProfileRow};
+use crate::client::{ClientConfig, ClientEncryption, RelayClient, SyncEventOutcome};
+use crate::protocol::{build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage};
+use crate::relay_transport::post_envelope;
 use crate::web_client::config::{
     DEFAULT_TTL_SECONDS, SYNC_INTERVAL_SECS, WEB_HPKE_INFO, WEB_PAYLOAD_AAD,
 };
@@ -89,346 +86,96 @@ pub async fn relay_sync_loop(state: SharedState) {
 
 /// Perform a single relay sync: fetch envelopes, verify, decrypt, and store.
 pub async fn sync_once(state: &SharedState) -> Result<(), String> {
-    // Extract what we need from state under a short lock
-    let (keypair, relay_url, peers) = {
+    // Extract what we need from state under a short lock.
+    let (keypair, relay_url, peers, groups) = {
         let st = state.lock().await;
         let relay_url = st
             .relay_url
             .clone()
             .ok_or_else(|| "no relay configured".to_string())?;
         let peers = st.storage.list_peers().map_err(|e| e.to_string())?;
-        (st.keypair.clone(), relay_url, peers)
+        let groups = st.storage.list_groups().map_err(|e| e.to_string())?;
+        (st.keypair.clone(), relay_url, peers, groups)
     };
 
-    // Build a peer lookup map for signature verification and decryption
-    let peer_map: std::collections::HashMap<String, &crate::storage::PeerRow> =
-        peers.iter().map(|p| (p.peer_id.clone(), p)).collect();
+    // Build a RelayClient populated with all known peers and groups.
+    let config = ClientConfig::new(
+        &relay_url,
+        DEFAULT_TTL_SECONDS,
+        ClientEncryption::Encrypted {
+            hpke_info: WEB_HPKE_INFO.to_vec(),
+            payload_aad: WEB_PAYLOAD_AAD.to_vec(),
+        },
+    );
+    let mut relay_client = RelayClient::new(keypair.clone(), config);
+    for peer in &peers {
+        relay_client.add_peer_with_encryption(
+            peer.peer_id.clone(),
+            peer.signing_public_key.clone(),
+            peer.encryption_public_key
+                .clone()
+                .unwrap_or_else(|| peer.signing_public_key.clone()),
+        );
+    }
+    for group in &groups {
+        let mut gm = relay_client.group_manager_mut();
+        // Reconstruct a minimal GroupInfo from the stored group row so that
+        // FriendGroup messages can be decrypted.
+        gm.add_group_key(group.group_id.clone(), group.group_key.clone());
+    }
 
-    // Fetch envelopes from relay
-    let envelopes = fetch_inbox(&relay_url, &keypair.id)?;
+    // Fetch and process all envelopes. The handler is not set here; we use the
+    // pull API (outcome.events) so we can perform async storage writes below.
+    let outcome = relay_client.sync_inbox(None).map_err(|e| e.to_string())?;
 
-    if envelopes.is_empty() {
+    if outcome.fetched == 0 {
         return Ok(());
     }
 
-    crate::tlog!("sync: fetched {} envelope(s) from relay", envelopes.len());
+    crate::tlog!("sync: fetched {} envelope(s) from relay", outcome.fetched);
 
     let now = now_secs();
     let mut stored_count = 0u32;
 
-    for envelope in &envelopes {
-        // --- Meta messages: process from ALL senders (including unknown) ---
-        if envelope.header.message_kind == MessageKind::Meta {
-            if let Ok(meta_msg) = decode_meta_payload(&envelope.payload) {
-                match meta_msg {
-                    MetaMessage::Online { peer_id, timestamp } => {
-                        let st = state.lock().await;
-                        if let Ok(true) = st.storage.update_peer_online(&peer_id, true, timestamp) {
-                            let _ = st.ws_tx.send(WsEvent::PeerOnline {
-                                peer_id: peer_id.clone(),
-                            });
-                            crate::tlog!(
-                                "sync: peer {} is now online",
-                                crate::logging::peer_id(&peer_id)
-                            );
-                        }
-                    }
-                    MetaMessage::Ack {
-                        peer_id,
-                        online_timestamp,
-                    } => {
-                        let st = state.lock().await;
-                        let _ = st
-                            .storage
-                            .update_peer_online(&peer_id, true, online_timestamp);
-                    }
-                    MetaMessage::FriendRequest {
-                        peer_id: from_peer_id,
-                        signing_public_key,
-                        encryption_public_key,
-                        message,
-                    } => {
-                        process_incoming_friend_request(
-                            state,
-                            &keypair,
-                            &relay_url,
-                            now,
-                            &from_peer_id,
-                            &signing_public_key,
-                            &encryption_public_key,
-                            message,
-                        )
-                        .await;
-                    }
-                    MetaMessage::FriendAccept {
-                        peer_id: from_peer_id,
-                        signing_public_key,
-                        encryption_public_key,
-                    } => {
-                        process_friend_accept(
-                            state,
-                            &keypair,
-                            now,
-                            &from_peer_id,
-                            signing_public_key,
-                            encryption_public_key,
-                        )
-                        .await;
-                    }
-                    _ => {}
-                }
-            } else {
-                // If not a standard MetaMessage, check if it's a reaction
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&envelope.payload.body) {
-                    if let (Some(target_id), Some(reaction)) = (
-                        parsed.get("target_message_id").and_then(|v| v.as_str()),
-                        parsed.get("reaction").and_then(|v| v.as_str()),
-                    ) {
-                        // This is a reaction - store it
-                        let st = state.lock().await;
-                        let reaction_row = crate::storage::ReactionRow {
-                            message_id: envelope.header.message_id.0.clone(),
-                            target_id: target_id.to_string(),
-                            sender_id: envelope.header.sender_id.clone(),
-                            reaction: reaction.to_string(),
-                            timestamp: envelope.header.timestamp,
-                        };
-                        if let Err(e) = st.storage.upsert_reaction(&reaction_row) {
-                            crate::tlog!(
-                                "sync: failed to store reaction from {}: {}",
-                                crate::logging::peer_id(&envelope.header.sender_id),
-                                e
-                            );
-                        } else {
-                            crate::tlog!(
-                                "sync: received {} reaction from {} for message {}",
-                                reaction,
-                                crate::logging::peer_id(&envelope.header.sender_id),
-                                crate::logging::msg_id(target_id)
-                            );
+    // Process each event, writing to storage and broadcasting WsEvents.
+    for event in &outcome.events {
+        match &event.outcome {
+            SyncEventOutcome::Meta(meta) => {
+                process_meta_event(state, meta, &keypair, &relay_url, now).await;
+            }
 
-                            // Create notification if reaction is to our own message
-                            if let Ok(Some(target_msg)) = st.storage.get_message(target_id) {
-                                if target_msg.sender_id == keypair.id {
-                                    let notif = NotificationRow {
-                                        id: 0,
-                                        notification_type: "reaction".to_string(),
-                                        message_id: envelope.header.message_id.0.clone(),
-                                        sender_id: envelope.header.sender_id.clone(),
-                                        created_at: now,
-                                        seen: false,
-                                        read: false,
-                                    };
-                                    if let Ok(notif_id) = st.storage.insert_notification(&notif) {
-                                        let _ = st.ws_tx.send(WsEvent::Notification {
-                                            id: notif_id,
-                                            notification_type: "reaction".to_string(),
-                                            message_id: envelope.header.message_id.0.clone(),
-                                            sender_id: envelope.header.sender_id.clone(),
-                                            created_at: now,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
+            SyncEventOutcome::RawMeta { body } => {
+                process_raw_meta_event(state, &event.envelope, body, &keypair.id, now).await;
+            }
+
+            SyncEventOutcome::Message(message) => {
+                let stored =
+                    process_message_event(state, &event.envelope, message, &keypair.id, now).await;
+                if stored {
+                    stored_count += 1;
                 }
             }
-            continue; // Meta messages are not stored as regular messages
-        }
 
-        // --- Non-meta messages: verify signature using known peers ---
-        let sender_id = &envelope.header.sender_id;
-        let peer = match peer_map.get(sender_id) {
-            Some(p) => p,
-            None => {
+            SyncEventOutcome::Duplicate
+            | SyncEventOutcome::TtlExpired
+            | SyncEventOutcome::UnknownSender => {
+                // Nothing to do for these outcomes.
+            }
+
+            SyncEventOutcome::InvalidSignature { reason } => {
                 crate::tlog!(
-                    "sync: skipping message from unknown sender {}",
-                    crate::logging::peer_id(sender_id)
+                    "sync: invalid signature from {}: {}",
+                    crate::logging::peer_id(&event.envelope.header.sender_id),
+                    reason
                 );
-                continue;
-            }
-        };
-
-        if let Err(e) = envelope
-            .header
-            .verify_signature(envelope.version, &peer.signing_public_key)
-        {
-            crate::tlog!(
-                "sync: invalid signature from {}: {:?}",
-                crate::logging::peer_id(sender_id),
-                e
-            );
-            continue;
-        }
-
-        // Decrypt body for Direct messages, pass through for others
-        let body = match envelope.header.message_kind {
-            MessageKind::Direct => {
-                match decrypt_encrypted_payload(
-                    &envelope.payload,
-                    &keypair.private_key_hex,
-                    WEB_PAYLOAD_AAD,
-                    WEB_HPKE_INFO,
-                ) {
-                    Ok(plaintext) => match String::from_utf8(plaintext) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            crate::tlog!(
-                                "sync: utf-8 decode error from {}: {}",
-                                crate::logging::peer_id(sender_id),
-                                e
-                            );
-                            continue;
-                        }
-                    },
-                    Err(e) => {
-                        crate::tlog!(
-                            "sync: decrypt error from {}: {}",
-                            crate::logging::peer_id(sender_id),
-                            e
-                        );
-                        continue;
-                    }
-                }
-            }
-            _ => Some(envelope.payload.body.clone()),
-        };
-
-        let message_id = envelope.header.message_id.0.clone();
-        let kind_str = match envelope.header.message_kind {
-            MessageKind::Public => "public",
-            MessageKind::Direct => "direct",
-            MessageKind::FriendGroup => "friend_group",
-            MessageKind::Meta => "meta",
-            MessageKind::StoreForPeer => "store_for_peer",
-        };
-
-        // Check if this is a profile update (body contains "type": "tenet.profile")
-        if let Some(ref body_str) = body {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body_str) {
-                if parsed.get("type").and_then(|t| t.as_str()) == Some("tenet.profile") {
-                    process_profile_update(state, sender_id, &envelope.header.timestamp, &parsed)
-                        .await;
-                    continue; // Don't store profile updates as timeline messages
-                }
-
-                // Also check for group key distribution messages — don't show in timeline
-                if parsed.get("type").and_then(|t| t.as_str()) == Some("group_key_distribution") {
-                    continue;
-                }
-            }
-        }
-
-        let st = state.lock().await;
-        if st.storage.has_message(&message_id).unwrap_or(true) {
-            continue;
-        }
-
-        // Update last_seen_online for the sender when we receive a message from them
-        if let Ok(Some(_)) = st.storage.get_peer(sender_id) {
-            let _ = st
-                .storage
-                .update_peer_online(sender_id, false, envelope.header.timestamp);
-        }
-
-        crate::tlog!(
-            "sync: received {} message from {} (id={})",
-            kind_str,
-            crate::logging::peer_id(sender_id),
-            crate::logging::msg_id(&message_id)
-        );
-
-        let row = MessageRow {
-            message_id: message_id.clone(),
-            sender_id: sender_id.clone(),
-            recipient_id: keypair.id.clone(),
-            message_kind: kind_str.to_string(),
-            group_id: envelope.header.group_id.clone(),
-            body,
-            timestamp: envelope.header.timestamp,
-            received_at: now,
-            ttl_seconds: DEFAULT_TTL_SECONDS,
-            is_read: false,
-            raw_envelope: None,
-            reply_to: envelope.header.reply_to.clone(),
-        };
-        if st.storage.insert_message(&row).is_ok() {
-            // Store any inline attachment data so it can be served locally
-            for (i, att_ref) in envelope.payload.attachments.iter().enumerate() {
-                if let Some(ref data_b64) = att_ref.data {
-                    if let Ok(data) =
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64)
-                    {
-                        let att_row = AttachmentRow {
-                            content_hash: att_ref.content_id.0.clone(),
-                            content_type: att_ref.content_type.clone(),
-                            size_bytes: att_ref.size,
-                            data,
-                            created_at: now,
-                        };
-                        let _ = st.storage.insert_attachment(&att_row);
-                        let _ = st.storage.insert_message_attachment(&MessageAttachmentRow {
-                            message_id: message_id.clone(),
-                            content_hash: att_ref.content_id.0.clone(),
-                            filename: att_ref.filename.clone(),
-                            position: i as u32,
-                        });
-                    }
-                }
             }
 
-            let _ = st.ws_tx.send(WsEvent::NewMessage {
-                message_id: message_id.clone(),
-                sender_id: sender_id.clone(),
-                message_kind: kind_str.to_string(),
-                body: row.body.clone(),
-                timestamp: envelope.header.timestamp,
-                reply_to: row.reply_to.clone(),
-            });
-            stored_count += 1;
-
-            // Create notifications for direct messages and replies
-            let notification_type = if row.reply_to.is_some() {
-                // Check if this is a reply to our own message
-                if let Some(ref parent_id) = row.reply_to {
-                    if let Ok(Some(parent_msg)) = st.storage.get_message(parent_id) {
-                        if parent_msg.sender_id == keypair.id {
-                            Some("reply")
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else if kind_str == "direct" {
-                Some("direct_message")
-            } else {
-                None
-            };
-
-            if let Some(notif_type) = notification_type {
-                let notif = NotificationRow {
-                    id: 0,
-                    notification_type: notif_type.to_string(),
-                    message_id: message_id.clone(),
-                    sender_id: sender_id.clone(),
-                    created_at: now,
-                    seen: false,
-                    read: false,
-                };
-                if let Ok(notif_id) = st.storage.insert_notification(&notif) {
-                    let _ = st.ws_tx.send(WsEvent::Notification {
-                        id: notif_id,
-                        notification_type: notif_type.to_string(),
-                        message_id: message_id.clone(),
-                        sender_id: sender_id.clone(),
-                        created_at: now,
-                    });
-                }
+            SyncEventOutcome::DecryptFailed { reason } => {
+                crate::tlog!(
+                    "sync: decrypt error from {}: {}",
+                    crate::logging::peer_id(&event.envelope.header.sender_id),
+                    reason
+                );
             }
         }
     }
@@ -444,6 +191,293 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Meta-message dispatch helpers (async, need WsEvent broadcasting)
+// ---------------------------------------------------------------------------
+
+async fn process_meta_event(
+    state: &SharedState,
+    meta: &MetaMessage,
+    keypair: &crate::crypto::StoredKeypair,
+    relay_url: &str,
+    now: u64,
+) {
+    match meta {
+        MetaMessage::Online { peer_id, timestamp } => {
+            let st = state.lock().await;
+            if let Ok(true) = st.storage.update_peer_online(peer_id, true, *timestamp) {
+                let _ = st.ws_tx.send(WsEvent::PeerOnline {
+                    peer_id: peer_id.clone(),
+                });
+                crate::tlog!(
+                    "sync: peer {} is now online",
+                    crate::logging::peer_id(peer_id)
+                );
+            }
+        }
+        MetaMessage::Ack {
+            peer_id,
+            online_timestamp,
+        } => {
+            let st = state.lock().await;
+            let _ = st
+                .storage
+                .update_peer_online(peer_id, true, *online_timestamp);
+        }
+        MetaMessage::FriendRequest {
+            peer_id: from_peer_id,
+            signing_public_key,
+            encryption_public_key,
+            message,
+        } => {
+            process_incoming_friend_request(
+                state,
+                keypair,
+                relay_url,
+                now,
+                from_peer_id,
+                signing_public_key,
+                encryption_public_key,
+                message.clone(),
+            )
+            .await;
+        }
+        MetaMessage::FriendAccept {
+            peer_id: from_peer_id,
+            signing_public_key,
+            encryption_public_key,
+        } => {
+            process_friend_accept(
+                state,
+                keypair,
+                now,
+                from_peer_id,
+                signing_public_key.clone(),
+                encryption_public_key.clone(),
+            )
+            .await;
+        }
+        MetaMessage::MessageRequest { .. } => {}
+    }
+}
+
+async fn process_raw_meta_event(
+    state: &SharedState,
+    envelope: &crate::protocol::Envelope,
+    body: &str,
+    my_peer_id: &str,
+    now: u64,
+) {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        // Reaction
+        if let (Some(target_id), Some(reaction)) = (
+            parsed.get("target_message_id").and_then(|v| v.as_str()),
+            parsed.get("reaction").and_then(|v| v.as_str()),
+        ) {
+            let st = state.lock().await;
+            let reaction_row = crate::storage::ReactionRow {
+                message_id: envelope.header.message_id.0.clone(),
+                target_id: target_id.to_string(),
+                sender_id: envelope.header.sender_id.clone(),
+                reaction: reaction.to_string(),
+                timestamp: envelope.header.timestamp,
+            };
+            if let Err(e) = st.storage.upsert_reaction(&reaction_row) {
+                crate::tlog!(
+                    "sync: failed to store reaction from {}: {}",
+                    crate::logging::peer_id(&envelope.header.sender_id),
+                    e
+                );
+            } else {
+                crate::tlog!(
+                    "sync: received {} reaction from {} for message {}",
+                    reaction,
+                    crate::logging::peer_id(&envelope.header.sender_id),
+                    crate::logging::msg_id(target_id)
+                );
+
+                // Notification if reaction is to our own message.
+                if let Ok(Some(target_msg)) = st.storage.get_message(target_id) {
+                    if target_msg.sender_id == my_peer_id {
+                        let notif = crate::storage::NotificationRow {
+                            id: 0,
+                            notification_type: "reaction".to_string(),
+                            message_id: envelope.header.message_id.0.clone(),
+                            sender_id: envelope.header.sender_id.clone(),
+                            created_at: now,
+                            seen: false,
+                            read: false,
+                        };
+                        if let Ok(notif_id) = st.storage.insert_notification(&notif) {
+                            let _ = st.ws_tx.send(WsEvent::Notification {
+                                id: notif_id,
+                                notification_type: "reaction".to_string(),
+                                message_id: envelope.header.message_id.0.clone(),
+                                sender_id: envelope.header.sender_id.clone(),
+                                created_at: now,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Process a successfully decoded message event: store it, handle attachments,
+/// create notifications, and broadcast WsEvents.  Returns `true` if stored.
+async fn process_message_event(
+    state: &SharedState,
+    envelope: &crate::protocol::Envelope,
+    message: &crate::client::ClientMessage,
+    my_peer_id: &str,
+    now: u64,
+) -> bool {
+    let st = state.lock().await;
+
+    // Deduplication at the DB level.
+    if st.storage.has_message(&message.message_id).unwrap_or(true) {
+        return false;
+    }
+
+    let sender_id = &envelope.header.sender_id;
+    let kind_str = match envelope.header.message_kind {
+        MessageKind::Public => "public",
+        MessageKind::Direct => "direct",
+        MessageKind::FriendGroup => "friend_group",
+        MessageKind::Meta => "meta",
+        MessageKind::StoreForPeer => "store_for_peer",
+    };
+
+    // Check for special message types that should not appear in the timeline.
+    // These must be handled by process_meta_event / process_raw_meta_event above.
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&message.body) {
+        let msg_type = parsed.get("type").and_then(|t| t.as_str());
+        if msg_type == Some("tenet.profile") {
+            drop(st);
+            process_profile_update(state, sender_id, &envelope.header.timestamp, &parsed).await;
+            return false;
+        }
+        if msg_type == Some("group_key_distribution") {
+            return false;
+        }
+    }
+
+    // Update last_seen_online for the sender.
+    if let Ok(Some(_)) = st.storage.get_peer(sender_id) {
+        let _ = st
+            .storage
+            .update_peer_online(sender_id, false, envelope.header.timestamp);
+    }
+
+    crate::tlog!(
+        "sync: received {} message from {} (id={})",
+        kind_str,
+        crate::logging::peer_id(sender_id),
+        crate::logging::msg_id(&message.message_id)
+    );
+
+    let row = crate::storage::MessageRow {
+        message_id: message.message_id.clone(),
+        sender_id: sender_id.clone(),
+        recipient_id: my_peer_id.to_string(),
+        message_kind: kind_str.to_string(),
+        group_id: envelope.header.group_id.clone(),
+        body: Some(message.body.clone()),
+        timestamp: message.timestamp,
+        received_at: now,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        is_read: false,
+        raw_envelope: None,
+        reply_to: envelope.header.reply_to.clone(),
+    };
+
+    if st.storage.insert_message(&row).is_err() {
+        return false;
+    }
+
+    // Store any inline attachment data.
+    for (i, att_ref) in envelope.payload.attachments.iter().enumerate() {
+        if let Some(ref data_b64) = att_ref.data {
+            if let Ok(data) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64) {
+                let att_row = crate::storage::AttachmentRow {
+                    content_hash: att_ref.content_id.0.clone(),
+                    content_type: att_ref.content_type.clone(),
+                    size_bytes: att_ref.size,
+                    data,
+                    created_at: now,
+                };
+                let _ = st.storage.insert_attachment(&att_row);
+                let _ =
+                    st.storage
+                        .insert_message_attachment(&crate::storage::MessageAttachmentRow {
+                            message_id: message.message_id.clone(),
+                            content_hash: att_ref.content_id.0.clone(),
+                            filename: att_ref.filename.clone(),
+                            position: i as u32,
+                        });
+            }
+        }
+    }
+
+    let _ = st.ws_tx.send(WsEvent::NewMessage {
+        message_id: message.message_id.clone(),
+        sender_id: sender_id.clone(),
+        message_kind: kind_str.to_string(),
+        body: row.body.clone(),
+        timestamp: message.timestamp,
+        reply_to: row.reply_to.clone(),
+    });
+
+    // Create notifications for direct messages and replies.
+    let notification_type = if row.reply_to.is_some() {
+        if let Some(ref parent_id) = row.reply_to {
+            if let Ok(Some(parent_msg)) = st.storage.get_message(parent_id) {
+                if parent_msg.sender_id == my_peer_id {
+                    Some("reply")
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else if kind_str == "direct" {
+        Some("direct_message")
+    } else {
+        None
+    };
+
+    if let Some(notif_type) = notification_type {
+        let notif = crate::storage::NotificationRow {
+            id: 0,
+            notification_type: notif_type.to_string(),
+            message_id: message.message_id.clone(),
+            sender_id: sender_id.clone(),
+            created_at: now,
+            seen: false,
+            read: false,
+        };
+        if let Ok(notif_id) = st.storage.insert_notification(&notif) {
+            let _ = st.ws_tx.send(WsEvent::Notification {
+                id: notif_id,
+                notification_type: notif_type.to_string(),
+                message_id: message.message_id.clone(),
+                sender_id: sender_id.clone(),
+                created_at: now,
+            });
+        }
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Friend request / accept helpers (unchanged logic, now called from above)
+// ---------------------------------------------------------------------------
 
 /// Process an incoming friend request meta message.
 #[allow(clippy::too_many_arguments)]
@@ -494,7 +528,7 @@ async fn process_incoming_friend_request(
                 .update_friend_request_status(out_req.id, "accepted");
 
             // Add peer as friend
-            let peer_row = PeerRow {
+            let peer_row = crate::storage::PeerRow {
                 peer_id: from_peer_id.to_string(),
                 display_name: None,
                 signing_public_key: signing_public_key.to_string(),
@@ -507,7 +541,6 @@ async fn process_incoming_friend_request(
             let _ = st.storage.insert_peer(&peer_row);
 
             // Send FriendAccept back so the other peer also completes the handshake
-            drop(st);
             {
                 let meta_msg = MetaMessage::FriendAccept {
                     peer_id: keypair.id.clone(),
@@ -543,7 +576,6 @@ async fn process_incoming_friend_request(
                     }
                 }
             }
-            let st = state.lock().await;
             let _ = st.ws_tx.send(WsEvent::FriendRequestAccepted {
                 request_id: out_req.id,
                 from_peer_id: from_peer_id.to_string(),
@@ -606,7 +638,7 @@ async fn process_incoming_friend_request(
     }
 
     // No existing request — create a new one
-    let fr_row = FriendRequestRow {
+    let fr_row = crate::storage::FriendRequestRow {
         id: 0,
         from_peer_id: from_peer_id.to_string(),
         to_peer_id: keypair.id.clone(),
@@ -627,7 +659,7 @@ async fn process_incoming_friend_request(
             });
 
             // Create notification for friend request
-            let notif = NotificationRow {
+            let notif = crate::storage::NotificationRow {
                 id: 0,
                 notification_type: "friend_request".to_string(),
                 message_id: format!("friend_request_{}", request_id),
@@ -695,7 +727,7 @@ async fn process_friend_accept(
     if let Some(pending) = requests.iter().find(|r| r.to_peer_id == from_peer_id) {
         let req_id = pending.id;
         let _ = st.storage.update_friend_request_status(req_id, "accepted");
-        let peer_row = PeerRow {
+        let peer_row = crate::storage::PeerRow {
             peer_id: from_peer_id.to_string(),
             display_name: None,
             signing_public_key,
@@ -745,6 +777,7 @@ async fn process_profile_update(
     header_timestamp: &u64,
     parsed: &serde_json::Value,
 ) {
+    let st = state.lock().await;
     let profile_user_id = parsed
         .get("user_id")
         .and_then(|v| v.as_str())
@@ -755,7 +788,7 @@ async fn process_profile_update(
         .and_then(|v| v.as_u64())
         .unwrap_or(*header_timestamp);
 
-    let profile_row = ProfileRow {
+    let profile_row = crate::storage::ProfileRow {
         user_id: profile_user_id.clone(),
         display_name: parsed
             .get("display_name")
@@ -780,7 +813,6 @@ async fn process_profile_update(
         updated_at,
     };
 
-    let st = state.lock().await;
     match st.storage.upsert_profile_if_newer(&profile_row) {
         Ok(true) => {
             crate::tlog!(
@@ -800,12 +832,14 @@ async fn process_profile_update(
                     }
                 }
             }
-            let _ = st.ws_tx.send(crate::web_client::state::WsEvent::ProfileUpdated {
-                peer_id: profile_user_id.clone(),
-                display_name: profile_row.display_name.clone(),
-                bio: profile_row.bio.clone(),
-                avatar_hash: profile_row.avatar_hash.clone(),
-            });
+            let _ = st
+                .ws_tx
+                .send(crate::web_client::state::WsEvent::ProfileUpdated {
+                    peer_id: profile_user_id.clone(),
+                    display_name: profile_row.display_name.clone(),
+                    bio: profile_row.bio.clone(),
+                    avatar_hash: profile_row.avatar_hash.clone(),
+                });
         }
         Ok(false) => {
             crate::tlog!(

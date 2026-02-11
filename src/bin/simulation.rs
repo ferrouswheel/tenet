@@ -539,7 +539,6 @@ fn format_log_entry(entry: &LogEntry) -> Line<'static> {
     ])
 }
 
-
 fn format_duration(seconds: f64) -> String {
     let total_seconds = seconds.max(0.0).round() as u64;
     let hours = total_seconds / 3600;

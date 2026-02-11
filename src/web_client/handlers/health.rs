@@ -44,7 +44,10 @@ pub async fn sync_now_handler(State(state): State<SharedState>) -> impl IntoResp
                     relay_url,
                 });
             }
-            (StatusCode::OK, axum::Json(serde_json::json!({"status": "ok"})))
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"status": "ok"})),
+            )
         }
         Err(e) => {
             let st = state.lock().await;

@@ -109,7 +109,7 @@ fn header_roundtrips_and_validates_message_kinds() {
             ttl_seconds: 3_600,
             payload_size: 128,
             reply_to: None,
-        signature: None,
+            signature: None,
         };
         header.signature = Some(
             header
