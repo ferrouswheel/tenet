@@ -393,11 +393,10 @@ pub async fn send_group_handler(
 
     // Build envelope (CPU-only, no lock needed)
     let aad = req.group_id.as_bytes();
-    let mut payload =
-        match build_group_message_payload(req.body.as_bytes(), &group_key, aad) {
-            Ok(p) => p,
-            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
-        };
+    let mut payload = match build_group_message_payload(req.body.as_bytes(), &group_key, aad) {
+        Ok(p) => p,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
+    };
     payload.attachments = attachment_refs;
 
     let envelope = match build_envelope_from_payload(
@@ -517,8 +516,7 @@ fn build_attachment_refs(
         .iter()
         .filter_map(|att| {
             let row = storage.get_attachment(&att.content_hash).ok()??;
-            let data_b64 =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&row.data);
+            let data_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&row.data);
             Some(AttachmentRef {
                 content_id: ContentId(row.content_hash),
                 content_type: row.content_type,

@@ -61,10 +61,7 @@ pub async fn count_notifications_handler(State(state): State<SharedState>) -> Re
 }
 
 /// POST /api/notifications/:id/read - Mark a notification as read.
-pub async fn mark_read_handler(
-    State(state): State<SharedState>,
-    Path(id): Path<i64>,
-) -> Response {
+pub async fn mark_read_handler(State(state): State<SharedState>, Path(id): Path<i64>) -> Response {
     let st = state.lock().await;
 
     match st.storage.mark_notification_read(id) {
