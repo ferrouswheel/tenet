@@ -261,16 +261,30 @@ pub enum SyncEventOutcome {
 ///
 /// All methods have default no-op implementations so callers only override
 /// what they need.
+///
+/// `on_message`, `on_meta`, and `on_raw_meta` return a `Vec<Envelope>` of
+/// outgoing envelopes the caller should send (e.g. auto-accept replies).
+/// The caller is responsible for routing them via whatever transport is
+/// appropriate (HTTP relay, simulation channel, etc.).
 pub trait MessageHandler: Send {
     /// Called for each successfully verified and decrypted message.
-    fn on_message(&mut self, _envelope: &Envelope, _message: &ClientMessage) {}
+    /// Returns any outgoing envelopes to be sent by the caller.
+    fn on_message(&mut self, _envelope: &Envelope, _message: &ClientMessage) -> Vec<Envelope> {
+        Vec::new()
+    }
 
     /// Called for each structured meta-message (Online, Ack, FriendRequest, etc.).
-    fn on_meta(&mut self, _meta: &MetaMessage) {}
+    /// Returns any outgoing envelopes to be sent by the caller.
+    fn on_meta(&mut self, _meta: &MetaMessage) -> Vec<Envelope> {
+        Vec::new()
+    }
 
     /// Called for raw meta payloads that couldn't be parsed as `MetaMessage`.
     /// The body string is the raw payload for custom dispatch (reactions, etc.).
-    fn on_raw_meta(&mut self, _envelope: &Envelope, _body: &str) {}
+    /// Returns any outgoing envelopes to be sent by the caller.
+    fn on_raw_meta(&mut self, _envelope: &Envelope, _body: &str) -> Vec<Envelope> {
+        Vec::new()
+    }
 
     /// Called when a message is rejected (bad signature, unknown sender, etc.).
     fn on_rejected(&mut self, _envelope: &Envelope, _reason: &str) {}
@@ -948,14 +962,18 @@ impl RelayClient {
                 let outcome = match decode_meta_payload(&envelope.payload) {
                     Ok(meta) => {
                         if let Some(ref mut h) = handler {
-                            h.on_meta(&meta);
+                            for env in h.on_meta(&meta) {
+                                let _ = self.post_envelope(&env);
+                            }
                         }
                         SyncEventOutcome::Meta(meta)
                     }
                     Err(_) => {
                         let body = envelope.payload.body.clone();
                         if let Some(ref mut h) = handler {
-                            h.on_raw_meta(&envelope, &body);
+                            for env in h.on_raw_meta(&envelope, &body) {
+                                let _ = self.post_envelope(&env);
+                            }
                         }
                         SyncEventOutcome::RawMeta { body }
                     }
@@ -1030,7 +1048,9 @@ impl RelayClient {
                     self.feed.push(message.clone());
                     messages.push(message.clone());
                     if let Some(ref mut h) = handler {
-                        h.on_message(&envelope, &message);
+                        for env in h.on_message(&envelope, &message) {
+                            let _ = self.post_envelope(&env);
+                        }
                     }
                     events.push(SyncEvent {
                         envelope,
@@ -1223,7 +1243,7 @@ impl Client for RelayClient {
         envelopes: Vec<Envelope>,
         _context: &mut ClientContext<'_>,
         _rolling_latency: Option<&mut RollingLatencyTracker>,
-    ) -> usize {
+    ) -> ClientInboxOutcome {
         let mut received = 0usize;
         for envelope in envelopes {
             if self.seen.contains(&envelope.header.message_id.0) {
@@ -1245,7 +1265,10 @@ impl Client for RelayClient {
                 Err(_) => continue,
             }
         }
-        received
+        ClientInboxOutcome {
+            received,
+            outgoing: Vec::new(),
+        }
     }
 
     fn announce_online(&mut self, _step: usize, _context: &mut ClientContext<'_>) -> Vec<Envelope> {
@@ -1362,6 +1385,14 @@ pub(crate) struct ClientBroadcastOutcome {
     pub delivered_missed: usize,
 }
 
+pub(crate) struct ClientInboxOutcome {
+    /// Number of messages successfully received and stored.
+    pub received: usize,
+    /// Outgoing envelopes produced by the handler (e.g. auto-accept replies)
+    /// that the caller should route via its transport.
+    pub outgoing: Vec<Envelope>,
+}
+
 pub(crate) trait Client: Send {
     fn id(&self) -> &str;
     fn is_online(&self, step: usize) -> bool;
@@ -1384,7 +1415,7 @@ pub(crate) trait Client: Send {
         envelopes: Vec<Envelope>,
         context: &mut ClientContext<'_>,
         rolling_latency: Option<&mut RollingLatencyTracker>,
-    ) -> usize;
+    ) -> ClientInboxOutcome;
 
     fn announce_online(&mut self, step: usize, context: &mut ClientContext<'_>) -> Vec<Envelope>;
 
@@ -1414,7 +1445,6 @@ pub(crate) trait Client: Send {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
-#[derive(Clone)]
 pub struct SimulationClient {
     id: String,
     schedule: Vec<bool>,
@@ -1430,6 +1460,29 @@ pub struct SimulationClient {
     public_message_cache: Vec<Envelope>,
     public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
     group_manager: GroupManager,
+    handler: Option<Box<dyn MessageHandler>>,
+}
+
+impl Clone for SimulationClient {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            schedule: self.schedule.clone(),
+            online_state: self.online_state,
+            inbox: self.inbox.clone(),
+            seen: self.seen.clone(),
+            last_seen_by_peer: self.last_seen_by_peer.clone(),
+            pending_online_broadcasts: self.pending_online_broadcasts.clone(),
+            stored_forwards: self.stored_forwards.clone(),
+            metrics: self.metrics.clone(),
+            log_sink: self.log_sink.clone(),
+            peer_registry: self.peer_registry.clone(),
+            public_message_cache: self.public_message_cache.clone(),
+            public_message_metadata: self.public_message_metadata.clone(),
+            group_manager: self.group_manager.clone(),
+            handler: None, // handlers are not cloned
+        }
+    }
 }
 
 impl std::fmt::Debug for SimulationClient {
@@ -1455,6 +1508,7 @@ impl std::fmt::Debug for SimulationClient {
                 &self.public_message_metadata.len(),
             )
             .field("group_manager", &self.group_manager)
+            .field("has_handler", &self.handler.is_some())
             .finish()
     }
 }
@@ -1480,7 +1534,18 @@ impl SimulationClient {
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
             group_manager: GroupManager::new(),
+            handler: None,
         }
+    }
+
+    /// Register a handler that processes incoming messages and meta-events.
+    pub fn set_handler(&mut self, handler: Box<dyn MessageHandler>) {
+        self.handler = Some(handler);
+    }
+
+    /// Remove any registered handler.
+    pub fn clear_handler(&mut self) {
+        self.handler = None;
     }
 
     pub fn set_log_sink(&mut self, log_sink: Option<std::sync::Arc<dyn ClientLogSink>>) {
@@ -2263,6 +2328,7 @@ impl SimulationClient {
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
             group_manager: GroupManager::new(),
+            handler: None,
         }
     }
 }
@@ -2444,16 +2510,30 @@ impl Client for SimulationClient {
         envelopes: Vec<Envelope>,
         context: &mut ClientContext<'_>,
         mut rolling_latency: Option<&mut RollingLatencyTracker>,
-    ) -> usize {
+    ) -> ClientInboxOutcome {
         let mut received = 0usize;
+        let mut outgoing: Vec<Envelope> = Vec::new();
+
+        // Take handler out so we can mutate self while calling it.
+        let mut handler = self.handler.take();
+
         for envelope in envelopes {
             match self.decode_envelope_action(&envelope, &self.id, context) {
-                Some(IncomingEnvelopeAction::DirectMessage(message)) => {
+                Some(IncomingEnvelopeAction::DirectMessage(ref message)) => {
                     if let Some(latency) =
-                        self.apply_delivery(step, message, context, DeliveryKind::Inbox)
+                        self.apply_delivery(step, message.clone(), context, DeliveryKind::Inbox)
                     {
                         if let Some(tracker) = rolling_latency.as_deref_mut() {
                             tracker.record(latency);
+                        }
+                        if let Some(ref mut h) = handler {
+                            let client_msg = ClientMessage {
+                                message_id: message.id.clone(),
+                                sender_id: message.sender.clone(),
+                                timestamp: envelope.header.timestamp,
+                                body: message.body.clone(),
+                            };
+                            outgoing.extend(h.on_message(&envelope, &client_msg));
                         }
                         received = received.saturating_add(1);
                     }
@@ -2464,7 +2544,9 @@ impl Client for SimulationClient {
                 None => {}
             }
         }
-        received
+
+        self.handler = handler;
+        ClientInboxOutcome { received, outgoing }
     }
 
     fn announce_online(&mut self, step: usize, context: &mut ClientContext<'_>) -> Vec<Envelope> {

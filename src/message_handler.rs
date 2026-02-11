@@ -22,11 +22,13 @@ use crate::crypto::StoredKeypair;
 use crate::protocol::{
     build_envelope_from_payload, build_meta_payload, Envelope, MessageKind, MetaMessage,
 };
-use crate::relay_transport::post_envelope;
 use crate::storage::{
     AttachmentRow, FriendRequestRow, MessageAttachmentRow, MessageRow, NotificationRow, PeerRow,
     ProfileRow, ReactionRow, Storage,
 };
+
+/// Default TTL for outgoing envelopes produced by the handler (e.g. auto-accept).
+const HANDLER_DEFAULT_TTL_SECONDS: u64 = 3600;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -47,7 +49,6 @@ fn now_secs() -> u64 {
 pub struct StorageMessageHandler {
     storage: Storage,
     keypair: StoredKeypair,
-    relay_url: Option<String>,
     my_peer_id: String,
 }
 
@@ -57,14 +58,11 @@ impl StorageMessageHandler {
     /// * `storage` — SQLite storage to write into.
     /// * `keypair` — Local keypair; used to sign outgoing envelopes (e.g.
     ///   auto-accept friend requests).
-    /// * `relay_url` — Relay to post replies to.  `None` disables outgoing
-    ///   posts (reactions, auto-accepts, etc. are still stored locally).
-    pub fn new(storage: Storage, keypair: StoredKeypair, relay_url: Option<String>) -> Self {
+    pub fn new(storage: Storage, keypair: StoredKeypair) -> Self {
         let my_peer_id = keypair.id.clone();
         Self {
             storage,
             keypair,
-            relay_url,
             my_peer_id,
         }
     }
@@ -105,7 +103,7 @@ impl StorageMessageHandler {
         encryption_public_key: &str,
         message: Option<String>,
         now: u64,
-    ) {
+    ) -> Option<Envelope> {
         crate::tlog!(
             "handler: received friend_request from {}",
             crate::logging::peer_id(from_peer_id)
@@ -118,7 +116,7 @@ impl StorageMessageHandler {
                     "handler: friend request from {} is a duplicate (already friends), ignoring",
                     crate::logging::peer_id(from_peer_id)
                 );
-                return;
+                return None;
             }
         }
 
@@ -131,7 +129,7 @@ impl StorageMessageHandler {
         if let Some(ref out_req) = outgoing {
             if out_req.status == "pending" {
                 // Auto-accept: mark our outgoing as accepted, add them as a friend,
-                // and send a FriendAccept envelope back.
+                // and return a FriendAccept envelope for the caller to send.
                 crate::tlog!(
                     "handler: mutual friend request detected with {} — auto-accepting",
                     crate::logging::peer_id(from_peer_id)
@@ -152,9 +150,7 @@ impl StorageMessageHandler {
                 };
                 let _ = self.storage.insert_peer(&peer_row);
 
-                // Post FriendAccept so the other peer completes the handshake.
-                self.post_friend_accept(from_peer_id, now);
-                return;
+                return self.build_friend_accept_envelope(from_peer_id, now);
             }
         }
 
@@ -171,7 +167,7 @@ impl StorageMessageHandler {
                     crate::logging::peer_id(from_peer_id),
                     ex.status
                 );
-                return;
+                return None;
             }
             if ex.status == "pending" {
                 let _ = self.storage.refresh_friend_request(
@@ -180,14 +176,14 @@ impl StorageMessageHandler {
                     signing_public_key,
                     encryption_public_key,
                 );
-                return;
+                return None;
             }
             if ex.status == "accepted" {
                 crate::tlog!(
                     "handler: friend request from {} already accepted, skipping",
                     crate::logging::peer_id(from_peer_id)
                 );
-                return;
+                return None;
             }
         }
 
@@ -231,6 +227,7 @@ impl StorageMessageHandler {
                 );
             }
         }
+        None
     }
 
     fn process_friend_accept(
@@ -301,17 +298,14 @@ impl StorageMessageHandler {
         }
     }
 
-    fn post_friend_accept(&self, to_peer_id: &str, now: u64) {
-        let Some(ref relay_url) = self.relay_url else {
-            return;
-        };
+    fn build_friend_accept_envelope(&self, to_peer_id: &str, now: u64) -> Option<Envelope> {
         let meta_msg = MetaMessage::FriendAccept {
             peer_id: self.keypair.id.clone(),
             signing_public_key: self.keypair.signing_public_key_hex.clone(),
             encryption_public_key: self.keypair.public_key_hex.clone(),
         };
         let Ok(payload) = build_meta_payload(&meta_msg) else {
-            return;
+            return None;
         };
         let Ok(env) = build_envelope_from_payload(
             self.keypair.id.clone(),
@@ -319,32 +313,25 @@ impl StorageMessageHandler {
             None,
             None,
             now,
-            crate::web_client::config::DEFAULT_TTL_SECONDS,
+            HANDLER_DEFAULT_TTL_SECONDS,
             MessageKind::Meta,
             None,
             None,
             payload,
             &self.keypair.signing_private_key_hex,
         ) else {
-            return;
+            return None;
         };
-        if let Err(e) = post_envelope(relay_url, &env) {
-            crate::tlog!(
-                "handler: failed to send auto-accept to {}: {}",
-                crate::logging::peer_id(to_peer_id),
-                e
-            );
-        } else {
-            crate::tlog!(
-                "handler: sent auto-accept to {} via relay",
-                crate::logging::peer_id(to_peer_id)
-            );
-        }
+        crate::tlog!(
+            "handler: built auto-accept envelope for {}",
+            crate::logging::peer_id(to_peer_id)
+        );
+        Some(env)
     }
 }
 
 impl MessageHandler for StorageMessageHandler {
-    fn on_message(&mut self, envelope: &Envelope, message: &ClientMessage) {
+    fn on_message(&mut self, envelope: &Envelope, message: &ClientMessage) -> Vec<Envelope> {
         let now = now_secs();
 
         // Deduplication: skip if already stored.
@@ -353,7 +340,7 @@ impl MessageHandler for StorageMessageHandler {
             .has_message(&message.message_id)
             .unwrap_or(true)
         {
-            return;
+            return Vec::new();
         }
 
         // Update last_seen_online for the sender.
@@ -375,11 +362,11 @@ impl MessageHandler for StorageMessageHandler {
                     &envelope.header.timestamp,
                     &parsed,
                 );
-                return;
+                return Vec::new();
             }
             if msg_type == Some("group_key_distribution") {
                 // Group key distribution messages are not stored as timeline messages.
-                return;
+                return Vec::new();
             }
         }
 
@@ -459,10 +446,12 @@ impl MessageHandler for StorageMessageHandler {
                 let _ = self.storage.insert_notification(&notif);
             }
         }
+        Vec::new()
     }
 
-    fn on_meta(&mut self, meta: &MetaMessage) {
+    fn on_meta(&mut self, meta: &MetaMessage) -> Vec<Envelope> {
         let now = now_secs();
+        let mut outgoing = Vec::new();
         match meta {
             MetaMessage::Online { peer_id, timestamp } => {
                 let _ = self.storage.update_peer_online(peer_id, true, *timestamp);
@@ -481,13 +470,15 @@ impl MessageHandler for StorageMessageHandler {
                 encryption_public_key,
                 message,
             } => {
-                self.process_friend_request(
+                if let Some(env) = self.process_friend_request(
                     peer_id,
                     signing_public_key,
                     encryption_public_key,
                     message.clone(),
                     now,
-                );
+                ) {
+                    outgoing.push(env);
+                }
             }
             MetaMessage::FriendAccept {
                 peer_id,
@@ -505,9 +496,10 @@ impl MessageHandler for StorageMessageHandler {
                 // Not handled at the storage layer.
             }
         }
+        outgoing
     }
 
-    fn on_raw_meta(&mut self, envelope: &Envelope, body: &str) {
+    fn on_raw_meta(&mut self, envelope: &Envelope, body: &str) -> Vec<Envelope> {
         let now = now_secs();
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
             // Reactions: {"target_message_id": "...", "reaction": "upvote"|"downvote"}
@@ -555,7 +547,7 @@ impl MessageHandler for StorageMessageHandler {
                         }
                     }
                 }
-                return;
+                return Vec::new();
             }
 
             // Profile updates embedded in raw meta (legacy / forwarded).
@@ -567,6 +559,7 @@ impl MessageHandler for StorageMessageHandler {
                 );
             }
         }
+        Vec::new()
     }
 }
 
@@ -670,7 +663,7 @@ mod tests {
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
-        let mut handler = StorageMessageHandler::new(storage, bob.clone(), None);
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
 
         // Build a simple plaintext direct message from Alice to Bob.
         let salt = [0u8; 16];
@@ -722,7 +715,7 @@ mod tests {
         let bob = generate_keypair();
 
         let storage = open_memory_storage();
-        let mut handler = StorageMessageHandler::new(storage, bob.clone(), None);
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
 
         let salt = [0u8; 16];
         let envelope = build_plaintext_envelope(
@@ -776,7 +769,7 @@ mod tests {
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
-        let mut handler = StorageMessageHandler::new(storage, bob.clone(), None);
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
 
         let meta = MetaMessage::Online {
             peer_id: alice.id.clone(),
@@ -828,7 +821,7 @@ mod tests {
         };
         storage.insert_message(&target_msg).expect("insert target");
 
-        let mut handler = StorageMessageHandler::new(storage, bob.clone(), None);
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
 
         // Build a raw-meta reaction envelope from Alice.
         let reaction_body = r#"{"target_message_id":"target-msg-001","reaction":"upvote"}"#;

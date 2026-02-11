@@ -801,7 +801,10 @@ impl EventBasedHarness {
                 metrics_tracker: &mut self.metrics_tracker,
             };
 
-            client.handle_inbox(step, envelopes, &mut context, None);
+            let outcome = client.handle_inbox(step, envelopes, &mut context, None);
+            for env in outcome.outgoing {
+                let _ = post_envelope(&self.relay_base_url, &env).await;
+            }
         }
 
         // Schedule next poll if still online (default: 60 seconds)
