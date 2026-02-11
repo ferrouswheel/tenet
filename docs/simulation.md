@@ -411,6 +411,8 @@ When running `tenet-sim --tui`, use these keys to control the simulation:
 - `f`: add a friendship (enter two peer ids separated by space or comma).
 - `+` / `=`: speed up simulated time.
 - `-`: slow down simulated time.
+- `↑` / `↓`: scroll the activity log up or down one line.
+- `PgUp` / `PgDn`: scroll the activity log up or down ten lines.
 - `q`: quit once the simulation has finished.
 
 ### Manual TUI test

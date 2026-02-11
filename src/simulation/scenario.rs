@@ -115,6 +115,7 @@ pub async fn run_event_based_scenario(
         scenario.simulation.reaction_config.clone(),
         None,
         None,
+        None,
         scenario.simulation.seed,
     );
 
@@ -142,7 +143,8 @@ pub async fn run_event_based_scenario_with_tui<F>(
     scenario: SimulationScenarioConfig,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<super::SimulationControlCommand>,
     relay_config_override: crate::relay::RelayConfig,
-    log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+    log_sink: Option<std::sync::Arc<dyn Fn(super::LogEntry) + Send + Sync>>,
+    relay_time_sync: Option<std::sync::Arc<std::sync::Mutex<f64>>>,
     mut on_progress: F,
 ) -> Result<SimulationReport, String>
 where
@@ -183,6 +185,7 @@ where
         scenario.simulation.reaction_config.clone(),
         log_sink,
         Some(relay_control),
+        relay_time_sync,
         scenario.simulation.seed,
     );
 

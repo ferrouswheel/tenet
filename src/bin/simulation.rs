@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode};
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tenet::crypto::generate_keypair;
 use tenet::protocol::MessageKind;
 use tenet::simulation::{
-    CountSummary, RollingLatencySnapshot, SimulationAggregateMetrics, SimulationClient,
+    CountSummary, LogEntry, RollingLatencySnapshot, SimulationAggregateMetrics, SimulationClient,
     SimulationControlCommand, SimulationScenarioConfig, SimulationStepUpdate, SizeSummary,
 };
 
@@ -82,7 +82,7 @@ async fn main() -> Result<(), String> {
 async fn run_with_tui(
     scenario: SimulationScenarioConfig,
 ) -> Result<tenet::simulation::SimulationReport, String> {
-    const RELAY_LOG_LIMIT: usize = 200;
+    const LOG_LIMIT: usize = 500;
     const SPEED_STEP: f64 = 0.10;
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
@@ -92,16 +92,35 @@ async fn run_with_tui(
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let (relay_log_tx, mut relay_log_rx) = mpsc::unbounded_channel();
-    let (sim_log_tx, mut sim_log_rx) = mpsc::unbounded_channel();
+    // Single combined log channel for all sources (sim, relay, peers).
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+
+    // Shared clock: the relay log sink reads it to stamp entries with the current
+    // sim time.  The harness updates it right after every clock jump (before
+    // processing events), so relay HTTP calls see the correct sim time.
+    let relay_sim_time: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+
     let mut relay_config = scenario.relay.clone().into_relay_config();
-    relay_config.log_sink = Some(Arc::new(move |line: String| {
-        let _ = relay_log_tx.send(line);
-    }));
-    let sim_log_sink = Arc::new(move |line: String| {
-        let _ = sim_log_tx.send(line);
-    });
+    {
+        let relay_sim_time = relay_sim_time.clone();
+        let log_tx = log_tx.clone();
+        relay_config.log_sink = Some(Arc::new(move |line: String| {
+            let sim_t = *relay_sim_time.lock().unwrap();
+            let message = line.strip_prefix("relay: ").unwrap_or(&line).to_string();
+            let _ = log_tx.send(LogEntry {
+                sim_time: sim_t,
+                source: "relay".to_string(),
+                message,
+            });
+        }));
+    }
+    let sim_log_sink: Arc<dyn Fn(LogEntry) + Send + Sync> = {
+        let log_tx = log_tx.clone();
+        Arc::new(move |entry: LogEntry| {
+            let _ = log_tx.send(entry);
+        })
+    };
     let scenario_for_task = scenario.clone();
     // For event-based simulation, total_steps is the duration in seconds
     let total_duration_seconds = scenario.simulation.duration_seconds.unwrap_or_else(|| {
@@ -115,6 +134,7 @@ async fn run_with_tui(
             control_rx,
             relay_config,
             Some(sim_log_sink),
+            Some(relay_sim_time),
             |update| {
                 let _ = tx.send(update);
             },
@@ -141,8 +161,15 @@ async fn run_with_tui(
         }
     });
 
-    let mut relay_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
-    let mut sim_logs: VecDeque<String> = VecDeque::with_capacity(RELAY_LOG_LIMIT);
+    let mut log_entries: VecDeque<LogEntry> = VecDeque::with_capacity(LOG_LIMIT);
+    // None = auto-tail (follow new entries).
+    // Some(n) = anchored: first visible entry is at sorted index n. New
+    //           entries do not move the view. Reverts to None when the user
+    //           scrolls back to the bottom.
+    let mut log_scroll: Option<usize> = None;
+    // Last known first-visible-line index, updated by every render call so
+    // that Up/PgUp know where to anchor from when coming out of auto-tail.
+    let mut log_view_start: usize = 0;
     let mut input_mode = InputMode::Normal;
     let mut status_message = "Simulation running.".to_string();
     let mut auto_peer_index = 1usize;
@@ -173,7 +200,8 @@ async fn run_with_tui(
         &mut terminal,
         &current_update,
         &[],
-        &[],
+        &mut log_scroll,
+        &mut log_view_start,
         &status_message,
         paused,
         base_seconds_per_step,
@@ -189,8 +217,9 @@ async fn run_with_tui(
                         render(
                             &mut terminal,
                             &current_update,
-                            sim_logs.make_contiguous(),
-                            relay_logs.make_contiguous(),
+                            log_entries.make_contiguous(),
+                            &mut log_scroll,
+                            &mut log_view_start,
                             &status_message,
                             paused,
                             base_seconds_per_step,
@@ -200,45 +229,25 @@ async fn run_with_tui(
                     None => break,
                 }
             }
-            sim_log_line = sim_log_rx.recv() => {
-                if let Some(line) = sim_log_line {
-                    if sim_logs.len() == RELAY_LOG_LIMIT {
-                        sim_logs.pop_front();
+            log_entry = log_rx.recv() => {
+                if let Some(entry) = log_entry {
+                    if log_entries.len() == LOG_LIMIT {
+                        log_entries.pop_front();
                     }
-                    sim_logs.push_back(line);
+                    log_entries.push_back(entry);
                     render(
                         &mut terminal,
                         &current_update,
-                        sim_logs.make_contiguous(),
-                        relay_logs.make_contiguous(),
+                        log_entries.make_contiguous(),
+                        &mut log_scroll,
+                        &mut log_view_start,
                         &status_message,
                         paused,
                         base_seconds_per_step,
                     )
                     .map_err(|err| err.to_string())?;
                 }
-                // Don't break here - let the main rx.recv() handle loop exit
-                // to ensure we drain any pending progress updates
-            }
-            relay_log_line = relay_log_rx.recv() => {
-                if let Some(line) = relay_log_line {
-                    if relay_logs.len() == RELAY_LOG_LIMIT {
-                        relay_logs.pop_front();
-                    }
-                    relay_logs.push_back(line);
-                    render(
-                        &mut terminal,
-                        &current_update,
-                        sim_logs.make_contiguous(),
-                        relay_logs.make_contiguous(),
-                        &status_message,
-                        paused,
-                        base_seconds_per_step,
-                    )
-                    .map_err(|err| err.to_string())?;
-                }
-                // Don't break here - let the main rx.recv() handle loop exit
-                // to ensure we drain any pending progress updates
+                // Don't break here - let the main rx.recv() handle loop exit.
             }
             input_event = input_rx.recv() => {
                 if let Some(Event::Key(key)) = input_event {
@@ -251,6 +260,8 @@ async fn run_with_tui(
                         total_duration_seconds as usize,
                         SPEED_STEP,
                         &mut paused,
+                        &mut log_scroll,
+                        log_view_start,
                     );
                     if action == InputAction::Quit {
                         let _ = control_tx.send(SimulationControlCommand::Stop);
@@ -260,8 +271,9 @@ async fn run_with_tui(
                     render(
                         &mut terminal,
                         &current_update,
-                        sim_logs.make_contiguous(),
-                        relay_logs.make_contiguous(),
+                        log_entries.make_contiguous(),
+                        &mut log_scroll,
+                        &mut log_view_start,
                         &status_message,
                         paused,
                         base_seconds_per_step,
@@ -272,22 +284,64 @@ async fn run_with_tui(
         }
     }
 
-    // Simulation has finished (rx closed)
-    // Update status for final display
+    // Simulation has finished (rx closed). Drain any remaining log entries.
+    while let Ok(entry) = log_rx.try_recv() {
+        if log_entries.len() == LOG_LIMIT {
+            log_entries.pop_front();
+        }
+        log_entries.push_back(entry);
+    }
     status_message = "Simulation complete. Press q to exit.".to_string();
     render(
         &mut terminal,
         &current_update,
-        sim_logs.make_contiguous(),
-        relay_logs.make_contiguous(),
+        log_entries.make_contiguous(),
+        &mut log_scroll,
+        &mut log_view_start,
         &status_message,
         paused,
         base_seconds_per_step,
     )
     .map_err(|err| err.to_string())?;
-    wait_for_quit(&mut input_rx)
-        .await
+
+    // Post-simulation event loop: scroll the log and quit on q.
+    loop {
+        match input_rx.recv().await {
+            Some(Event::Key(key)) => match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Up => {
+                    log_scroll = Some(log_view_start.saturating_sub(1));
+                }
+                KeyCode::Down => {
+                    if let Some(n) = log_scroll {
+                        log_scroll = Some(n.saturating_add(1));
+                    }
+                }
+                KeyCode::PageUp => {
+                    log_scroll = Some(log_view_start.saturating_sub(10));
+                }
+                KeyCode::PageDown => {
+                    if let Some(n) = log_scroll {
+                        log_scroll = Some(n.saturating_add(10));
+                    }
+                }
+                _ => continue,
+            },
+            _ => continue,
+        }
+        render(
+            &mut terminal,
+            &current_update,
+            log_entries.make_contiguous(),
+            &mut log_scroll,
+            &mut log_view_start,
+            &status_message,
+            paused,
+            base_seconds_per_step,
+        )
         .map_err(|err| err.to_string())?;
+    }
+
     input_shutdown.store(true, Ordering::SeqCst);
     let _ = input_handle.await;
 
@@ -303,8 +357,9 @@ async fn run_with_tui(
 fn render(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     update: &SimulationStepUpdate,
-    sim_logs: &[String],
-    relay_logs: &[String],
+    log_entries: &[LogEntry],
+    log_scroll: &mut Option<usize>,
+    log_view_start: &mut usize,
     status: &str,
     paused: bool,
     _base_seconds_per_step: f64,
@@ -387,43 +442,46 @@ fn render(
             );
             frame.render_widget(aggregate_block, chunks[2]);
 
-            let log_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[3]);
-
-            let sim_lines = sim_logs
-                .iter()
-                .rev()
-                .take(log_chunks[0].height.saturating_sub(2) as usize)
-                .cloned()
-                .collect::<Vec<_>>();
-            let sim_lines = sim_lines
-                .into_iter()
-                .rev()
-                .map(Line::from)
-                .collect::<Vec<_>>();
-            let sim_block = Paragraph::new(sim_lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Simulation Logs"),
-            );
-            frame.render_widget(sim_block, log_chunks[0]);
-
-            let relay_lines = relay_logs
-                .iter()
-                .rev()
-                .take(log_chunks[1].height.saturating_sub(2) as usize)
-                .cloned()
-                .collect::<Vec<_>>();
-            let relay_lines = relay_lines
-                .into_iter()
-                .rev()
-                .map(Line::from)
-                .collect::<Vec<_>>();
-            let relay_block = Paragraph::new(relay_lines)
-                .block(Block::default().borders(Borders::ALL).title("Relay Logs"));
-            frame.render_widget(relay_block, log_chunks[1]);
+            // Combined activity log with scroll support.
+            // Sort by sim_time so that relay entries (which arrive with a lag
+            // relative to the fast-forwarding simulator) appear at the correct
+            // chronological position rather than at the end of the visible window.
+            let mut sorted: Vec<&LogEntry> = log_entries.iter().collect();
+            sorted.sort_by(|a, b| {
+                a.sim_time
+                    .partial_cmp(&b.sim_time)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let visible_height = chunks[3].height.saturating_sub(2) as usize;
+            let total_entries = sorted.len();
+            // max_start: largest first-line index that still fills the view.
+            let max_start = total_entries.saturating_sub(visible_height);
+            let start_idx = match *log_scroll {
+                None => max_start, // auto-tail: show newest entries
+                Some(n) => {
+                    let clamped = n.min(max_start);
+                    if clamped >= max_start {
+                        // Scrolled back to the bottom — resume auto-tail.
+                        *log_scroll = None;
+                    } else {
+                        *log_scroll = Some(clamped);
+                    }
+                    clamped
+                }
+            };
+            *log_view_start = start_idx;
+            let end_idx = (start_idx + visible_height).min(total_entries);
+            let visible = &sorted[start_idx..end_idx];
+            let log_lines: Vec<Line> = visible.iter().map(|e| format_log_entry(e)).collect();
+            let lines_from_bottom = max_start.saturating_sub(start_idx);
+            let log_title = if lines_from_bottom > 0 {
+                format!("Activity Log  ↑{lines_from_bottom} lines  (↑/↓ PgUp/PgDn to scroll)")
+            } else {
+                "Activity Log  (↑/↓ PgUp/PgDn to scroll)".to_string()
+            };
+            let log_block = Paragraph::new(log_lines)
+                .block(Block::default().borders(Borders::ALL).title(log_title));
+            frame.render_widget(log_block, chunks[3]);
 
             let status_lines = vec![
                 Line::from(Span::raw(format!(
@@ -456,16 +514,31 @@ fn render(
         .map(|_| ())
 }
 
-async fn wait_for_quit(input_rx: &mut mpsc::UnboundedReceiver<Event>) -> io::Result<()> {
-    loop {
-        if let Some(Event::Key(key)) = input_rx.recv().await {
-            if key.code == KeyCode::Char('q') {
-                break;
-            }
-        }
-    }
-    Ok(())
+/// Format a single log entry as a coloured ratatui `Line`.
+///
+/// Layout: `t=NNNNN.N [SOURCE   ] message`
+/// - Relay entries are yellow, peer entries are cyan, sim entries are blue.
+fn format_log_entry(entry: &LogEntry) -> Line<'static> {
+    let time_part = format!("t={:>8.1}s ", entry.sim_time);
+    // Truncate long source names (e.g. very long peer IDs) to keep layout tidy.
+    let source_display = if entry.source.len() > 9 {
+        format!("{}… ", &entry.source[..8])
+    } else {
+        format!("{:<9} ", entry.source)
+    };
+    let source_part = format!("[{source_display}] ");
+    let source_color = match entry.source.as_str() {
+        "sim" => Color::Blue,
+        "relay" => Color::Yellow,
+        _ => Color::Cyan,
+    };
+    Line::from(vec![
+        Span::styled(time_part, Style::default().fg(Color::DarkGray)),
+        Span::styled(source_part, Style::default().fg(source_color)),
+        Span::raw(entry.message.clone()),
+    ])
 }
+
 
 fn format_duration(seconds: f64) -> String {
     let total_seconds = seconds.max(0.0).round() as u64;
@@ -569,12 +642,31 @@ fn handle_key_event(
     _total_steps: usize,
     speed_step: f64,
     paused: &mut bool,
+    log_scroll: &mut Option<usize>,
+    log_view_start: usize,
 ) -> InputAction {
     if key == KeyCode::Char('q') {
         return InputAction::Quit;
     }
     match input_mode {
         InputMode::Normal => match key {
+            KeyCode::Up => {
+                *log_scroll = Some(log_view_start.saturating_sub(1));
+            }
+            KeyCode::Down => {
+                if let Some(n) = *log_scroll {
+                    // render will revert to None (auto-tail) if this reaches max_start
+                    *log_scroll = Some(n.saturating_add(1));
+                }
+            }
+            KeyCode::PageUp => {
+                *log_scroll = Some(log_view_start.saturating_sub(10));
+            }
+            KeyCode::PageDown => {
+                if let Some(n) = *log_scroll {
+                    *log_scroll = Some(n.saturating_add(10));
+                }
+            }
             KeyCode::Char('a') => {
                 *input_mode = InputMode::AddPeer {
                     buffer: String::new(),

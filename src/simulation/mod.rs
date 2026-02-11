@@ -45,6 +45,21 @@ pub use scenario::{
 
 pub const SIMULATION_PAYLOAD_AAD: &[u8] = b"tenet-simulation";
 pub const SIMULATION_HPKE_INFO: &[u8] = b"tenet-simulation-hpke";
+
+/// A structured log entry emitted by the simulation harness and client peers.
+/// The relay emits these too, with an approximate simulation time read from a
+/// shared clock updated at each progress tick.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    /// Current simulated time in seconds when the event was logged.
+    pub sim_time: f64,
+    /// Source of the log: "sim" for harness events, "relay" for relay events,
+    /// or the peer ID for client-level events.
+    pub source: String,
+    /// The log message (without any prefix formatting).
+    pub message: String,
+}
+
 pub const SIMULATION_ACK_WINDOW_STEPS: usize = 10;
 pub const SIMULATION_HOURS_PER_DAY: usize = 24;
 pub const MESSAGE_KIND_SUMMARIES: [MessageKind; 5] = [
@@ -98,7 +113,7 @@ pub struct SimulationHarness {
     metrics: SimulationMetrics,
     metrics_tracker: MetricsTracker,
     timing: SimulationTimingConfig,
-    log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+    log_sink: Option<std::sync::Arc<dyn Fn(LogEntry) + Send + Sync>>,
     client_log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     relay_control: Option<RelayControl>,
 }
@@ -122,7 +137,7 @@ impl SimulationHarness {
         keypairs: HashMap<String, StoredKeypair>,
         timing: SimulationTimingConfig,
         cohort_online_rates: HashMap<String, f64>,
-        log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+        log_sink: Option<std::sync::Arc<dyn Fn(LogEntry) + Send + Sync>>,
         relay_control: Option<RelayControl>,
     ) -> Self {
         let planned_messages = 0;
@@ -136,10 +151,11 @@ impl SimulationHarness {
         let client_log_sink = log_sink.as_ref().map(|log_sink| {
             let log_sink = std::sync::Arc::clone(log_sink);
             std::sync::Arc::new(move |event: ClientLogEvent| {
-                log_sink(format!(
-                    "[sim step={}] {} {}",
-                    event.step, event.client_id, event.message
-                ));
+                log_sink(LogEntry {
+                    sim_time: event.step as f64,
+                    source: event.client_id.clone(),
+                    message: event.message.clone(),
+                });
             }) as std::sync::Arc<dyn ClientLogSink>
         });
         Self {
@@ -236,7 +252,11 @@ impl SimulationHarness {
 
     fn log_action(&self, step: usize, message: impl Into<String>) {
         if let Some(log_sink) = &self.log_sink {
-            log_sink(format!("[sim step={step}] {}", message.into()));
+            log_sink(LogEntry {
+                sim_time: step as f64,
+                source: "sim".to_string(),
+                message: message.into(),
+            });
         }
     }
 
@@ -410,9 +430,13 @@ pub struct EventBasedHarness {
     metrics_tracker: MetricsTracker,
     network_conditions: NetworkConditions,
     reaction_config: Option<ReactionConfig>,
-    log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+    log_sink: Option<std::sync::Arc<dyn Fn(LogEntry) + Send + Sync>>,
     client_log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     relay_control: Option<RelayControl>,
+    /// Shared clock the relay log sink reads to stamp relay entries with the
+    /// correct simulation time.  Updated immediately after every clock jump,
+    /// so relay HTTP calls see the right time even in fast-forward mode.
+    relay_time_sync: Option<std::sync::Arc<std::sync::Mutex<f64>>>,
     rng: rand::rngs::StdRng,
 }
 
@@ -430,8 +454,9 @@ impl EventBasedHarness {
         network_conditions: NetworkConditions,
         cohort_online_rates: HashMap<String, f64>,
         reaction_config: Option<ReactionConfig>,
-        log_sink: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+        log_sink: Option<std::sync::Arc<dyn Fn(LogEntry) + Send + Sync>>,
         relay_control: Option<RelayControl>,
+        relay_time_sync: Option<std::sync::Arc<std::sync::Mutex<f64>>>,
         seed: u64,
     ) -> Self {
         let mut neighbors: HashMap<String, Vec<String>> = HashMap::new();
@@ -444,10 +469,11 @@ impl EventBasedHarness {
         let client_log_sink = log_sink.as_ref().map(|log_sink| {
             let log_sink = std::sync::Arc::clone(log_sink);
             std::sync::Arc::new(move |event: ClientLogEvent| {
-                log_sink(format!(
-                    "[sim t={:.2}] {} {}",
-                    event.step as f64, event.client_id, event.message
-                ));
+                log_sink(LogEntry {
+                    sim_time: event.step as f64,
+                    source: event.client_id.clone(),
+                    message: event.message.clone(),
+                });
             }) as std::sync::Arc<dyn ClientLogSink>
         });
 
@@ -490,17 +516,26 @@ impl EventBasedHarness {
             log_sink,
             client_log_sink,
             relay_control,
+            relay_time_sync,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
+        }
+    }
+
+    /// Push the current simulation time into the shared relay clock so the
+    /// relay log sink can stamp its entries with the right sim time.
+    fn sync_relay_time(&self) {
+        if let Some(arc) = &self.relay_time_sync {
+            *arc.lock().unwrap() = self.clock.simulated_time;
         }
     }
 
     fn log_event(&self, message: impl Into<String>) {
         if let Some(log_sink) = &self.log_sink {
-            log_sink(format!(
-                "[sim t={:.2}] {}",
-                self.clock.simulated_time,
-                message.into()
-            ));
+            log_sink(LogEntry {
+                sim_time: self.clock.simulated_time,
+                source: "sim".to_string(),
+                message: message.into(),
+            });
         }
     }
 
@@ -548,6 +583,20 @@ impl EventBasedHarness {
                 &online_set,
                 &mut context,
             );
+
+            if !outcome.envelopes.is_empty() {
+                let kind = match message.message_kind {
+                    MessageKind::Direct => "direct",
+                    MessageKind::Public => "public",
+                    MessageKind::FriendGroup => "group",
+                    MessageKind::Meta => "meta",
+                    MessageKind::StoreForPeer => "store-for-peer",
+                };
+                self.log_event(format!(
+                    "Client {} -> {} ({})",
+                    sender_id, message.recipient, kind
+                ));
+            }
 
             // Post envelopes to relay
             for envelope in &outcome.envelopes {
@@ -819,6 +868,10 @@ impl EventBasedHarness {
 
         // Post forwarded messages to relay
         for envelope in forward_envelopes {
+            self.log_event(format!(
+                "Forwarding stored message: {} -> {}",
+                envelope.header.sender_id, envelope.header.recipient_id
+            ));
             let _ = post_envelope(&self.relay_base_url, &envelope).await;
         }
     }
@@ -1034,6 +1087,7 @@ impl EventBasedHarness {
                 _ => {
                     // No more events or past duration - send final progress update
                     self.clock.jump_to(duration_seconds);
+                    self.sync_relay_time();
                     let online_nodes = self
                         .clients
                         .values()
@@ -1070,6 +1124,7 @@ impl EventBasedHarness {
             match self.clock.mode {
                 TimeControlMode::FastForward => {
                     self.clock.jump_to(next_time);
+                    self.sync_relay_time();
                     // Yield to allow TUI and other tasks to process updates
                     tokio::task::yield_now().await;
                 }
@@ -1085,6 +1140,7 @@ impl EventBasedHarness {
                         }
                     }
                     self.clock.jump_to(next_time);
+                    self.sync_relay_time();
                 }
                 TimeControlMode::Paused => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
