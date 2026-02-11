@@ -73,40 +73,6 @@
                 </div>
             </div>
 
-            <!-- Friends list -->
-            <div class="friends-panel">
-                <h2>Friends</h2>
-                <div id="friends-list"></div>
-                <button class="add-friend-btn" onclick="toggleAddFriendForm()">+ Add Friend</button>
-            </div>
-
-            <!-- Add friend form (simplified - just peer ID + message) -->
-            <div id="add-friend-form" class="add-friend-form">
-                <h3>Send Friend Request</h3>
-                <input type="text" id="friend-peer-id" placeholder="Peer ID" />
-                <input type="text" id="friend-message" placeholder="Message (optional)" />
-                <div class="form-actions">
-                    <button class="btn-secondary" onclick="toggleAddFriendForm()">Cancel</button>
-                    <button class="btn-primary" onclick="sendFriendRequest()">Send Request</button>
-                </div>
-            </div>
-
-            <!-- Friend Requests panel -->
-            <div class="friend-requests-panel" id="friend-requests-panel">
-                <div class="friend-requests-header" onclick="toggleFriendRequests()">
-                    <h2>Friend Requests <span class="fr-badge" id="fr-pending-badge"></span></h2>
-                </div>
-                <div id="friend-requests-content" class="friend-requests-content visible">
-                    <div class="fr-tabs">
-                        <button class="fr-tab active" data-fr-tab="pending" onclick="switchFrTab('pending')">Pending</button>
-                        <button class="fr-tab" data-fr-tab="history" onclick="switchFrTab('history')">History</button>
-                    </div>
-                    <div class="fr-toggle-hidden">
-                        <label><input type="checkbox" id="fr-show-hidden" onchange="loadFriendRequests()"> Show blocked &amp; ignored</label>
-                    </div>
-                    <div id="friend-requests-list"></div>
-                </div>
-            </div>
         </div>
 
         <!-- Main content -->
@@ -203,6 +169,42 @@
                     <div class="form-actions">
                         <button class="btn-secondary" onclick="backFromProfile()">Cancel</button>
                         <button class="btn-primary" onclick="saveProfile()">Save</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Friends view -->
+            <div id="friends-view" class="friends-view">
+                <div class="friends-view-header">
+                    <h2>Friends</h2>
+                    <button class="add-friend-btn friends-view-add-btn" onclick="toggleAddFriendForm()">+ Add Friend</button>
+                </div>
+                <div id="add-friend-form" class="add-friend-form">
+                    <h3>Send Friend Request</h3>
+                    <input type="text" id="friend-peer-id" placeholder="Peer ID" />
+                    <input type="text" id="friend-message" placeholder="Message (optional)" />
+                    <div class="form-actions">
+                        <button class="btn-secondary" onclick="toggleAddFriendForm()">Cancel</button>
+                        <button class="btn-primary" onclick="sendFriendRequest()">Send Request</button>
+                    </div>
+                </div>
+                <div class="friends-page-layout">
+                    <div class="friends-page-list">
+                        <h3 class="friends-page-section-title">My Friends</h3>
+                        <div id="friends-list"></div>
+                    </div>
+                    <div class="friends-page-requests">
+                        <h3 class="friends-page-section-title">
+                            Friend Requests <span class="fr-badge" id="fr-pending-badge"></span>
+                        </h3>
+                        <div class="fr-tabs">
+                            <button class="fr-tab active" data-fr-tab="pending" onclick="switchFrTab('pending')">Pending</button>
+                            <button class="fr-tab" data-fr-tab="history" onclick="switchFrTab('history')">History</button>
+                        </div>
+                        <div class="fr-toggle-hidden">
+                            <label><input type="checkbox" id="fr-show-hidden" onchange="loadFriendRequests()"> Show blocked &amp; ignored</label>
+                        </div>
+                        <div id="friend-requests-list"></div>
                     </div>
                 </div>
             </div>

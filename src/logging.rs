@@ -80,12 +80,13 @@ pub fn peer_id(id: &str) -> String {
     }
 }
 
+const MSG_ID_COLOUR: &str = "\x1b[93m"; // bright yellow
+
 /// Format a message ID with consistent colour and truncation.
 pub fn msg_id(id: &str) -> String {
     let short = truncate_id(id);
     if colour_enabled() {
-        let colour = hash_colour(id);
-        format!("{colour}m-{short}{RESET}")
+        format!("{MSG_ID_COLOUR}m-{short}{RESET}")
     } else {
         format!("m-{short}")
     }

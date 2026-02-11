@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 let myPeerId = '';
 let currentFilter = 'public'; // 'public' or 'friend_group'
-let currentView = 'timeline'; // 'timeline', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
+let currentView = 'timeline'; // 'timeline', 'friends', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
 let messages = [];
 let oldestTimestamp = null;
 let ws = null;
@@ -23,6 +23,7 @@ let relayConnected = null; // null = unknown, true/false = status
 let notifications = []; // Phase 11
 let unseenNotificationCount = 0; // Phase 11 - resets to 0 when bell is clicked
 let notificationPanelOpen = false; // Phase 11
+let pendingFriendRequestHighlight = null; // peer ID to highlight on friends page
 const PAGE_SIZE = 50;
 const COMMENTS_PAGE_SIZE = 100;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -91,6 +92,8 @@ function handleRoute() {
         showConversationDetail(peerId, true);
     } else if (route === 'profile') {
         showMyProfile(true);
+    } else if (route === 'friends') {
+        showFriendsView(true);
     } else {
         // Default: timeline
         currentView = 'timeline';
@@ -393,6 +396,7 @@ function hideAllViews() {
     document.getElementById('post-detail').classList.remove('visible');
     document.getElementById('profile-view').classList.remove('visible');
     document.getElementById('profile-edit').classList.remove('visible');
+    document.getElementById('friends-view').classList.remove('visible');
     document.getElementById('compose-box').style.display = '';
     // Hide filters on non-timeline views
     document.querySelector('.filters').style.display = '';
@@ -1015,7 +1019,7 @@ function renderFriendRequests() {
             statusHtml = '<div class="fr-status ' + r.status + '">' + r.status.charAt(0).toUpperCase() + r.status.slice(1) + '</div>';
         }
 
-        return '<div class="fr-item" data-status="' + r.status + '">'
+        return '<div class="fr-item" data-status="' + r.status + '" data-fr-from="' + escapeHtml(otherPeerId) + '">'
             + '<div class="fr-item-header">'
             + '<span class="fr-direction">' + dirLabel + '</span> '
             + '<span class="fr-peer" title="' + escapeHtml(otherPeerId) + '">' + escapeHtml(shortId) + '</span>'
@@ -1382,13 +1386,39 @@ function navToGroups() {
 }
 
 function navToFriends() {
-    if (currentView !== 'timeline') {
-        navigateTo('timeline');
-    }
+    navigateTo('friends');
+}
+
+async function showFriendsView(fromRoute) {
+    currentView = 'friends';
+    hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
+    document.getElementById('compose-box').style.display = 'none';
+    document.getElementById('friends-view').classList.add('visible');
     setActiveHeaderNav('nav-friends');
-    setTimeout(() => {
-        document.querySelector('.friends-panel').scrollIntoView({ behavior: 'smooth' });
-    }, 50);
+
+    if (!fromRoute) {
+        window.location.hash = '#/friends';
+    }
+
+    await loadFriendRequests();
+
+    if (pendingFriendRequestHighlight) {
+        const hlId = pendingFriendRequestHighlight;
+        pendingFriendRequestHighlight = null;
+        highlightFriendRequest(hlId);
+    }
+}
+
+function highlightFriendRequest(peerId) {
+    // Ensure pending tab is active so the request is visible
+    switchFrTab('pending');
+    const item = document.querySelector('.fr-item[data-fr-from="' + peerId + '"]');
+    if (item) {
+        item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        item.classList.add('fr-item-highlight');
+        setTimeout(() => item.classList.remove('fr-item-highlight'), 2500);
+    }
 }
 
 function navToProfile() {
@@ -1546,6 +1576,8 @@ function backFromProfile() {
         showConversationDetail(decodeURIComponent(parts.slice(1).join('/')), true);
     } else if (route === 'post' && parts[1]) {
         showPostDetail(decodeURIComponent(parts.slice(1).join('/')), true);
+    } else if (route === 'friends') {
+        showFriendsView(true);
     } else {
         showTimelineView();
         loadMessages(false);
@@ -1684,12 +1716,8 @@ async function handleNotificationClick(id, type, messageId, senderId) {
             navigateTo('post/' + encodeURIComponent(messageId));
         }
     } else if (type === 'friend_request') {
-        // Expand friend requests panel
-        const content = document.getElementById('friend-requests-content');
-        if (!content.classList.contains('visible')) {
-            content.classList.add('visible');
-            loadFriendRequests();
-        }
+        pendingFriendRequestHighlight = senderId;
+        navigateTo('friends');
     }
 }
 

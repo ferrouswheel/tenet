@@ -1384,6 +1384,61 @@ body {
     margin-top: 0.2rem;
 }
 
+/* Friends page view */
+.friends-view {
+    display: none;
+}
+.friends-view.visible { display: block; }
+.friends-view-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+}
+.friends-view-header h2 {
+    font-size: 1.2rem;
+    color: #fff;
+}
+.friends-view-add-btn {
+    width: auto !important;
+}
+.friends-view .add-friend-form {
+    margin-bottom: 1rem;
+}
+.friends-page-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+}
+@media (max-width: 640px) {
+    .friends-page-layout { grid-template-columns: 1fr; }
+}
+.friends-page-list,
+.friends-page-requests {
+    background: #1a1d27;
+    border: 1px solid #2a2d37;
+    border-radius: 8px;
+    padding: 1rem;
+}
+.friends-page-section-title {
+    font-size: 0.8rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.fr-item-highlight {
+    border-color: #5566cc !important;
+    animation: fr-highlight 2.5s forwards;
+}
+@keyframes fr-highlight {
+    0%, 60% { background: #1a2a4a; border-color: #5566cc; }
+    100% { background: #0f1117; border-color: #2a2d37; }
+}
+
 /* Toast notification */
 .toast {
     position: fixed;
