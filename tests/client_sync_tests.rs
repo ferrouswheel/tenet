@@ -29,16 +29,19 @@ struct RecordingHandler {
 }
 
 impl MessageHandler for RecordingHandler {
-    fn on_message(&mut self, _envelope: &Envelope, message: &ClientMessage) {
+    fn on_message(&mut self, _envelope: &Envelope, message: &ClientMessage) -> Vec<Envelope> {
         self.messages.push(message.clone());
+        Vec::new()
     }
 
-    fn on_meta(&mut self, meta: &MetaMessage) {
+    fn on_meta(&mut self, meta: &MetaMessage) -> Vec<Envelope> {
         self.meta_messages.push(meta.clone());
+        Vec::new()
     }
 
-    fn on_raw_meta(&mut self, _envelope: &Envelope, body: &str) {
+    fn on_raw_meta(&mut self, _envelope: &Envelope, body: &str) -> Vec<Envelope> {
         self.raw_metas.push(body.to_string());
+        Vec::new()
     }
 
     fn on_rejected(&mut self, _envelope: &Envelope, reason: &str) {

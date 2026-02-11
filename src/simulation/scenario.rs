@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
 use crate::groups::GroupInfo;
+use crate::message_handler::StorageMessageHandler;
 use crate::protocol::{
     build_encrypted_payload, build_plaintext_payload, ContentId, Envelope, MessageKind, Payload,
 };
+use crate::storage::Storage;
 
 use super::random::{generate_message_body, sample_poisson, sample_weighted_index, sample_zipf};
 use super::{
@@ -273,7 +275,18 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             .get(node_id)
             .cloned()
             .unwrap_or_default();
-        clients.push(SimulationHarness::build_client(node_id, schedule));
+        let mut client = SimulationHarness::build_client(node_id, schedule);
+
+        // Attach a per-peer in-memory StorageMessageHandler so received
+        // messages are persisted in an in-memory SQLite database.
+        if let Some(keypair) = keypairs.get(node_id) {
+            if let Ok(storage) = Storage::open_in_memory(std::path::Path::new("/tmp")) {
+                let handler = StorageMessageHandler::new(storage, keypair.clone());
+                client.set_handler(Box::new(handler));
+            }
+        }
+
+        clients.push(client);
     }
     SimulationInputs {
         clients,
