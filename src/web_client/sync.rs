@@ -2,9 +2,13 @@
 //! and announcing online status.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use futures_util::StreamExt as _;
+use tokio::sync::Notify;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::client::{ClientConfig, ClientEncryption, RelayClient, SyncEventOutcome};
 use crate::protocol::{build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage};
@@ -16,7 +20,12 @@ use crate::web_client::state::{SharedState, WsEvent};
 use crate::web_client::utils::now_secs;
 
 /// Runs the background relay sync loop with exponential backoff on failure.
-pub async fn relay_sync_loop(state: SharedState) {
+///
+/// `notify` is signalled by `relay_ws_listen_loop` whenever the relay pushes a
+/// new envelope over its WebSocket connection.  The loop wakes immediately on
+/// that signal so messages are delivered in near-real-time; the periodic
+/// interval serves as a polling fallback when the WS is unavailable.
+pub async fn relay_sync_loop(state: SharedState, notify: Arc<Notify>) {
     let mut consecutive_failures = 0u32;
     const MAX_BACKOFF_SECS: u64 = 300; // 5 minutes
 
@@ -31,7 +40,12 @@ pub async fn relay_sync_loop(state: SharedState) {
             backoff.min(MAX_BACKOFF_SECS)
         };
 
-        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        // Wake on a WS push notification OR the polling interval, whichever
+        // comes first.
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+        }
 
         match sync_once(&state).await {
             Ok(()) => {
@@ -857,6 +871,78 @@ async fn process_profile_update(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Relay WebSocket push listener
+// ---------------------------------------------------------------------------
+
+/// Connects to the relay's WebSocket endpoint and signals `notify` whenever an
+/// envelope arrives so that `relay_sync_loop` wakes up immediately.
+///
+/// Reconnects with exponential backoff on disconnect or error.  Exits cleanly
+/// if no relay URL is configured.
+pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>) {
+    let mut backoff_secs = 2u64;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    loop {
+        let (relay_url, peer_id) = {
+            let st = state.lock().await;
+            match st.relay_url.clone() {
+                Some(url) => (url, st.keypair.id.clone()),
+                None => return, // No relay configured — nothing to do.
+            }
+        };
+
+        let ws_url = relay_http_to_ws(&relay_url, &peer_id);
+
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((ws_stream, _response)) => {
+                backoff_secs = 2; // reset on successful connect
+                crate::tlog!("relay WS connected: {}", ws_url);
+
+                let (_, mut read) = ws_stream.split();
+
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(WsMessage::Text(_)) | Ok(WsMessage::Binary(_)) => {
+                            // An envelope was pushed — wake the sync loop.
+                            notify.notify_one();
+                        }
+                        Ok(WsMessage::Close(_)) => break,
+                        Err(e) => {
+                            crate::tlog!("relay WS error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                crate::tlog!("relay WS disconnected, reconnecting in {}s", backoff_secs);
+            }
+            Err(e) => {
+                crate::tlog!(
+                    "relay WS connection failed (retry in {}s): {}",
+                    backoff_secs,
+                    e
+                );
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+    }
+}
+
+/// Convert an HTTP(S) relay base URL into a WS(S) URL for `/ws/<peer_id>`.
+fn relay_http_to_ws(relay_url: &str, peer_id: &str) -> String {
+    let base = if relay_url.starts_with("https://") {
+        relay_url.replacen("https://", "wss://", 1)
+    } else {
+        relay_url.replacen("http://", "ws://", 1)
+    };
+    format!("{}/ws/{}", base.trim_end_matches('/'), peer_id)
 }
 
 /// Send online announcement to all known peers via relay.

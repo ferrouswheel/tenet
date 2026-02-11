@@ -14,6 +14,8 @@ pub mod utils;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::Notify;
+
 use clap::Parser;
 use tokio::sync::broadcast;
 
@@ -98,9 +100,23 @@ pub async fn run() {
             }
         }
 
+        // Shared signal: the WS listener notifies this when an envelope arrives
+        // so the sync loop wakes up immediately instead of waiting the full poll
+        // interval.
+        let notify = Arc::new(Notify::new());
+
         let sync_state = Arc::clone(&state);
+        let sync_notify = Arc::clone(&notify);
         tokio::spawn(async move {
-            sync::relay_sync_loop(sync_state).await;
+            sync::relay_sync_loop(sync_state, sync_notify).await;
+        });
+
+        // Connect to the relay's WebSocket push endpoint so messages are
+        // delivered in near-real-time rather than waiting for the next poll.
+        let ws_state = Arc::clone(&state);
+        let ws_notify = Arc::clone(&notify);
+        tokio::spawn(async move {
+            sync::relay_ws_listen_loop(ws_state, ws_notify).await;
         });
 
         // Send online announcement to known peers
