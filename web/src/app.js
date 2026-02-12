@@ -1373,6 +1373,7 @@ function navToFeed() {
     showTimelineView();
     loadMessages(false);
     setActiveHeaderNav('nav-feed');
+    window.location.hash = '#/';
 }
 
 function navToGroups() {
@@ -1383,6 +1384,7 @@ function navToGroups() {
     showTimelineView();
     loadMessages(false);
     setActiveHeaderNav('nav-groups');
+    window.location.hash = '#/';
 }
 
 function navToFriends() {
