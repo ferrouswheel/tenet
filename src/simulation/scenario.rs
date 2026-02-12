@@ -16,11 +16,12 @@ use crate::storage::Storage;
 
 use super::random::{generate_message_body, sample_poisson, sample_weighted_index, sample_zipf};
 use super::{
-    start_relay, ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution,
-    MessageEncryption, MessageType, MessageTypeWeights, OnlineAvailability, OnlineCohortDefinition,
-    PostFrequency, SimulationClient, SimulationConfig, SimulationHarness, SimulationReport,
-    SimulationScenarioConfig, SimulationStepUpdate, SimulationTimingConfig, TimeDistribution,
-    SIMULATION_HOURS_PER_DAY, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
+    start_relay, ClusteringConfig, FriendRequestConfig, FriendsPerNode, GroupMembershipsPerNode,
+    GroupSizeDistribution, LatencyDistribution, MessageEncryption, MessageType, MessageTypeWeights,
+    OnlineAvailability, OnlineCohortDefinition, PostFrequency, ScheduledEvent, SimulationClient,
+    SimulationConfig, SimulationHarness, SimulationReport, SimulationScenarioConfig,
+    SimulationStepUpdate, SimulationTimingConfig, TimeDistribution, SIMULATION_HOURS_PER_DAY,
+    SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +64,7 @@ pub struct SimulationInputs {
     pub timing: SimulationTimingConfig,
     pub groups: HashMap<String, GroupInfo>,
     pub node_groups: HashMap<String, Vec<String>>,
+    pub message_size_distribution: super::MessageSizeDistribution,
 }
 
 /// Mapping of nodes to their assigned cohorts (for message type weights)
@@ -84,7 +86,7 @@ pub async fn run_event_based_scenario(
     scenario: SimulationScenarioConfig,
 ) -> Result<SimulationReport, String> {
     use super::event::{SimulationClock, TimeControlMode};
-    use super::{EventBasedHarness, NetworkConditions};
+    use super::EventBasedHarness;
     use crate::simulation::planned_sends_to_events;
 
     let relay_config = scenario.relay.clone();
@@ -101,13 +103,20 @@ pub async fn run_event_based_scenario(
     let time_control_mode = TimeControlMode::FastForward;
     let clock = SimulationClock::new(time_control_mode);
 
-    let network_conditions = NetworkConditions::default();
+    let network_conditions = scenario
+        .network_conditions
+        .clone()
+        .unwrap_or_default();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
+    let (active_links, pending_friendships, friend_accept_delay) =
+        split_friend_graph(inputs.direct_links, &scenario.simulation.friend_request_config, &mut rng);
 
     let mut harness = EventBasedHarness::new(
         clock,
         base_url,
         inputs.clients,
-        inputs.direct_links,
+        active_links,
         scenario.direct_enabled.unwrap_or(true),
         relay_config.ttl_seconds,
         inputs.encryption,
@@ -115,6 +124,9 @@ pub async fn run_event_based_scenario(
         network_conditions,
         inputs.cohort_online_rates,
         scenario.simulation.reaction_config.clone(),
+        inputs.message_size_distribution,
+        pending_friendships.clone(),
+        friend_accept_delay,
         None,
         None,
         None,
@@ -128,11 +140,18 @@ pub async fn run_event_based_scenario(
     }
 
     // Schedule online/offline events
-    let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
     let (online_events, _node_cohorts) =
         build_online_events(&scenario.simulation, 0.0, duration_seconds, &mut rng);
     for event in online_events {
         harness.schedule_event(event.time, event.event);
+    }
+
+    // Schedule friend request events for pending friendships
+    if let Some(fr_config) = &scenario.simulation.friend_request_config {
+        let fr_events = build_friend_request_events(&pending_friendships, fr_config, 0.0, duration_seconds, &mut rng);
+        for event in fr_events {
+            harness.schedule_event(event.time, event.event);
+        }
     }
 
     let report = harness.run(duration_seconds).await;
@@ -153,7 +172,7 @@ where
     F: FnMut(SimulationStepUpdate),
 {
     use super::event::{SimulationClock, TimeControlMode};
-    use super::{EventBasedHarness, NetworkConditions};
+    use super::EventBasedHarness;
     use crate::simulation::planned_sends_to_events;
 
     let (base_url, shutdown_tx, relay_control) = start_relay(relay_config_override).await;
@@ -169,15 +188,22 @@ where
     let time_control_mode = TimeControlMode::FastForward;
     let clock = SimulationClock::new(time_control_mode);
 
-    let network_conditions = NetworkConditions::default();
+    let network_conditions = scenario
+        .network_conditions
+        .clone()
+        .unwrap_or_default();
 
     let ttl_seconds = scenario.relay.ttl_seconds;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
+    let (active_links, pending_friendships, friend_accept_delay) =
+        split_friend_graph(inputs.direct_links, &scenario.simulation.friend_request_config, &mut rng);
 
     let mut harness = EventBasedHarness::new(
         clock,
         base_url,
         inputs.clients,
-        inputs.direct_links,
+        active_links,
         scenario.direct_enabled.unwrap_or(true),
         ttl_seconds,
         inputs.encryption,
@@ -185,6 +211,9 @@ where
         network_conditions,
         inputs.cohort_online_rates,
         scenario.simulation.reaction_config.clone(),
+        inputs.message_size_distribution,
+        pending_friendships.clone(),
+        friend_accept_delay,
         log_sink,
         Some(relay_control),
         relay_time_sync,
@@ -209,8 +238,7 @@ where
         harness.schedule_event(event.time, event.event);
     }
 
-    // Schedule online/offline events
-    let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
+    // Schedule online/offline events (reuse rng already seeded above)
     let (online_events, _node_cohorts) =
         build_online_events(&scenario.simulation, 0.0, duration_seconds, &mut rng);
     harness.log_event(format!(
@@ -219,6 +247,15 @@ where
     ));
     for event in online_events {
         harness.schedule_event(event.time, event.event);
+    }
+
+    // Schedule friend request events for pending friendships
+    if let Some(fr_config) = &scenario.simulation.friend_request_config {
+        let fr_events = build_friend_request_events(&pending_friendships, fr_config, 0.0, duration_seconds, &mut rng);
+        harness.log_event(format!("Scheduling {} friend-request events", fr_events.len()));
+        for event in fr_events {
+            harness.schedule_event(event.time, event.event);
+        }
     }
 
     let report = harness
@@ -236,7 +273,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
     let encryption = config
         .encryption
         .clone()
-        .unwrap_or(MessageEncryption::Plaintext);
+        .unwrap_or(MessageEncryption::Encrypted);
     let mut crypto_rng = ChaCha20Rng::seed_from_u64(config.seed ^ 0x5A17_5EED);
     let graph = build_friend_graph(config, &mut rng);
     let schedule_plan = build_online_schedules(config, &mut rng);
@@ -302,6 +339,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
         },
         groups,
         node_groups,
+        message_size_distribution: config.message_size_distribution.clone(),
     }
 }
 
@@ -1359,7 +1397,7 @@ fn build_planned_message(
     }
 }
 
-fn build_message_payload(
+pub(crate) fn build_message_payload(
     encryption: &MessageEncryption,
     keypairs: &HashMap<String, StoredKeypair>,
     crypto_rng: &mut Option<&mut dyn RngCore>,
@@ -1393,6 +1431,182 @@ fn build_message_payload(
             )
             .expect("encrypt payload")
         }
+    }
+}
+
+/// Split the full friend graph into active and pending sets based on
+/// `FriendRequestConfig.initial_friend_fraction`.
+///
+/// Returns `(active_links, pending_pairs, acceptance_delay)`.  When no
+/// `FriendRequestConfig` is configured all links are active immediately and the
+/// pending list is empty.
+fn split_friend_graph(
+    all_links: HashSet<(String, String)>,
+    fr_config: &Option<FriendRequestConfig>,
+    rng: &mut impl Rng,
+) -> (
+    HashSet<(String, String)>,
+    Vec<(String, String)>,
+    Option<LatencyDistribution>,
+) {
+    let Some(cfg) = fr_config else {
+        return (all_links, Vec::new(), None);
+    };
+
+    let fraction = cfg.initial_friend_fraction.clamp(0.0, 1.0);
+    // De-duplicate: treat (a,b) and (b,a) as the same pair so we don't
+    // put both directions into pending and then activate both separately.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (a, b) in &all_links {
+        let key = if a <= b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        if seen.insert(key.clone()) {
+            pairs.push(key);
+        }
+    }
+
+    let n_active = ((pairs.len() as f64) * fraction).round() as usize;
+    // Shuffle so the active subset is random
+    use rand::seq::SliceRandom;
+    pairs.shuffle(rng);
+
+    let (active_pairs, pending_pairs) = pairs.split_at(n_active.min(pairs.len()));
+
+    let mut active_links: HashSet<(String, String)> = HashSet::new();
+    for (a, b) in active_pairs {
+        active_links.insert((a.clone(), b.clone()));
+        active_links.insert((b.clone(), a.clone()));
+    }
+
+    let pending: Vec<(String, String)> = pending_pairs.to_vec();
+    let delay = Some(cfg.acceptance_delay.clone());
+    (active_links, pending, delay)
+}
+
+/// Build `FriendRequestSend` events for a list of pending friendship pairs.
+///
+/// Events are scattered across `[start_time, end_time)` using a Poisson
+/// process whose rate is `fr_config.request_rate_per_hour` per pending pair.
+fn build_friend_request_events(
+    pending: &[(String, String)],
+    fr_config: &FriendRequestConfig,
+    start_time: f64,
+    end_time: f64,
+    rng: &mut impl Rng,
+) -> Vec<ScheduledEvent> {
+    use super::event::Event;
+
+    let duration_hours = (end_time - start_time) / 3600.0;
+    let mut events = Vec::new();
+    let mut counter = 0u64;
+
+    for (a, b) in pending {
+        // Expected number of requests for this pair over the duration.
+        // We schedule exactly one request per pair (the first one that would
+        // fire under the Poisson process) so that each pending friendship is
+        // activated at most once.
+        let expected = fr_config.request_rate_per_hour * duration_hours;
+        if expected <= 0.0 {
+            continue;
+        }
+        // Sample the time of the first request as an exponential inter-arrival.
+        let u: f64 = rng.gen::<f64>().max(1e-9); // avoid log(0)
+        let delay_hours = -u.ln() / fr_config.request_rate_per_hour;
+        let event_time = start_time + (delay_hours * 3600.0);
+        if event_time >= end_time {
+            continue; // Would fire after simulation ends
+        }
+        events.push(ScheduledEvent {
+            time: event_time,
+            event: Event::FriendRequestSend {
+                sender_id: a.clone(),
+                recipient_id: b.clone(),
+            },
+            event_id: counter,
+        });
+        counter += 1;
+    }
+    events
+}
+
+/// Build a reply SimMessage of the same kind as the original.
+///
+/// Returns `None` when the original kind does not warrant a reply (Meta,
+/// StoreForPeer) or when the required context is missing (e.g. no group_id for
+/// a FriendGroup message).
+pub(crate) fn build_reply_sim_message(
+    replier_id: &str,
+    original_kind: MessageKind,
+    original_sender: &str,
+    original_group_id: Option<&str>,
+    encryption: &MessageEncryption,
+    keypairs: &HashMap<String, StoredKeypair>,
+    size_dist: &super::MessageSizeDistribution,
+    rng: &mut impl Rng,
+    counter: usize,
+) -> Option<SimMessage> {
+    match original_kind {
+        MessageKind::Direct => {
+            let body = generate_message_body(rng, size_dist);
+            let rng_dyn: &mut dyn RngCore = rng;
+            let mut crypto_rng_opt: Option<&mut dyn RngCore> = Some(rng_dyn);
+            let payload = build_message_payload(
+                encryption,
+                keypairs,
+                &mut crypto_rng_opt,
+                &body,
+                original_sender,
+                replier_id,
+                counter,
+            );
+            let message_id = ContentId::from_value(&payload).ok()?;
+            Some(SimMessage {
+                id: message_id.0,
+                sender: replier_id.to_string(),
+                recipient: original_sender.to_string(),
+                body,
+                payload,
+                message_kind: MessageKind::Direct,
+                group_id: None,
+            })
+        }
+        MessageKind::Public => {
+            let body = generate_message_body(rng, size_dist);
+            let salt = format!("{replier_id}-reply-{counter}");
+            let payload = build_plaintext_payload(body.clone(), salt.as_bytes());
+            let message_id = ContentId::from_value(&payload).ok()?;
+            Some(SimMessage {
+                id: message_id.0,
+                sender: replier_id.to_string(),
+                recipient: "*".to_string(),
+                body,
+                payload,
+                message_kind: MessageKind::Public,
+                group_id: None,
+            })
+        }
+        MessageKind::FriendGroup => {
+            let group_id = original_group_id?.to_string();
+            let body = generate_message_body(rng, size_dist);
+            let salt = format!("{replier_id}-{group_id}-reply-{counter}");
+            let payload = build_plaintext_payload(body.clone(), salt.as_bytes());
+            let message_id = ContentId::from_value(&payload).ok()?;
+            Some(SimMessage {
+                id: message_id.0,
+                sender: replier_id.to_string(),
+                recipient: group_id.clone(),
+                body,
+                payload,
+                message_kind: MessageKind::FriendGroup,
+                group_id: Some(group_id),
+            })
+        }
+        // Do not reply to meta or store-for-peer messages.
+        MessageKind::Meta | MessageKind::StoreForPeer => None,
     }
 }
 
@@ -1535,6 +1749,7 @@ mod tests {
             groups: None,
             message_type_weights: None,
             reaction_config: None,
+            friend_request_config: None,
             seed: 42,
         };
 

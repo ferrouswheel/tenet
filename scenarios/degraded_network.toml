@@ -1,0 +1,89 @@
+# Degraded-network scenario
+#
+# Exercises message delivery under adverse network conditions: a 15 % random
+# drop rate affects all message types (data and meta), and relay/direct
+# operations carry realistic latency.  Use this scenario to measure how
+# delivery ratios and latency distributions degrade when the underlying
+# transport is unreliable.
+#
+# Expected behaviour:
+#   - sent_messages / planned_messages ratio is lower than in the baseline
+#     small_dense_6.toml run because some senders are offline at send time.
+#   - inbox_deliveries is noticeably lower than sent_messages due to drops.
+#   - Meta messages (Online/Ack) are also subject to drops, which causes
+#     store-and-forward to activate more often.
+
+[simulation]
+node_ids = ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6"]
+steps = 0               # derived from duration_seconds / seconds_per_step
+duration_seconds = 86400
+seed = 99
+
+[simulation.simulated_time]
+seconds_per_step = 300
+default_speed_factor = 1.0
+
+[simulation.friends_per_node]
+type = "uniform"
+min = 2
+max = 4
+
+[simulation.post_frequency]
+type = "poisson"
+lambda_per_hour = 3.0
+
+[[simulation.cohorts]]
+name = "always-online"
+type = "always_online"
+share = 0.33
+
+[[simulation.cohorts]]
+name = "diurnal"
+type = "diurnal"
+share = 0.34
+online_probability = 0.7
+timezone_offset_hours = 0
+hourly_weights = [0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9, 1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25]
+
+[[simulation.cohorts]]
+name = "rarely-online"
+type = "rarely_online"
+share = 0.33
+online_probability = 0.2
+
+[simulation.message_size_distribution]
+type = "normal"
+mean = 120.0
+std_dev = 40.0
+min = 20
+max = 400
+
+[simulation.encryption]
+type = "encrypted"
+
+[relay]
+ttl_seconds = 3600
+max_messages = 500
+max_bytes = 2097152
+retry_backoff_seconds = [1, 2, 4]
+
+# ---------- Network impairment ----------
+# 15 % of all posted envelopes (including meta) are silently dropped.
+# Direct and relay operations also carry realistic latency.
+[network_conditions]
+drop_probability = 0.15
+
+[network_conditions.direct_latency]
+type = "log_normal"
+mean = 0.5
+std_dev = 0.4
+
+[network_conditions.relay_post_latency]
+type = "uniform"
+min = 0.05
+max = 0.5
+
+[network_conditions.relay_fetch_latency]
+type = "uniform"
+min = 0.05
+max = 0.3

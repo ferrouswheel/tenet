@@ -36,6 +36,23 @@ pub enum Event {
     /// Client announces online status to peers
     OnlineAnnounce { client_id: String },
 
+    /// A node sends a FriendRequest meta message to a not-yet-connected peer.
+    /// When processed, a FriendAcceptSend event is scheduled after the
+    /// configured acceptance_delay.
+    FriendRequestSend {
+        sender_id: String,
+        recipient_id: String,
+    },
+
+    /// A node sends a FriendAccept meta message, completing a friendship.
+    /// When processed, the routing edge is activated in the harness.
+    FriendAcceptSend {
+        /// The node that originally sent the FriendRequest.
+        sender_id: String,
+        /// The node that is now accepting (completing the handshake).
+        recipient_id: String,
+    },
+
     /// Generic scheduled action (for extensibility)
     CustomAction {
         action_id: String,
@@ -159,6 +176,14 @@ pub enum EventOutcome {
         messages_fetched: usize,
     },
     OnlineAnnounced,
+    FriendRequestSent {
+        sender_id: String,
+        recipient_id: String,
+    },
+    FriendAccepted {
+        peer_a: String,
+        peer_b: String,
+    },
     CustomActionExecuted {
         success: bool,
     },

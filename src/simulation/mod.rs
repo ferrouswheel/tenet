@@ -18,11 +18,12 @@ pub mod scenario;
 
 pub use crate::client::SimulationClient;
 pub use config::{
-    ClusteringConfig, FriendsPerNode, GroupMembershipsPerNode, GroupSizeDistribution, GroupsConfig,
-    LatencyDistribution, MessageEncryption, MessageSizeDistribution, MessageType,
-    MessageTypeWeights, NetworkConditions, OnlineAvailability, OnlineCohortDefinition,
-    PostFrequency, ReactionConfig, RelayConfigToml, SimulatedTimeConfig, SimulationConfig,
-    SimulationScenarioConfig, SimulationTimingConfig, TimeControlConfig, TimeDistribution,
+    ClusteringConfig, FriendRequestConfig, FriendsPerNode, GroupMembershipsPerNode,
+    GroupSizeDistribution, GroupsConfig, LatencyDistribution, MessageEncryption,
+    MessageSizeDistribution, MessageType, MessageTypeWeights, NetworkConditions,
+    OnlineAvailability, OnlineCohortDefinition, PostFrequency, ReactionConfig, RelayConfigToml,
+    SimulatedTimeConfig, SimulationConfig, SimulationScenarioConfig, SimulationTimingConfig,
+    TimeControlConfig, TimeDistribution,
 };
 pub use event::{
     Event, EventLog, EventOutcome, EventQueue, ProcessedEvent, ScheduledEvent, SimulationClock,
@@ -430,6 +431,15 @@ pub struct EventBasedHarness {
     metrics_tracker: MetricsTracker,
     network_conditions: NetworkConditions,
     reaction_config: Option<ReactionConfig>,
+    /// Message size distribution used when building reply messages for reaction_config.
+    message_size_distribution: MessageSizeDistribution,
+    /// Monotonic counter for generating unique reply message IDs.
+    reply_counter: usize,
+    /// Friendships that are not yet active; each pair will exchange
+    /// FriendRequest / FriendAccept events during the simulation.
+    pending_friendships: Vec<(String, String)>,
+    /// Delay distribution for friend-request acceptance (None = instant).
+    friend_accept_delay: Option<LatencyDistribution>,
     log_sink: Option<std::sync::Arc<dyn Fn(LogEntry) + Send + Sync>>,
     client_log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     relay_control: Option<RelayControl>,
@@ -454,6 +464,9 @@ impl EventBasedHarness {
         network_conditions: NetworkConditions,
         cohort_online_rates: HashMap<String, f64>,
         reaction_config: Option<ReactionConfig>,
+        message_size_distribution: MessageSizeDistribution,
+        pending_friendships: Vec<(String, String)>,
+        friend_accept_delay: Option<LatencyDistribution>,
         log_sink: Option<std::sync::Arc<dyn Fn(LogEntry) + Send + Sync>>,
         relay_control: Option<RelayControl>,
         relay_time_sync: Option<std::sync::Arc<std::sync::Mutex<f64>>>,
@@ -513,12 +526,40 @@ impl EventBasedHarness {
             metrics_tracker: MetricsTracker::new(1.0, cohort_online_rates),
             network_conditions,
             reaction_config,
+            message_size_distribution,
+            reply_counter: 0,
+            pending_friendships,
+            friend_accept_delay,
             log_sink,
             client_log_sink,
             relay_control,
             relay_time_sync,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
         }
+    }
+
+    /// Post an envelope to the relay, applying the configured drop probability.
+    /// Returns `true` if the envelope was posted, `false` if it was dropped.
+    async fn try_post_envelope(&mut self, envelope: &Envelope) -> bool {
+        if self.network_conditions.drop_probability > 0.0
+            && self.rng.gen::<f64>() < self.network_conditions.drop_probability
+        {
+            self.log_event(format!(
+                "Drop: {} -> {} ({})",
+                envelope.header.sender_id,
+                envelope.header.recipient_id,
+                match envelope.header.message_kind {
+                    MessageKind::Direct => "direct",
+                    MessageKind::Public => "public",
+                    MessageKind::FriendGroup => "group",
+                    MessageKind::Meta => "meta",
+                    MessageKind::StoreForPeer => "store-for-peer",
+                }
+            ));
+            return false;
+        }
+        let _ = post_envelope(&self.relay_base_url, envelope).await;
+        true
     }
 
     /// Push the current simulation time into the shared relay clock so the
@@ -598,9 +639,9 @@ impl EventBasedHarness {
                 ));
             }
 
-            // Post envelopes to relay
+            // Post envelopes to relay (subject to drop probability)
             for envelope in &outcome.envelopes {
-                let _ = post_envelope(&self.relay_base_url, envelope).await;
+                self.try_post_envelope(envelope).await;
             }
 
             // Schedule direct deliveries with latency
@@ -663,6 +704,9 @@ impl EventBasedHarness {
 
         let step = self.clock.simulated_time as usize;
         let sender_id = envelope.header.sender_id.clone();
+        // Save these before `envelope` is partially moved into `sim_message`.
+        let original_kind = envelope.header.message_kind;
+        let original_group_id = envelope.header.group_id.clone();
 
         if let Some(client) = self.clients.get_mut(&recipient_id) {
             // Create a SimMessage from envelope for direct delivery
@@ -672,33 +716,49 @@ impl EventBasedHarness {
                 recipient: recipient_id.clone(),
                 body: envelope.payload.body.clone(),
                 payload: envelope.payload.clone(),
-                message_kind: envelope.header.message_kind,
-                group_id: envelope.header.group_id.clone(),
+                message_kind: original_kind.clone(),
+                group_id: original_group_id.clone(),
             };
 
             let result = client.handle_direct_delivery(step, sim_message, &mut context, None);
 
             // Check if we should generate a reaction (reply) event
             if result.is_some() {
-                if let Some(reaction_config) = &self.reaction_config {
+                if let Some(reaction_config) = &self.reaction_config.clone() {
                     let should_reply = self.rng.gen::<f64>() < reaction_config.reply_probability;
                     if should_reply {
-                        // Schedule a reply event after a delay
                         let delay = reaction_config
                             .reply_delay_distribution
                             .sample(&mut self.rng);
                         let reply_time = self.clock.simulated_time + delay;
+                        let counter = self.reply_counter;
+                        self.reply_counter += 1;
 
-                        // Note: In a full implementation, we would create a reply message here
-                        // For now, we just log that a reaction would occur
-                        self.log_event(format!(
-                            "Reaction: {} will reply to {} after {:.2}s delay (at t={:.2})",
-                            recipient_id, sender_id, delay, reply_time
-                        ));
+                        let reply = scenario::build_reply_sim_message(
+                            &recipient_id,
+                            original_kind,
+                            &sender_id,
+                            original_group_id.as_deref(),
+                            &self.encryption,
+                            &self.keypairs,
+                            &self.message_size_distribution,
+                            &mut self.rng,
+                            counter,
+                        );
 
-                        // TODO: Actually generate and schedule a reply message event
-                        // This would require access to the message generation logic
-                        // which is currently in scenario.rs
+                        if let Some(reply_msg) = reply {
+                            self.log_event(format!(
+                                "Reaction: {} will reply to {} after {:.2}s (at t={:.2})",
+                                recipient_id, sender_id, delay, reply_time
+                            ));
+                            self.event_queue.push(
+                                reply_time,
+                                Event::MessageSend {
+                                    sender_id: recipient_id.clone(),
+                                    message: reply_msg,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -803,7 +863,7 @@ impl EventBasedHarness {
 
             let outcome = client.handle_inbox(step, envelopes, &mut context, None);
             for env in outcome.outgoing {
-                let _ = post_envelope(&self.relay_base_url, &env).await;
+                self.try_post_envelope(&env).await;
             }
         }
 
@@ -829,6 +889,73 @@ impl EventBasedHarness {
         // and potential future extensions.
 
         EventOutcome::OnlineAnnounced
+    }
+
+    async fn handle_friend_request_send(
+        &mut self,
+        sender_id: String,
+        recipient_id: String,
+    ) -> EventOutcome {
+        self.log_event(format!(
+            "FriendRequest: {} -> {}",
+            sender_id, recipient_id
+        ));
+
+        // Schedule the accept after the configured delay
+        let delay = self
+            .friend_accept_delay
+            .as_ref()
+            .map(|d| d.clone().sample(&mut self.rng))
+            .unwrap_or(0.0);
+        let accept_time = self.clock.simulated_time + delay;
+        self.event_queue.push(
+            accept_time,
+            Event::FriendAcceptSend {
+                sender_id: sender_id.clone(),
+                recipient_id: recipient_id.clone(),
+            },
+        );
+
+        EventOutcome::FriendRequestSent {
+            sender_id,
+            recipient_id,
+        }
+    }
+
+    async fn handle_friend_accept_send(
+        &mut self,
+        sender_id: String,
+        recipient_id: String,
+    ) -> EventOutcome {
+        // Activate the friendship in both directions
+        if self
+            .direct_links
+            .insert((sender_id.clone(), recipient_id.clone()))
+        {
+            self.neighbors
+                .entry(sender_id.clone())
+                .or_default()
+                .push(recipient_id.clone());
+        }
+        if self
+            .direct_links
+            .insert((recipient_id.clone(), sender_id.clone()))
+        {
+            self.neighbors
+                .entry(recipient_id.clone())
+                .or_default()
+                .push(sender_id.clone());
+        }
+
+        self.log_event(format!(
+            "FriendAccept: {} <-> {} (friendship activated)",
+            sender_id, recipient_id
+        ));
+
+        EventOutcome::FriendAccepted {
+            peer_a: sender_id,
+            peer_b: recipient_id,
+        }
     }
 
     async fn trigger_store_and_forward(&mut self, client_id: &str) {
@@ -869,13 +996,13 @@ impl EventBasedHarness {
             }
         }
 
-        // Post forwarded messages to relay
+        // Post forwarded messages to relay (subject to drop probability)
         for envelope in forward_envelopes {
             self.log_event(format!(
                 "Forwarding stored message: {} -> {}",
                 envelope.header.sender_id, envelope.header.recipient_id
             ));
-            let _ = post_envelope(&self.relay_base_url, &envelope).await;
+            self.try_post_envelope(&envelope).await;
         }
     }
 
@@ -943,6 +1070,20 @@ impl EventBasedHarness {
                     Event::InboxPoll { client_id } => self.handle_inbox_poll(client_id).await,
                     Event::OnlineAnnounce { client_id } => {
                         self.handle_online_announce(client_id).await
+                    }
+                    Event::FriendRequestSend {
+                        sender_id,
+                        recipient_id,
+                    } => {
+                        self.handle_friend_request_send(sender_id, recipient_id)
+                            .await
+                    }
+                    Event::FriendAcceptSend {
+                        sender_id,
+                        recipient_id,
+                    } => {
+                        self.handle_friend_accept_send(sender_id, recipient_id)
+                            .await
                     }
                     Event::CustomAction { .. } => {
                         EventOutcome::CustomActionExecuted { success: true }
@@ -1185,6 +1326,20 @@ impl EventBasedHarness {
                     Event::InboxPoll { client_id } => self.handle_inbox_poll(client_id).await,
                     Event::OnlineAnnounce { client_id } => {
                         self.handle_online_announce(client_id).await
+                    }
+                    Event::FriendRequestSend {
+                        sender_id,
+                        recipient_id,
+                    } => {
+                        self.handle_friend_request_send(sender_id, recipient_id)
+                            .await
+                    }
+                    Event::FriendAcceptSend {
+                        sender_id,
+                        recipient_id,
+                    } => {
+                        self.handle_friend_accept_send(sender_id, recipient_id)
+                            .await
                     }
                     Event::CustomAction { .. } => {
                         EventOutcome::CustomActionExecuted { success: true }

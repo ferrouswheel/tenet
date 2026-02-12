@@ -55,7 +55,9 @@ cargo run --bin tenet -- init
 cargo run --bin tenet -- add-peer <name> <public_key_hex>
 cargo run --bin tenet -- send <peer> <message> --relay http://...
 
-# Interactive TUI debugger
+# Interactive REPL debugger (self-contained; starts its own in-process relay)
+cargo run --bin tenet-debugger -- --peers 4
+# Or with an external relay:
 cargo run --bin tenet-debugger -- --peers 4 --relay http://127.0.0.1:8080
 
 # Simulation scenario runner

@@ -46,6 +46,19 @@ std_dev = 0.6
 min = 40
 max = 400
 
+[simulation.encryption]
+type = "encrypted"
+
+# Low reply probability (15 %) with longer delays to avoid message explosion
+# across 100 peers.  Still exercises reply routing at scale.
+[simulation.reaction_config]
+reply_probability = 0.15
+
+[simulation.reaction_config.reply_delay_distribution]
+type = "uniform"
+min = 600.0     # 10 minutes
+max = 3600.0    # 1 hour
+
 [relay]
 ttl_seconds = 3600
 max_messages = 2000

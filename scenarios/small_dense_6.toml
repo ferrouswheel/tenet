@@ -40,6 +40,18 @@ type = "uniform"
 min = 20
 max = 120
 
+[simulation.encryption]
+type = "encrypted"
+
+# 25 % of received messages trigger a direct reply after 5–20 minutes.
+[simulation.reaction_config]
+reply_probability = 0.25
+
+[simulation.reaction_config.reply_delay_distribution]
+type = "uniform"
+min = 300.0    # 5 minutes
+max = 1200.0   # 20 minutes
+
 [relay]
 ttl_seconds = 3600
 max_messages = 500

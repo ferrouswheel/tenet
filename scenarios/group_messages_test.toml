@@ -78,6 +78,19 @@ type = "uniform"
 min = 30
 max = 150
 
+[simulation.encryption]
+type = "encrypted"
+
+# 30 % of received messages trigger a same-kind reply (group replies stay in the
+# same group, direct replies go back to the original sender).
+[simulation.reaction_config]
+reply_probability = 0.3
+
+[simulation.reaction_config.reply_delay_distribution]
+type = "log_normal"
+mean = 6.0    # ln(seconds) ≈ 6.5 minute median
+std_dev = 0.7
+
 [relay]
 ttl_seconds = 2400
 max_messages = 1000

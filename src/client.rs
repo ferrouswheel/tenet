@@ -482,6 +482,10 @@ impl RelayClient {
         &self.keypair.public_key_hex
     }
 
+    pub fn signing_public_key_hex(&self) -> &str {
+        &self.keypair.signing_public_key_hex
+    }
+
     pub fn is_online(&self) -> bool {
         self.online
     }

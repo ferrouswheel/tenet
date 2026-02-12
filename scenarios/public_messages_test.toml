@@ -52,6 +52,19 @@ type = "uniform"
 min = 20
 max = 100
 
+[simulation.encryption]
+type = "encrypted"
+
+# 30 % of received messages trigger a same-kind reply (public replies stay public,
+# direct replies go back to the original sender).
+[simulation.reaction_config]
+reply_probability = 0.3
+
+[simulation.reaction_config.reply_delay_distribution]
+type = "uniform"
+min = 120.0    # 2 minutes
+max = 600.0    # 10 minutes
+
 [relay]
 ttl_seconds = 1800
 max_messages = 500

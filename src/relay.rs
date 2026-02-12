@@ -111,6 +111,7 @@ pub fn app(state: RelayState) -> Router {
         .route("/inbox/:recipient_id", get(fetch_inbox))
         .route("/inbox/batch", post(fetch_inbox_batch))
         .route("/ws/:recipient_id", get(ws_handler))
+        .route("/debug/stats", get(debug_stats))
         .with_state(state)
 }
 
@@ -183,6 +184,22 @@ impl RelayState {
 
 async fn healthcheck() -> impl IntoResponse {
     StatusCode::OK
+}
+
+async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
+    let inner = state.inner.lock().await;
+    let queues: HashMap<String, usize> = inner
+        .queues
+        .iter()
+        .map(|(k, v)| (k.clone(), v.len()))
+        .collect();
+    let total: usize = queues.values().sum();
+    let peer_count = inner.peer_last_seen.len();
+    Json(serde_json::json!({
+        "queues": queues,
+        "total": total,
+        "peer_count": peer_count,
+    }))
 }
 
 async fn ws_handler(

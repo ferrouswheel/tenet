@@ -1,0 +1,84 @@
+# Friend-discovery scenario
+#
+# Demonstrates dynamic friend-graph construction.  Nodes start with only 25 %
+# of their eventual friendships active.  The remaining 75 % are established
+# progressively during the simulation via FriendRequest / FriendAccept meta
+# message exchanges.
+#
+# Expected behaviour:
+#   - Early in the run, direct-message delivery ratios are lower because many
+#     routing edges do not exist yet.
+#   - FriendAccepted log entries appear throughout the run as new friendships
+#     activate.
+#   - By the end of the simulation the full friend graph is connected and
+#     delivery ratios converge toward the fully-connected baseline.
+#
+# The acceptance_delay models realistic human response times (minutes to hours).
+
+[simulation]
+node_ids = [
+  "alice", "bob", "carol", "dave", "erin",
+  "frank", "grace", "heidi", "ivan", "judy",
+]
+steps = 0               # derived from duration_seconds / seconds_per_step
+duration_seconds = 172800   # 48-hour run
+seed = 7
+
+[simulation.simulated_time]
+seconds_per_step = 300
+default_speed_factor = 1.0
+
+[simulation.friends_per_node]
+type = "uniform"
+min = 3
+max = 5
+
+[simulation.post_frequency]
+type = "poisson"
+lambda_per_hour = 2.0
+
+[[simulation.cohorts]]
+name = "always-online"
+type = "always_online"
+share = 0.3
+
+[[simulation.cohorts]]
+name = "diurnal"
+type = "diurnal"
+share = 0.5
+online_probability = 0.75
+timezone_offset_hours = 0
+hourly_weights = [0.2, 0.15, 0.1, 0.1, 0.15, 0.3, 0.5, 0.7, 0.9, 1.0, 1.0, 0.95, 0.9, 0.8, 0.75, 0.8, 0.9, 1.0, 0.95, 0.8, 0.6, 0.45, 0.3, 0.25]
+
+[[simulation.cohorts]]
+name = "rarely-online"
+type = "rarely_online"
+share = 0.2
+online_probability = 0.25
+
+[simulation.message_size_distribution]
+type = "uniform"
+min = 20
+max = 200
+
+[simulation.encryption]
+type = "encrypted"
+
+# ---------- Friend-request configuration ----------
+# 25 % of friendships are active from the start.
+# Each node sends new friend requests at ~2 per hour on average.
+# Accepts arrive 5–30 minutes after the request is sent.
+[simulation.friend_request_config]
+initial_friend_fraction = 0.25
+request_rate_per_hour = 2.0
+
+[simulation.friend_request_config.acceptance_delay]
+type = "uniform"
+min = 300.0    # 5 minutes
+max = 1800.0   # 30 minutes
+
+[relay]
+ttl_seconds = 7200
+max_messages = 1000
+max_bytes = 2097152
+retry_backoff_seconds = [1, 2, 4]

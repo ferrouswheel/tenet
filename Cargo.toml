@@ -16,7 +16,7 @@ path = "src/bin/simulation.rs"
 
 [[bin]]
 name = "tenet-debugger"
-path = "src/bin/toy_ui.rs"
+path = "src/bin/debugger.rs"
 
 [[bin]]
 name = "tenet-relay"
@@ -53,8 +53,8 @@ axum-extra = { version = "0.9", features = ["multipart"] }
 clap = { version = "4", features = ["derive"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 tokio-tungstenite = "0.21"
 futures-util = "0.3"

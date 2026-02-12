@@ -13,11 +13,51 @@ behaviour, and relay configuration. Ready-made scenarios are in `scenarios/`.
 
 ```bash
 # Non-interactive (fast-forward, prints a JSON report at the end)
-cargo run --bin tenet-sim -- scenarios/basic.toml
+cargo run --bin tenet-sim -- scenarios/small_dense_6.toml
 
 # Interactive TUI
-cargo run --bin tenet-sim -- --tui scenarios/basic.toml
+cargo run --bin tenet-sim -- --tui scenarios/small_dense_6.toml
 ```
+
+## Protocol feature coverage
+
+The simulation exercises these Tenet protocol features:
+
+| Feature | Covered | Notes |
+|---------|---------|-------|
+| `MessageKind::Direct` | ✅ | All scenarios; default message type |
+| `MessageKind::Public` | ✅ | `public_messages_test.toml`, `group_messages_test.toml` |
+| `MessageKind::FriendGroup` | ✅ | `group_messages_test.toml` |
+| `MessageKind::StoreForPeer` | ✅ | `store_and_forward_3.toml` |
+| `MetaMessage::Online/Ack/MessageRequest` | ✅ | Generated on every online transition |
+| `MetaMessage::FriendRequest/FriendAccept` | ✅ | `friend_discovery.toml`; configured via `friend_request_config` |
+| Reply threads (`reply_to` field) | ✅ | `reaction_config` schedules same-kind replies; `reply_probability = 1.0` causes cascading exchanges |
+| Network degradation (drops, latency) | ✅ | `degraded_network.toml`; configured via top-level `[network_conditions]` block |
+| Profiles | ❌ | No profile broadcasts simulated |
+| Attachments | ❌ | Messages are plain text only; no binary payloads |
+
+### Ready-made scenarios
+
+All scenarios use HPKE encryption for Direct messages (`[simulation.encryption] type = "encrypted"`), matching real protocol behaviour.  Public and Group message payloads are always plaintext by design (no single recipient to encrypt to).
+
+| Scenario | Message types | Reply prob. | Groups | Purpose |
+|----------|--------------|-------------|--------|---------|
+| `small_dense_6.toml` | Direct | 25 % | No | Baseline: 6 peers, three cohorts (always-on, rarely-on, diurnal) |
+| `public_messages_test.toml` | Direct + Public | 30 % | No | Public broadcasting with a "broadcasters" cohort |
+| `group_messages_test.toml` | Direct + Public + Group | 30 % | Yes (3 groups) | Group messaging; per-cohort message-type weights |
+| `reply_chains.toml` | Direct | 50 % | No | Focused reply-chain test: two cohorts, 12 h window, log-normal response times |
+| `store_and_forward_3.toml` | Direct | — | No | Peer-assisted store-and-forward; 3 nodes, deliberate offline patterns |
+| `large_clustered_100.toml` | Direct | 15 % | No | 100 peers in 12 clusters; scale / delivery-ratio stress test |
+| `degraded_network.toml` | Direct | — | No | 15 % message-drop rate; measures delivery-ratio degradation under packet loss |
+| `friend_discovery.toml` | Direct | — | No | 25 % initial friends; remaining 75 % connect via FriendRequest/FriendAccept over 48 h |
+
+### Remaining gaps
+
+The following features are still not exercised by the simulation:
+
+- **Profiles** — profile creation and broadcast (`MetaMessage` profile variants) are not scheduled.  Out of scope for the transport-layer harness.
+- **Attachments** — simulated messages are plain text; no binary attachment payloads are generated.  Out of scope for the transport-layer harness.
+- **TTL expiry** — no scenario uses a short enough relay TTL with sufficiently offline recipients to specifically exercise the expired-message path.  A scenario with `ttl_seconds = 60` and `online_probability = 0.05` would cover this.
 
 ## Execution model
 
@@ -278,14 +318,17 @@ group = 1.0
 
 ### `encryption` (optional)
 
+Controls payload encryption for Direct messages.  Defaults to `encrypted` when
+omitted, matching the real protocol.  `plaintext` is available for debugging.
+
 ```toml
 [simulation.encryption]
-type = "plaintext"
+type = "encrypted"   # default — HPKE per-recipient encryption
 ```
 
 ```toml
 [simulation.encryption]
-type = "encrypted"
+type = "plaintext"   # debug only
 ```
 
 ### `clustering` (optional)
@@ -326,7 +369,10 @@ count = 1
 
 ### `reaction_config` (optional)
 
-When set, receiving a message may trigger an automatic reply after a configurable delay.
+When set, receiving a message triggers an automatic reply of the same kind (`Direct` → Direct,
+`Public` → Public, `FriendGroup` → same group) after a configurable delay.  Replies are real
+`MessageSend` events so they appear in delivery metrics and can themselves trigger further
+replies, producing cascading conversation threads.
 
 ```toml
 [simulation.reaction_config]
@@ -341,6 +387,56 @@ max = 300.0
 `reply_delay_distribution` uses the same variants as latency distributions: `fixed` (with
 `seconds`), `uniform` (with `min`/`max`), `normal` (with `mean`/`std_dev`), and `log_normal`
 (with `mean`/`std_dev`).
+
+### `friend_request_config` (optional)
+
+Controls dynamic friend-graph construction.  When absent the full friend graph is active from
+simulation start.  When present only `initial_friend_fraction` of the planned friendships are
+active at `t=0`; the rest are established during the run via `FriendRequest` / `FriendAccept`
+meta message exchanges.
+
+```toml
+[simulation.friend_request_config]
+initial_friend_fraction = 0.5   # 50 % of friendships start active
+request_rate_per_hour = 2.0     # each pending pair gets one request every ~30 min on average
+
+[simulation.friend_request_config.acceptance_delay]
+type = "uniform"
+min = 300.0    # 5 minutes
+max = 1800.0   # 30 minutes
+```
+
+`acceptance_delay` uses the same distribution variants as `reply_delay_distribution` above.
+
+## `[network_conditions]` fields (optional)
+
+Controls network impairment applied to every envelope the harness posts to the relay.
+When absent all messages are delivered instantly with no drops.
+
+```toml
+[network_conditions]
+drop_probability = 0.1          # 10 % of all envelopes (including meta) silently dropped
+
+[network_conditions.direct_latency]
+type = "log_normal"
+mean = 0.5
+std_dev = 0.4
+
+[network_conditions.relay_post_latency]
+type = "uniform"
+min = 0.05
+max = 0.5
+
+[network_conditions.relay_fetch_latency]
+type = "uniform"
+min = 0.05
+max = 0.3
+```
+
+- `drop_probability` applies to **all** message kinds including meta (Online/Ack).  Dropped
+  envelopes never reach the relay and are not counted as delivered.
+- `direct_latency`, `relay_post_latency`, `relay_fetch_latency` use the same distribution
+  variants as `reply_delay_distribution` above.  All default to `fixed { seconds: 0.0 }`.
 
 ## `[relay]` fields
 
@@ -397,11 +493,12 @@ The `report` section (`SimulationMetricsReport`) adds aggregate summaries:
 - `sent_messages_by_kind`: per message kind min/avg/max sent counts per peer.
 - `message_size_by_kind`: per message kind min/avg/max payload sizes in **bytes**.
 
-If a message kind has `no samples`, it means the scenario did not generate that kind. The current
-scenarios primarily emit direct messages and store-and-forward traffic, so `public` and
-`friend_group` kinds will remain at zero until scenarios start scheduling those messages. Meta
-messages are emitted for online broadcasts, acknowledgements, and missed-message requests; if the
-`meta` kind remains at zero it indicates a simulation bug rather than an optional feature.
+If a message kind has `no samples`, it means the scenario did not generate that kind. The
+`small_dense_6.toml` and `store_and_forward_3.toml` scenarios emit only direct messages, so
+`public` and `friend_group` will be zero in their reports — use `public_messages_test.toml` or
+`group_messages_test.toml` to see those kinds. Meta messages are emitted for online broadcasts,
+acknowledgements, and missed-message requests; if the `meta` kind remains at zero it indicates a
+simulation bug rather than an optional feature.
 
 ## TUI controls
 
@@ -417,6 +514,6 @@ When running `tenet-sim --tui`, use these keys to control the simulation:
 
 ### Manual TUI test
 
-1. Run a simulation with the TUI enabled: `cargo run --bin tenet-sim -- --tui scenarios/basic.toml`.
+1. Run a simulation with the TUI enabled: `cargo run --bin tenet-sim -- --tui scenarios/small_dense_6.toml`.
 2. Wait for the simulation to complete and confirm the status panel displays the completion prompt.
 3. Press `q` and confirm the TUI exits back to the terminal.

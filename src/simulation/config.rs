@@ -109,7 +109,40 @@ pub struct SimulationConfig {
     pub message_type_weights: Option<MessageTypeWeights>,
     #[serde(default)]
     pub reaction_config: Option<ReactionConfig>,
+    #[serde(default)]
+    pub friend_request_config: Option<FriendRequestConfig>,
     pub seed: u64,
+}
+
+/// Configuration for dynamic friend-request simulation.
+///
+/// When present, the scenario starts with only `initial_friend_fraction` of the
+/// planned friendships active.  The remaining pairs exchange FriendRequest /
+/// FriendAccept meta messages over time, activating the friendship (and the
+/// routing edge) once the accept is processed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequestConfig {
+    /// Fraction of friendships active at simulation start (0.0 – 1.0).
+    /// The remaining pairs are established dynamically.  Defaults to 0.5.
+    #[serde(default = "default_initial_friend_fraction")]
+    pub initial_friend_fraction: f64,
+
+    /// Poisson rate at which each node sends new friend requests (per hour).
+    /// Controls how quickly the pending pairs get connected.  Defaults to 2.0.
+    #[serde(default = "default_friend_request_rate")]
+    pub request_rate_per_hour: f64,
+
+    /// How long after a FriendRequest is sent before the accept arrives.
+    #[serde(default)]
+    pub acceptance_delay: LatencyDistribution,
+}
+
+fn default_initial_friend_fraction() -> f64 {
+    0.5
+}
+
+fn default_friend_request_rate() -> f64 {
+    2.0
 }
 
 /// Configuration for dynamic event generation (reactions)
@@ -414,6 +447,10 @@ pub struct SimulationScenarioConfig {
     pub simulation: SimulationConfig,
     pub relay: RelayConfigToml,
     pub direct_enabled: Option<bool>,
+    /// Optional network-impairment settings (drop rate, latency distributions).
+    /// When absent all messages are delivered instantly with no drops.
+    #[serde(default)]
+    pub network_conditions: Option<NetworkConditions>,
 }
 
 /// Latency distribution for network operations
