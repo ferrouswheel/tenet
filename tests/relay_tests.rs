@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::Router;
@@ -53,7 +54,11 @@ async fn start_relay(config: RelayConfig) -> (String, oneshot::Sender<()>) {
     let addr = listener.local_addr().expect("relay addr");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
         let _ = shutdown_rx.await;
     });
     tokio::spawn(async move {

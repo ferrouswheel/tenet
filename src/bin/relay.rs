@@ -1,4 +1,5 @@
 use std::env;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tenet::relay::{app, RelayConfig, RelayState};
@@ -36,9 +37,12 @@ async fn main() {
     let local_addr = listener.local_addr().expect("failed to get local address");
     tenet::tlog!("tenet-relay listening on http://{}", local_addr);
 
-    axum::serve(listener, app)
-        .await
-        .unwrap_or_else(|error| panic!("server error: {error}"));
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("server error: {error}"));
 }
 
 fn env_u64(key: &str, default_value: u64) -> u64 {

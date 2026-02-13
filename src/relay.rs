@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,10 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Path, Query, State, WebSocketUpgrade,
+        ConnectInfo, Path, Query, State, WebSocketUpgrade,
     },
     http::StatusCode,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -20,6 +21,157 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, MutexGuard, RwLock};
 use tokio::time::sleep;
+
+const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tenet Relay</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#111;font-size:14px;line-height:1.5}
+.header{background:#fff;border-bottom:1px solid #e5e5e5;padding:14px 28px;display:flex;align-items:center;justify-content:space-between}
+.header h1{font-size:15px;font-weight:600;letter-spacing:.04em}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-right:8px;vertical-align:middle}
+.uptime{font-size:13px;color:#888}
+.main{max-width:1100px;margin:28px auto;padding:0 24px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+.card{background:#fff;border:1px solid #e5e5e5;border-radius:6px;padding:14px 16px}
+.card .label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin-bottom:4px}
+.card .value{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;color:#111}
+.card .value.hi{color:#2563eb}
+.box{background:#fff;border:1px solid #e5e5e5;border-radius:6px;margin-bottom:20px;overflow:hidden}
+.box-title{padding:10px 16px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#666;background:#fafafa;border-bottom:1px solid #e5e5e5}
+table{width:100%;border-collapse:collapse}
+th{padding:8px 16px;text-align:left;font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:#999;background:#fafafa;border-bottom:1px solid #f0f0f0;white-space:nowrap}
+td{padding:9px 16px;font-size:13px;border-top:1px solid #f5f5f5;vertical-align:middle}
+tr:hover td{background:#fafafa}
+.mono{font-family:'SF Mono','Cascadia Code',Consolas,monospace;font-size:12px}
+.muted{color:#999}
+.bar-wrap{width:60px;height:4px;background:#eee;border-radius:2px;display:inline-block;vertical-align:middle;margin-left:8px}
+.bar-fill{height:100%;background:#2563eb;border-radius:2px}
+.lat-row{padding:14px 16px;display:flex;gap:28px;align-items:center}
+.lat-item label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#999;margin-bottom:2px}
+.lat-item .n{font-size:20px;font-weight:600}
+.lat-item.cnt .n{font-size:16px;color:#666}
+.del{display:inline-flex;gap:10px;font-size:12px}
+.del span{color:#666}
+.del span b{color:#111;font-weight:600}
+.sent{display:inline-flex;gap:10px;font-size:12px}
+.sent span{color:#666}
+.sent span b{color:#111;font-weight:600}
+.link-icon{font-size:13px;color:#2563eb;text-decoration:none;margin-left:6px}
+.link-icon:hover{text-decoration:underline}
+.badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:#f0f4ff;color:#2563eb;font-weight:500}
+.empty{padding:24px;text-align:center;color:#bbb;font-size:13px}
+.footer{text-align:center;color:#bbb;font-size:12px;margin-top:16px;margin-bottom:32px}
+@media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr)}.lat-row{flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1><span class="dot"></span>Tenet Relay</h1>
+  <span class="uptime" id="uptime"></span>
+</div>
+<div class="main">
+  <div class="cards">
+    <div class="card"><div class="label">Inboxes</div><div class="value" id="c-inboxes">&#x2014;</div></div>
+    <div class="card"><div class="label">Queued</div><div class="value hi" id="c-queued">&#x2014;</div></div>
+    <div class="card"><div class="label">WebSockets</div><div class="value" id="c-ws">&#x2014;</div></div>
+    <div class="card"><div class="label">Total Stored</div><div class="value" id="c-stored">&#x2014;</div></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Connected Clients</div>
+    <div id="clients-body"></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Inboxes</div>
+    <div id="inboxes-body"></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Delivery Latency</div>
+    <div id="latency-body"></div>
+  </div>
+</div>
+<div class="footer" id="footer">loading&#x2026;</div>
+<script>
+function fmtBytes(b){return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(2)+'MB'}
+function fmtDur(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+pad(s%60)+'s';return Math.floor(s/3600)+'h '+pad(Math.floor((s%3600)/60))+'m'}
+function pad(n){return String(n).padStart(2,'0')}
+function fmtPeer(id){return id.length>20?id.slice(0,8)+'\u2026'+id.slice(-8):id}
+function set(id,v){const el=document.getElementById(id);if(el)el.textContent=v}
+function rateCell(m,h,d){
+  return '<div class="del">'+
+    '<span><b>'+m+'</b>/min</span>'+
+    '<span><b>'+h+'</b>/hr</span>'+
+    '<span><b>'+d+'</b>/day</span>'+
+  '</div>'
+}
+async function refresh(){
+  let d;
+  try{d=await fetch('/debug/stats').then(r=>r.json())}catch(e){set('footer','fetch failed \u2013 retrying');return}
+  set('uptime','up '+fmtDur(d.uptime_secs||0));
+  set('c-inboxes',d.total_inboxes||0);
+  set('c-queued',d.total_queued||0);
+  set('c-ws',d.ws_connections||0);
+  set('c-stored',d.total_stored||0);
+
+  // Connected clients
+  const clients=d.ws_clients||[];
+  const cb=document.getElementById('clients-body');
+  if(!clients.length){cb.innerHTML='<div class="empty">No active WebSocket connections</div>'}
+  else{
+    cb.innerHTML='<table><thead><tr>'+
+      '<th>Peer ID</th><th>IP</th><th>Web UI</th><th>Version</th><th>Connected</th><th>Sent (1m / 1h / 24h)</th>'+
+      '</tr></thead><tbody>'+
+    clients.map(c=>'<tr>'+
+      '<td class="mono">'+fmtPeer(c.peer_id)+'</td>'+
+      '<td class="mono muted">'+(c.ip||'\u2014')+'</td>'+
+      '<td>'+(c.web_ui_url?'<a class="link-icon" href="'+c.web_ui_url+'" target="_blank">'+c.web_ui_url+' &#x2197;</a>':'\u2014')+'</td>'+
+      '<td>'+(c.version?'<span class="badge">'+c.version+'</span>':'\u2014')+'</td>'+
+      '<td class="muted">'+fmtDur(c.connected_secs||0)+'</td>'+
+      '<td>'+rateCell(c.sent_1m||0,c.sent_1h||0,c.sent_24h||0)+'</td>'+
+      '</tr>').join('')+'</tbody></table>'
+  }
+
+  // Inboxes
+  const inboxes=d.inboxes||[];
+  const ib=document.getElementById('inboxes-body');
+  if(!inboxes.length){ib.innerHTML='<div class="empty">No inboxes yet</div>'}
+  else{
+    const maxB=Math.max(...inboxes.map(i=>i.queue_bytes),1);
+    ib.innerHTML='<table><thead><tr>'+
+      '<th>Peer ID</th><th>Queue</th><th>Size</th><th>Last Seen</th><th>Delivered (1m / 1h / 24h)</th>'+
+      '</tr></thead><tbody>'+
+    inboxes.map(i=>'<tr>'+
+      '<td class="mono">'+fmtPeer(i.peer_id)+'</td>'+
+      '<td>'+i.queue_depth+'</td>'+
+      '<td>'+fmtBytes(i.queue_bytes)+'<span class="bar-wrap"><div class="bar-fill" style="width:'+Math.round(i.queue_bytes/maxB*100)+'%"></div></span></td>'+
+      '<td class="muted">'+fmtDur(i.last_seen_secs)+' ago</td>'+
+      '<td>'+rateCell(i.delivered_1m||0,i.delivered_1h||0,i.delivered_24h||0)+'</td>'+
+      '</tr>').join('')+'</tbody></table>'
+  }
+
+  // Latency
+  const lat=d.latency_ms||{};
+  const lb=document.getElementById('latency-body');
+  if(!lat.count){lb.innerHTML='<div class="empty">No deliveries recorded yet</div>'}
+  else{
+    lb.innerHTML='<div class="lat-row">'+
+      '<div class="lat-item"><label>Min</label><div class="n">'+lat.min+'ms</div></div>'+
+      '<div class="lat-item"><label>Avg</label><div class="n">'+lat.avg+'ms</div></div>'+
+      '<div class="lat-item"><label>Max</label><div class="n">'+lat.max+'ms</div></div>'+
+      '<div class="lat-item cnt"><label>Deliveries</label><div class="n">'+lat.count+'</div></div>'+
+      '</div>'
+  }
+  set('footer','refreshed '+new Date().toLocaleTimeString()+' \u00b7 auto-refresh 5s');
+}
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>"#;
 
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -40,12 +192,35 @@ pub struct RelayState {
     config: RelayConfig,
     inner: Arc<Mutex<RelayStateInner>>,
     subscribers: Arc<RwLock<HashMap<String, broadcast::Sender<Value>>>>,
+    start_time: Instant,
+    ws_connections: Arc<AtomicUsize>,
 }
 
 struct RelayStateInner {
     queues: HashMap<String, VecDeque<StoredEnvelope>>,
     dedup: HashMap<String, Instant>,
     peer_last_seen: HashMap<String, Instant>,
+    // Lifetime stats
+    total_stored: u64,
+    total_delivered: u64,
+    latency_min_ms: u64,
+    latency_max_ms: u64,
+    latency_sum_ms: u64,
+    latency_count: u64,
+    // Rolling activity windows (pruned to 24 h)
+    inbox_deliveries: HashMap<String, VecDeque<Instant>>,
+    peer_sends: HashMap<String, VecDeque<Instant>>,
+    // Active WebSocket connections
+    ws_clients: HashMap<u64, WsClientInfo>,
+    next_conn_id: u64,
+}
+
+struct WsClientInfo {
+    peer_id: String,
+    ip: Option<String>,
+    web_ui_url: Option<String>,
+    version: Option<String>,
+    connected_at: Instant,
 }
 
 #[derive(Clone)]
@@ -68,6 +243,7 @@ struct StoredEnvelope {
     size_bytes: usize,
     expires_at: Instant,
     message_id: String,
+    stored_at: Instant,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +281,7 @@ struct BatchStoreResult {
 
 pub fn app(state: RelayState) -> Router {
     Router::new()
+        .route("/", get(index_handler))
         .route("/health", get(healthcheck))
         .route("/envelopes", post(store_envelope))
         .route("/envelopes/batch", post(store_envelopes_batch))
@@ -123,8 +300,20 @@ impl RelayState {
                 queues: HashMap::new(),
                 dedup: HashMap::new(),
                 peer_last_seen: HashMap::new(),
+                total_stored: 0,
+                total_delivered: 0,
+                latency_min_ms: u64::MAX,
+                latency_max_ms: 0,
+                latency_sum_ms: 0,
+                latency_count: 0,
+                inbox_deliveries: HashMap::new(),
+                peer_sends: HashMap::new(),
+                ws_clients: HashMap::new(),
+                next_conn_id: 0,
             })),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
+            start_time: Instant::now(),
+            ws_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -182,12 +371,50 @@ impl RelayState {
     }
 }
 
+async fn index_handler() -> impl IntoResponse {
+    Html(DASHBOARD_HTML)
+}
+
 async fn healthcheck() -> impl IntoResponse {
     StatusCode::OK
 }
 
+#[derive(Serialize)]
+struct InboxInfo {
+    peer_id: String,
+    queue_depth: usize,
+    queue_bytes: usize,
+    last_seen_secs: u64,
+    delivered_1m: usize,
+    delivered_1h: usize,
+    delivered_24h: usize,
+}
+
+#[derive(Serialize)]
+struct LatencyInfo {
+    min: u64,
+    max: u64,
+    avg: u64,
+    count: u64,
+}
+
+#[derive(Serialize)]
+struct WsClientStats {
+    peer_id: String,
+    ip: Option<String>,
+    web_ui_url: Option<String>,
+    version: Option<String>,
+    connected_secs: u64,
+    sent_1m: usize,
+    sent_1h: usize,
+    sent_24h: usize,
+}
+
 async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
     let inner = state.inner.lock().await;
+    let now = Instant::now();
+
+    // Legacy fields kept for backwards compatibility with the debugger CLI
     let queues: HashMap<String, usize> = inner
         .queues
         .iter()
@@ -195,22 +422,112 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
         .collect();
     let total: usize = queues.values().sum();
     let peer_count = inner.peer_last_seen.len();
+
+    // Per-inbox detail, sorted by queue depth descending
+    let mut inboxes: Vec<InboxInfo> = inner
+        .queues
+        .iter()
+        .map(|(peer_id, queue)| {
+            let queue_depth = queue.iter().filter(|e| e.expires_at > now).count();
+            let queue_bytes: usize = queue
+                .iter()
+                .filter(|e| e.expires_at > now)
+                .map(|e| e.size_bytes)
+                .sum();
+            let last_seen_secs = inner
+                .peer_last_seen
+                .get(peer_id)
+                .map(|t| now.duration_since(*t).as_secs())
+                .unwrap_or(0);
+            let deliveries = inner.inbox_deliveries.get(peer_id);
+            InboxInfo {
+                peer_id: peer_id.clone(),
+                queue_depth,
+                queue_bytes,
+                last_seen_secs,
+                delivered_1m: deliveries.map(|d| count_in_window(d, now, 60)).unwrap_or(0),
+                delivered_1h: deliveries.map(|d| count_in_window(d, now, 3600)).unwrap_or(0),
+                delivered_24h: deliveries.map(|d| count_in_window(d, now, 86400)).unwrap_or(0),
+            }
+        })
+        .collect();
+    inboxes.sort_by(|a, b| b.queue_depth.cmp(&a.queue_depth).then(a.peer_id.cmp(&b.peer_id)));
+
+    let total_queued_bytes: usize = inboxes.iter().map(|i| i.queue_bytes).sum();
+
+    let latency = if inner.latency_count > 0 {
+        Some(LatencyInfo {
+            min: inner.latency_min_ms,
+            max: inner.latency_max_ms,
+            avg: inner.latency_sum_ms / inner.latency_count,
+            count: inner.latency_count,
+        })
+    } else {
+        None
+    };
+
+    let mut ws_clients: Vec<WsClientStats> = inner
+        .ws_clients
+        .values()
+        .map(|c| {
+            let sends = inner.peer_sends.get(&c.peer_id);
+            WsClientStats {
+                peer_id: c.peer_id.clone(),
+                ip: c.ip.clone(),
+                web_ui_url: c.web_ui_url.clone(),
+                version: c.version.clone(),
+                connected_secs: now.duration_since(c.connected_at).as_secs(),
+                sent_1m: sends.map(|s| count_in_window(s, now, 60)).unwrap_or(0),
+                sent_1h: sends.map(|s| count_in_window(s, now, 3600)).unwrap_or(0),
+                sent_24h: sends.map(|s| count_in_window(s, now, 86400)).unwrap_or(0),
+            }
+        })
+        .collect();
+    ws_clients.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+
+    let uptime_secs = state.start_time.elapsed().as_secs();
+    let ws_connections = state.ws_connections.load(Ordering::Relaxed);
+
     Json(serde_json::json!({
+        // Legacy fields
         "queues": queues,
         "total": total,
         "peer_count": peer_count,
+        // Extended fields
+        "uptime_secs": uptime_secs,
+        "total_inboxes": inboxes.len(),
+        "total_queued": total,
+        "total_queued_bytes": total_queued_bytes,
+        "total_stored": inner.total_stored,
+        "total_delivered": inner.total_delivered,
+        "ws_connections": ws_connections,
+        "ws_clients": ws_clients,
+        "inboxes": inboxes,
+        "latency_ms": latency,
+        "config": {
+            "ttl_secs": state.config.ttl.as_secs(),
+            "max_messages": state.config.max_messages,
+            "max_bytes": state.config.max_bytes,
+        }
     }))
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(recipient_id): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, recipient_id, state))
+    let ip = addr.ip().to_string();
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, recipient_id, ip, state))
 }
 
-async fn handle_ws_connection(mut socket: WebSocket, recipient_id: String, state: RelayState) {
+async fn handle_ws_connection(
+    mut socket: WebSocket,
+    recipient_id: String,
+    ip: String,
+    state: RelayState,
+) {
     let mut rx = state.subscribe(&recipient_id).await;
 
     {
@@ -218,6 +535,25 @@ async fn handle_ws_connection(mut socket: WebSocket, recipient_id: String, state
         let now = Instant::now();
         record_peer_connection(&state.config, &mut inner, &recipient_id, now);
     }
+
+    let conn_id = {
+        let mut inner = state.inner.lock().await;
+        let id = inner.next_conn_id;
+        inner.next_conn_id += 1;
+        inner.ws_clients.insert(
+            id,
+            WsClientInfo {
+                peer_id: recipient_id.clone(),
+                ip: Some(ip),
+                web_ui_url: None,
+                version: None,
+                connected_at: Instant::now(),
+            },
+        );
+        id
+    };
+
+    state.ws_connections.fetch_add(1, Ordering::Relaxed);
 
     log_message(
         &state.config,
@@ -255,6 +591,23 @@ async fn handle_ws_connection(mut socket: WebSocket, recipient_id: String, state
             }
             msg = socket.recv() => {
                 match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Handle hello message from client
+                        if let Ok(hello) = serde_json::from_str::<Value>(&text) {
+                            if hello.get("type").and_then(|v| v.as_str()) == Some("hello") {
+                                let mut inner = state.inner.lock().await;
+                                if let Some(client) = inner.ws_clients.get_mut(&conn_id) {
+                                    if let Some(v) = hello.get("version").and_then(|v| v.as_str()) {
+                                        client.version = Some(v.to_string());
+                                    }
+                                    if let Some(port) = hello.get("web_ui_port").and_then(|v| v.as_u64()) {
+                                        let ip = client.ip.clone().unwrap_or_default();
+                                        client.web_ui_url = Some(format!("http://{}:{}", ip, port));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Some(Ok(Message::Ping(data))) => {
                         if socket.send(Message::Pong(data)).await.is_err() {
                             break;
@@ -266,6 +619,13 @@ async fn handle_ws_connection(mut socket: WebSocket, recipient_id: String, state
             }
         }
     }
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.ws_clients.remove(&conn_id);
+    }
+
+    state.ws_connections.fetch_sub(1, Ordering::Relaxed);
 
     log_message(
         &state.config,
@@ -438,10 +798,12 @@ async fn fetch_inbox(
     };
     let now = Instant::now();
     record_peer_connection(&state.config, &mut inner, &recipient_id, now);
-    let (expired_ids, envelopes) = match inner.queues.get_mut(&recipient_id) {
+    let (expired_ids, envelopes, latencies) = match inner.queues.get_mut(&recipient_id) {
         Some(queue) => pop_envelopes(queue, query.limit, now),
         None => return (StatusCode::OK, Json(Vec::<Value>::new())).into_response(),
     };
+
+    record_deliveries(&mut inner, &recipient_id, &latencies, now);
 
     for message_id in expired_ids {
         inner.dedup.remove(&message_id);
@@ -463,14 +825,25 @@ async fn fetch_inbox_batch(
     let mut expired_ids = Vec::new();
     let mut results = HashMap::new();
 
+    // Collect (recipient_id, latencies) pairs before calling record_deliveries
+    // to avoid borrowing inner.queues while mutably borrowing inner.inbox_deliveries.
+    let mut delivery_records: Vec<(String, Vec<u128>)> = Vec::new();
+
     for recipient_id in request.recipient_ids {
         record_peer_connection(&state.config, &mut inner, &recipient_id, now);
-        let (expired, envelopes) = match inner.queues.get_mut(&recipient_id) {
+        let (expired, envelopes, latencies) = match inner.queues.get_mut(&recipient_id) {
             Some(queue) => pop_envelopes(queue, request.limit, now),
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         expired_ids.extend(expired);
+        if !latencies.is_empty() {
+            delivery_records.push((recipient_id.clone(), latencies));
+        }
         results.insert(recipient_id, envelopes);
+    }
+
+    for (recipient_id, latencies) in delivery_records {
+        record_deliveries(&mut inner, &recipient_id, &latencies, now);
     }
 
     for message_id in expired_ids {
@@ -517,18 +890,72 @@ fn pop_envelopes(
     queue: &mut VecDeque<StoredEnvelope>,
     limit: Option<usize>,
     now: Instant,
-) -> (Vec<String>, Vec<Value>) {
+) -> (Vec<String>, Vec<Value>, Vec<u128>) {
     let expired_ids = prune_expired(queue, now);
     let limit = limit.unwrap_or(queue.len());
     let mut envelopes = Vec::new();
+    let mut latencies = Vec::new();
 
     for _ in 0..limit.min(queue.len()) {
         if let Some(item) = queue.pop_front() {
+            latencies.push(now.duration_since(item.stored_at).as_millis());
             envelopes.push(item.body);
         }
     }
 
-    (expired_ids, envelopes)
+    (expired_ids, envelopes, latencies)
+}
+
+/// Push a delivery timestamp for `recipient_id` and update lifetime latency stats.
+fn record_deliveries(
+    inner: &mut RelayStateInner,
+    recipient_id: &str,
+    latencies: &[u128],
+    now: Instant,
+) {
+    for &lat_ms in latencies {
+        let lat = lat_ms as u64;
+        if lat < inner.latency_min_ms {
+            inner.latency_min_ms = lat;
+        }
+        if lat > inner.latency_max_ms {
+            inner.latency_max_ms = lat;
+        }
+        inner.latency_sum_ms = inner.latency_sum_ms.saturating_add(lat);
+        inner.latency_count += 1;
+        push_timestamped(
+            inner
+                .inbox_deliveries
+                .entry(recipient_id.to_string())
+                .or_default(),
+            now,
+        );
+    }
+    inner.total_delivered += latencies.len() as u64;
+}
+
+/// Push `now` into a rolling 24-hour timestamp window.
+fn push_timestamped(deque: &mut VecDeque<Instant>, now: Instant) {
+    deque.push_back(now);
+    let max_age = Duration::from_secs(86400);
+    while let Some(&front) = deque.front() {
+        if now.duration_since(front) > max_age {
+            deque.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Count timestamps in `deque` that fall within the last `window_secs` seconds.
+fn count_in_window(deque: &VecDeque<Instant>, now: Instant, window_secs: u64) -> usize {
+    let window = Duration::from_secs(window_secs);
+    // Deque is ordered oldest-first, so iterate from the back for efficiency.
+    deque
+        .iter()
+        .rev()
+        .take_while(|&&t| now.duration_since(t) <= window)
+        .count()
 }
 
 fn prune_expired(queue: &mut VecDeque<StoredEnvelope>, now: Instant) -> Vec<String> {
@@ -652,6 +1079,7 @@ fn store_envelope_locked(
                 size_bytes,
                 expires_at,
                 message_id: message_id.clone(),
+                stored_at: now,
             };
             let queue = inner
                 .queues
@@ -671,7 +1099,13 @@ fn store_envelope_locked(
             queue.push_back(stored);
         }
 
-        if let Some(sender_id) = &sender_id {
+        inner.total_stored += recipients.len() as u64;
+
+        if let Some(ref sender_id) = sender_id {
+            push_timestamped(
+                inner.peer_sends.entry(sender_id.clone()).or_default(),
+                now,
+            );
             log_message(
                 config,
                 format!(
@@ -694,6 +1128,7 @@ fn store_envelope_locked(
         size_bytes,
         expires_at,
         message_id: message_id.clone(),
+        stored_at: now,
     };
     let mut evicted_ids = Vec::new();
     {
@@ -714,11 +1149,17 @@ fn store_envelope_locked(
         queue.push_back(stored);
     }
 
+    inner.total_stored += 1;
+
     for message_id in evicted_ids {
         inner.dedup.remove(&message_id);
     }
 
     if let Some(sender_id) = sender_id {
+        push_timestamped(
+            inner.peer_sends.entry(sender_id.clone()).or_default(),
+            now,
+        );
         log_message(
             config,
             format!(

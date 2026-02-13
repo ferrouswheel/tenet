@@ -3,6 +3,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::crypto::{generate_content_key, NONCE_SIZE};
@@ -74,7 +75,7 @@ pub async fn update_own_profile_handler(
     let now = now_secs();
 
     // Short lock: persist profile and extract data for broadcasting
-    let (keypair_id, signing_key, relay_url, friend_enc_keys) = {
+    let (keypair_id, signing_key, relay_url, friend_enc_keys, avatar_inline) = {
         let st = state.lock().await;
 
         let profile = ProfileRow {
@@ -107,11 +108,28 @@ pub async fn update_own_profile_handler(
             })
             .collect();
 
+        // Fetch avatar attachment bytes so recipients can store them locally.
+        // The relay allows up to 5 MB per message; profile photos from phones are
+        // typically 1-3 MB so no size filter is applied here.
+        let avatar_inline: Option<(String, String)> =
+            req.avatar_hash.as_ref().and_then(|hash| {
+                st.storage
+                    .get_attachment(hash)
+                    .ok()
+                    .flatten()
+                    .map(|att| {
+                        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(&att.data);
+                        (b64, att.content_type)
+                    })
+            });
+
         (
             st.keypair.id.clone(),
             st.keypair.signing_private_key_hex.clone(),
             st.relay_url.clone(),
             friends,
+            avatar_inline,
         )
     };
     // Lock released
@@ -123,6 +141,8 @@ pub async fn update_own_profile_handler(
         "display_name": req.display_name,
         "bio": req.bio,
         "avatar_hash": req.avatar_hash,
+        "avatar_data": avatar_inline.as_ref().map(|(d, _)| d),
+        "avatar_content_type": avatar_inline.as_ref().map(|(_, ct)| ct),
         "public_fields": req.public_fields,
         "updated_at": now,
     });
@@ -167,6 +187,8 @@ pub async fn update_own_profile_handler(
         "display_name": req.display_name,
         "bio": req.bio,
         "avatar_hash": req.avatar_hash,
+        "avatar_data": avatar_inline.as_ref().map(|(d, _)| d),
+        "avatar_content_type": avatar_inline.as_ref().map(|(_, ct)| ct),
         "public_fields": req.public_fields,
         "friends_fields": req.friends_fields,
         "updated_at": now,

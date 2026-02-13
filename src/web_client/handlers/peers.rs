@@ -28,7 +28,20 @@ pub async fn list_peers_handler(State(state): State<SharedState>) -> Response {
     let st = state.lock().await;
     match st.storage.list_peers() {
         Ok(peers) => {
-            let json: Vec<serde_json::Value> = peers.iter().map(peer_to_json).collect();
+            let json: Vec<serde_json::Value> = peers
+                .iter()
+                .map(|p| {
+                    let mut j = peer_to_json(p);
+                    let avatar_hash = st
+                        .storage
+                        .get_profile(&p.peer_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|prof| prof.avatar_hash);
+                    j["avatar_hash"] = serde_json::json!(avatar_hash);
+                    j
+                })
+                .collect();
             (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

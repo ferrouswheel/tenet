@@ -164,8 +164,12 @@
                     <input type="text" id="profile-display-name" placeholder="Your name" />
                     <label>Bio</label>
                     <textarea id="profile-bio" placeholder="Tell us about yourself..." rows="3"></textarea>
-                    <label>Avatar (upload an image first)</label>
-                    <input type="text" id="profile-avatar-hash" placeholder="Attachment content hash" />
+                    <label>Profile Photo</label>
+                    <div class="avatar-upload-zone" id="avatar-upload-zone">
+                        <div id="avatar-upload-preview"></div>
+                        <div class="avatar-upload-overlay">&#128247;</div>
+                        <input type="file" id="avatar-file-input" accept="image/*" style="display:none" onchange="handleAvatarFileSelect(this.files)" />
+                    </div>
                     <div class="form-actions">
                         <button class="btn-secondary" onclick="backFromProfile()">Cancel</button>
                         <button class="btn-primary" onclick="saveProfile()">Save</button>

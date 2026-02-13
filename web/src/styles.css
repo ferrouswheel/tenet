@@ -125,13 +125,36 @@ body {
     margin-bottom: 0.25rem;
 }
 .friend-item:hover { background: #0f1117; }
-.friend-item .online-dot {
-    width: 8px;
-    height: 8px;
+.friend-avatar {
+    width: 36px;
+    height: 36px;
     border-radius: 50%;
-    background: #666;
+    background: #2a2d47;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #5566cc;
+    flex-shrink: 0;
+    overflow: hidden;
+    position: relative;
 }
-.friend-item .online-dot.online { background: #4caf50; }
+.friend-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.friend-online-badge {
+    position: absolute;
+    bottom: 1px;
+    right: 1px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #4caf50;
+    border: 2px solid #1a1d27;
+}
 .friend-item .friend-info {
     flex: 1;
     min-width: 0;
@@ -299,9 +322,36 @@ body {
     padding: 0.75rem 1rem;
     margin-bottom: 0.5rem;
     transition: border-color 0.2s;
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
 }
 .message:hover { border-color: #3a3d47; }
 .message.unread { border-left: 3px solid #5566cc; }
+.msg-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #2a2d47;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #5566cc;
+    flex-shrink: 0;
+    overflow: hidden;
+    cursor: pointer;
+}
+.msg-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.msg-content {
+    flex: 1;
+    min-width: 0;
+}
 .msg-header {
     display: flex;
     align-items: center;
@@ -630,6 +680,31 @@ body {
     padding: 1.5rem;
 }
 
+.post-detail-author {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+}
+.post-detail-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #2a2d47;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #5566cc;
+    flex-shrink: 0;
+    overflow: hidden;
+    cursor: pointer;
+}
+.post-detail-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
 .post-detail-content .post-body {
     font-size: 1rem;
     line-height: 1.6;
@@ -828,6 +903,29 @@ body {
     padding: 0.6rem 0.8rem;
     margin-top: 0.5rem;
     margin-left: 1rem;
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+}
+.reply-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #2a2d47;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #5566cc;
+    flex-shrink: 0;
+    overflow: hidden;
+    cursor: pointer;
+}
+.reply-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
 }
 .reply-item .msg-header {
     display: flex;
@@ -1062,6 +1160,50 @@ body {
     color: #aaa;
 }
 .profile-edit-form .btn-secondary:hover { background: #3a3d47; }
+
+.avatar-upload-zone {
+    width: 96px;
+    height: 96px;
+    border-radius: 50%;
+    background: #2a2d47;
+    border: 2px dashed #3a3d57;
+    cursor: pointer;
+    overflow: hidden;
+    position: relative;
+    margin: 0.5rem 0;
+    transition: border-color 0.2s;
+}
+.avatar-upload-zone:hover,
+.avatar-upload-zone.drag-over { border-color: #5566cc; }
+.avatar-upload-zone:hover .avatar-upload-overlay,
+.avatar-upload-zone.drag-over .avatar-upload-overlay { opacity: 1; }
+#avatar-upload-preview {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: #5566cc;
+}
+#avatar-upload-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.avatar-upload-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+}
 
 /* Peer ID display in sidebar */
 .peer-id-display {

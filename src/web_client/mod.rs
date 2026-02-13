@@ -115,8 +115,14 @@ pub async fn run() {
         // delivered in near-real-time rather than waiting for the next poll.
         let ws_state = Arc::clone(&state);
         let ws_notify = Arc::clone(&notify);
+        let web_ui_port: u16 = config
+            .bind_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(3000);
         tokio::spawn(async move {
-            sync::relay_ws_listen_loop(ws_state, ws_notify).await;
+            sync::relay_ws_listen_loop(ws_state, ws_notify, web_ui_port).await;
         });
 
         // Send online announcement to known peers

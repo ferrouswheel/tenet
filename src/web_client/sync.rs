@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
@@ -372,7 +372,8 @@ async fn process_message_event(
         let msg_type = parsed.get("type").and_then(|t| t.as_str());
         if msg_type == Some("tenet.profile") {
             drop(st);
-            process_profile_update(state, sender_id, &envelope.header.timestamp, &parsed).await;
+            process_profile_update(state, sender_id, &envelope.header.timestamp, &parsed, now)
+                .await;
             return false;
         }
         if msg_type == Some("group_key_distribution") {
@@ -792,6 +793,7 @@ async fn process_profile_update(
     sender_id: &str,
     header_timestamp: &u64,
     parsed: &serde_json::Value,
+    now: u64,
 ) {
     let st = state.lock().await;
     let profile_user_id = parsed
@@ -828,6 +830,56 @@ async fn process_profile_update(
             .unwrap_or_else(|| "{}".to_string()),
         updated_at,
     };
+
+    // Store inline avatar attachment before the profile upsert check.
+    // The relay delivers each message only once, so we must extract attachment
+    // data on the first (and only) receipt regardless of profile timestamp order.
+    // insert_attachment is idempotent: it skips the file write if already on disk
+    // and uses OR IGNORE for the DB row, so calling it unconditionally is safe.
+    if let Some(hash) = &profile_row.avatar_hash {
+        if let Some(data_b64) = parsed.get("avatar_data").and_then(|v| v.as_str()) {
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64) {
+                Ok(data) => {
+                    let content_type = parsed
+                        .get("avatar_content_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image/jpeg")
+                        .to_string();
+                    let att_row = crate::storage::AttachmentRow {
+                        content_hash: hash.clone(),
+                        content_type,
+                        size_bytes: data.len() as u64,
+                        data,
+                        created_at: now,
+                    };
+                    if let Err(e) = st.storage.insert_attachment(&att_row) {
+                        crate::tlog!(
+                            "sync: failed to store avatar for {}: {}",
+                            crate::logging::peer_id(&profile_user_id),
+                            e
+                        );
+                    } else {
+                        crate::tlog!(
+                            "sync: stored avatar for {}",
+                            crate::logging::peer_id(&profile_user_id)
+                        );
+                    }
+                }
+                Err(e) => {
+                    crate::tlog!(
+                        "sync: failed to decode avatar_data for {}: {}",
+                        crate::logging::peer_id(&profile_user_id),
+                        e
+                    );
+                }
+            }
+        } else {
+            crate::tlog!(
+                "sync: profile from {} has avatar_hash but no avatar_data",
+                crate::logging::peer_id(&profile_user_id)
+            );
+        }
+    }
 
     match st.storage.upsert_profile_if_newer(&profile_row) {
         Ok(true) => {
@@ -882,7 +934,7 @@ async fn process_profile_update(
 ///
 /// Reconnects with exponential backoff on disconnect or error.  Exits cleanly
 /// if no relay URL is configured.
-pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>) {
+pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>, web_ui_port: u16) {
     let mut backoff_secs = 2u64;
     const MAX_BACKOFF_SECS: u64 = 60;
 
@@ -902,7 +954,18 @@ pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>) {
                 backoff_secs = 2; // reset on successful connect
                 crate::tlog!("relay WS connected: {}", ws_url);
 
-                let (_, mut read) = ws_stream.split();
+                let (mut write, mut read) = ws_stream.split();
+
+                // Announce client identity so the relay can display it in the dashboard.
+                let hello = serde_json::json!({
+                    "type": "hello",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "web_ui_port": web_ui_port,
+                });
+                if let Ok(text) = serde_json::to_string(&hello) {
+                    let _ = write.send(WsMessage::Text(text)).await;
+                }
+                // write half is kept alive for the duration of the connection.
 
                 while let Some(msg) = read.next().await {
                     match msg {

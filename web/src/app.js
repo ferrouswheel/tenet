@@ -17,6 +17,7 @@ let pendingAttachments = []; // { file, previewUrl }
 let currentPostReplies = [];
 let repliesOldestTimestamp = null;
 let myProfile = null;
+let pendingAvatarHash = null;
 let viewingProfileId = null;
 let previousView = 'timeline';
 let relayConnected = null; // null = unknown, true/false = status
@@ -201,16 +202,27 @@ function renderMessage(m) {
     const reactionsHtml = renderReactions(m);
     const commentCountHtml = renderCommentCount(m);
 
+    const avatarHash = isSelf
+        ? (myProfile && myProfile.avatar_hash)
+        : (peer && peer.avatar_hash);
+    const avatarInitial = senderLabel[0].toUpperCase();
+    const avatarInner = avatarHash
+        ? `<img src="/api/attachments/${encodeURIComponent(avatarHash)}" alt="" />`
+        : avatarInitial;
+
     return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
-        <div class="msg-header">
-            <span class="msg-badge ${kindClass}">${kindClass}</span>
-            <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${senderLabel}</span>
-            <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
+        <div class="msg-avatar" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${avatarInner}</div>
+        <div class="msg-content">
+            <div class="msg-header">
+                <span class="msg-badge ${kindClass}">${kindClass}</span>
+                <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${senderLabel}</span>
+                <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
+            </div>
+            <div class="msg-body">${escapeHtml(m.body || '')}</div>
+            ${attachmentsHtml}
+            ${reactionsHtml}
+            ${commentCountHtml}
         </div>
-        <div class="msg-body">${escapeHtml(m.body || '')}</div>
-        ${attachmentsHtml}
-        ${reactionsHtml}
-        ${commentCountHtml}
     </div>`;
 }
 
@@ -537,15 +549,25 @@ function renderPostDetail(post) {
     const attachmentsHtml = renderAttachments(post.attachments);
     const reactionsHtml = renderReactions(post);
 
+    const avatarHash = isSelf ? (myProfile && myProfile.avatar_hash) : (peer && peer.avatar_hash);
+    const avatarInner = avatarHash
+        ? `<img src="/api/attachments/${encodeURIComponent(avatarHash)}" alt="" />`
+        : senderLabel[0].toUpperCase();
+
     el.innerHTML = `
-        <div class="msg-header" style="margin-bottom:0.75rem;">
-            <span class="msg-badge ${kindClass}">${kindClass}</span>
-            <span class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</span>
-            <span class="msg-time" title="${msgTimeTitle(post)}">${timeAgo(post.timestamp)}</span>
+        <div class="post-detail-author">
+            <div class="post-detail-avatar" onclick="showPeerProfile('${post.sender_id}')">${avatarInner}</div>
+            <div class="msg-content">
+                <div class="msg-header" style="margin-bottom:0.4rem;">
+                    <span class="msg-badge ${kindClass}">${kindClass}</span>
+                    <span class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</span>
+                    <span class="msg-time" title="${msgTimeTitle(post)}">${timeAgo(post.timestamp)}</span>
+                </div>
+                <div class="post-body">${escapeHtml(post.body || '')}</div>
+                ${attachmentsHtml}
+                ${reactionsHtml}
+            </div>
         </div>
-        <div class="post-body">${escapeHtml(post.body || '')}</div>
-        ${attachmentsHtml}
-        ${reactionsHtml}
     `;
 }
 
@@ -836,6 +858,29 @@ async function uploadAttachment(file) {
     });
 })();
 
+// Drag and drop + click on avatar upload zone
+(function setupAvatarUpload() {
+    const zone = document.getElementById('avatar-upload-zone');
+    if (!zone) return;
+    zone.addEventListener('click', () => {
+        document.getElementById('avatar-file-input').click();
+    });
+    zone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        zone.classList.add('drag-over');
+    });
+    zone.addEventListener('dragleave', () => {
+        zone.classList.remove('drag-over');
+    });
+    zone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        if (e.dataTransfer.files.length > 0) {
+            handleAvatarFileSelect(e.dataTransfer.files);
+        }
+    });
+})();
+
 // Send on Ctrl+Enter / Cmd+Enter
 document.getElementById('compose-body').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -878,12 +923,15 @@ function renderFriendsList() {
 
     el.innerHTML = peers.map(p => {
         const displayName = p.display_name || p.peer_id.substring(0, 12) + '...';
-        const onlineClass = p.online ? 'online' : '';
-        // Use last_seen_online, falling back to added_at (time of friend request/acceptance)
+        const initial = displayName[0].toUpperCase();
         const lastSeenTs = p.last_seen_online || p.added_at;
         const lastSeen = lastSeenTs ? timeAgo(lastSeenTs) : 'never';
+        const avatarInner = p.avatar_hash
+            ? `<img src="/api/attachments/${encodeURIComponent(p.avatar_hash)}" alt="" />`
+            : escapeHtml(initial);
+        const onlineBadge = p.online ? '<span class="friend-online-badge"></span>' : '';
         return `<div class="friend-item" data-peer-id="${p.peer_id}" onclick="openConversationWithPeer('${p.peer_id}')">
-            <span class="online-dot ${onlineClass}"></span>
+            <div class="friend-avatar">${avatarInner}${onlineBadge}</div>
             <div class="friend-info">
                 <div class="friend-name" title="${p.peer_id}">${escapeHtml(displayName)}</div>
                 <div class="friend-last-seen">${p.online ? 'online' : 'last seen ' + lastSeen}</div>
@@ -1281,14 +1329,22 @@ function renderReplyItem(m) {
     const attachmentsHtml = renderAttachments(m.attachments);
     const reactionsHtml = renderReactions(m);
 
+    const avatarHash = isSelf ? (myProfile && myProfile.avatar_hash) : (peer && peer.avatar_hash);
+    const avatarInner = avatarHash
+        ? `<img src="/api/attachments/${encodeURIComponent(avatarHash)}" alt="" />`
+        : senderLabel[0].toUpperCase();
+
     return `<div class="reply-item" data-id="${m.message_id}">
-        <div class="msg-header">
-            <span class="${senderClass}" title="${m.sender_id}" onclick="showPeerProfile('${m.sender_id}')">${senderLabel}</span>
-            <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
+        <div class="reply-avatar" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${avatarInner}</div>
+        <div class="msg-content">
+            <div class="msg-header">
+                <span class="${senderClass}" title="${m.sender_id}" onclick="showPeerProfile('${m.sender_id}')">${senderLabel}</span>
+                <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
+            </div>
+            <div class="msg-body">${escapeHtml(m.body || '')}</div>
+            ${attachmentsHtml}
+            ${reactionsHtml}
         </div>
-        <div class="msg-body">${escapeHtml(m.body || '')}</div>
-        ${attachmentsHtml}
-        ${reactionsHtml}
     </div>`;
 }
 
@@ -1427,6 +1483,43 @@ function navToProfile() {
     showMyProfile();
 }
 
+function renderAvatarUploadPreview() {
+    const preview = document.getElementById('avatar-upload-preview');
+    if (!preview) return;
+    if (pendingAvatarHash) {
+        preview.innerHTML = `<img src="/api/attachments/${encodeURIComponent(pendingAvatarHash)}" alt="" />`;
+    } else {
+        const initial = (myProfile && myProfile.display_name) ? myProfile.display_name[0].toUpperCase() : '?';
+        preview.textContent = initial;
+    }
+}
+
+async function handleAvatarFileSelect(files) {
+    const file = files && files[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+        showToast('Please select an image file');
+        return;
+    }
+    // Show local preview immediately
+    const previewUrl = URL.createObjectURL(file);
+    const preview = document.getElementById('avatar-upload-preview');
+    if (preview) preview.innerHTML = `<img src="${previewUrl}" alt="" />`;
+
+    try {
+        const result = await uploadAttachment(file);
+        pendingAvatarHash = result.content_hash;
+    } catch (e) {
+        showToast('Failed to upload photo: ' + e.message);
+    } finally {
+        URL.revokeObjectURL(previewUrl);
+        renderAvatarUploadPreview();
+    }
+    // Reset file input so the same file can be re-selected if needed
+    const input = document.getElementById('avatar-file-input');
+    if (input) input.value = '';
+}
+
 function showMyProfile(fromRoute) {
     previousView = currentView;
     currentView = 'profile-edit';
@@ -1449,13 +1542,14 @@ function showMyProfile(fromRoute) {
     // Pre-fill form
     document.getElementById('profile-display-name').value = (myProfile && myProfile.display_name) || '';
     document.getElementById('profile-bio').value = (myProfile && myProfile.bio) || '';
-    document.getElementById('profile-avatar-hash').value = (myProfile && myProfile.avatar_hash) || '';
+    pendingAvatarHash = (myProfile && myProfile.avatar_hash) || null;
+    renderAvatarUploadPreview();
 }
 
 async function saveProfile() {
     const displayName = document.getElementById('profile-display-name').value.trim();
     const bio = document.getElementById('profile-bio').value.trim();
-    const avatarHash = document.getElementById('profile-avatar-hash').value.trim();
+    const avatarHash = pendingAvatarHash || null;
 
     try {
         myProfile = await apiPut('/api/profile', {
