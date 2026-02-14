@@ -34,4 +34,5 @@ fn build_web_assets() {
     println!("cargo:rerun-if-changed=web/src/index.html");
     println!("cargo:rerun-if-changed=web/src/styles.css");
     println!("cargo:rerun-if-changed=web/src/app.js");
+    println!("cargo:rerun-if-changed=web/src/relay_dashboard.html");
 }
