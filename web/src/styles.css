@@ -1580,6 +1580,14 @@ body {
     0%, 60% { background: #1a2a4a; border-color: #5566cc; }
     100% { background: #0f1117; border-color: #2a2d37; }
 }
+.reply-item-highlight {
+    border-left-color: #5566cc !important;
+    animation: reply-highlight 2.5s forwards;
+}
+@keyframes reply-highlight {
+    0%, 60% { background: #1a2a4a; border-left-color: #5566cc; }
+    100% { background: #1a1d27; border-left-color: #3a3d47; }
+}
 
 /* Toast notification */
 .toast {

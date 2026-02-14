@@ -25,6 +25,7 @@ let notifications = []; // Phase 11
 let unseenNotificationCount = 0; // Phase 11 - resets to 0 when bell is clicked
 let notificationPanelOpen = false; // Phase 11
 let pendingFriendRequestHighlight = null; // peer ID to highlight on friends page
+let pendingCommentHighlight = null; // reply message ID to highlight after navigating to parent post
 const PAGE_SIZE = 50;
 const COMMENTS_PAGE_SIZE = 100;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -533,6 +534,11 @@ async function showPostDetail(messageId, fromRoute) {
         }
         // Load comments (up to 100)
         await loadReplies(messageId, false);
+        if (pendingCommentHighlight) {
+            const hlId = pendingCommentHighlight;
+            pendingCommentHighlight = null;
+            highlightReply(hlId);
+        }
     } catch (e) {
         showToast('Failed to load post');
         console.error(e);
@@ -1479,6 +1485,14 @@ function highlightFriendRequest(peerId) {
     }
 }
 
+function highlightReply(replyId) {
+    const item = document.querySelector(`.reply-item[data-id="${replyId}"]`);
+    if (!item) return;
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    item.classList.add('reply-item-highlight');
+    setTimeout(() => item.classList.remove('reply-item-highlight'), 2500);
+}
+
 function navToProfile() {
     showMyProfile();
 }
@@ -1807,7 +1821,21 @@ async function handleNotificationClick(id, type, messageId, senderId) {
     toggleNotificationPanel();
     if (type === 'direct_message') {
         navigateTo('peer/' + encodeURIComponent(senderId));
-    } else if (type === 'reply' || type === 'reaction') {
+    } else if (type === 'reply') {
+        if (messageId) {
+            try {
+                const msg = await apiGet(`/api/messages/${encodeURIComponent(messageId)}`);
+                if (msg.reply_to) {
+                    pendingCommentHighlight = messageId;
+                    navigateTo('post/' + encodeURIComponent(msg.reply_to));
+                } else {
+                    navigateTo('post/' + encodeURIComponent(messageId));
+                }
+            } catch (e) {
+                navigateTo('post/' + encodeURIComponent(messageId));
+            }
+        }
+    } else if (type === 'reaction') {
         if (messageId) {
             navigateTo('post/' + encodeURIComponent(messageId));
         }
