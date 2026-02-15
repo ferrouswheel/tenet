@@ -18,13 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 
 use crate::client::{ClientMessage, MessageHandler};
-use crate::crypto::StoredKeypair;
+
+use crate::crypto::{generate_content_key, StoredKeypair, NONCE_SIZE};
 use crate::protocol::{
-    build_envelope_from_payload, build_meta_payload, Envelope, MessageKind, MetaMessage,
+    build_encrypted_payload, build_envelope_from_payload, build_meta_payload, Envelope,
+    MessageKind, MetaMessage,
 };
 use crate::storage::{
-    AttachmentRow, FriendRequestRow, MessageAttachmentRow, MessageRow, NotificationRow, PeerRow,
-    ProfileRow, ReactionRow, Storage,
+    AttachmentRow, FriendRequestRow, GroupInviteRow, GroupMemberRow, GroupRow,
+    MessageAttachmentRow, MessageRow, NotificationRow, PeerRow, ProfileRow, ReactionRow, Storage,
 };
 
 /// Default TTL for outgoing envelopes produced by the handler (e.g. auto-accept).
@@ -46,24 +48,58 @@ fn now_secs() -> u64 {
 /// - Friend request state machine (including auto-accept on mutual request)
 /// - Reaction and profile updates
 /// - Notification creation for direct messages, replies, and reactions
+/// - Group invite flow: auto-accept `GroupInvite`, send back `GroupInviteAccept`,
+///   distribute group key on receipt of `GroupInviteAccept`
 pub struct StorageMessageHandler {
     storage: Storage,
     keypair: StoredKeypair,
     my_peer_id: String,
+    /// HPKE info binding for encrypting `group_key_distribution` Direct messages.
+    hpke_info: Vec<u8>,
+    /// Additional authenticated data for encrypting `group_key_distribution` Direct messages.
+    payload_aad: Vec<u8>,
+    /// Group keys received via `group_key_distribution` messages, pending drain into the
+    /// client's in-memory `GroupManager`.
+    pending_group_keys: Vec<(String, Vec<u8>)>,
 }
 
 impl StorageMessageHandler {
-    /// Create a new handler.
+    /// Create a new handler without crypto params (group key distribution disabled).
     ///
     /// * `storage` — SQLite storage to write into.
-    /// * `keypair` — Local keypair; used to sign outgoing envelopes (e.g.
-    ///   auto-accept friend requests).
+    /// * `keypair` — Local keypair; used to sign outgoing envelopes.
     pub fn new(storage: Storage, keypair: StoredKeypair) -> Self {
         let my_peer_id = keypair.id.clone();
         Self {
             storage,
             keypair,
             my_peer_id,
+            hpke_info: Vec::new(),
+            payload_aad: Vec::new(),
+            pending_group_keys: Vec::new(),
+        }
+    }
+
+    /// Create a new handler with HPKE crypto params for group key distribution.
+    ///
+    /// * `storage` — SQLite storage to write into.
+    /// * `keypair` — Local keypair; used to sign outgoing envelopes.
+    /// * `hpke_info` — HPKE info binding (must match the recipient's decryption context).
+    /// * `payload_aad` — Additional authenticated data for payload encryption.
+    pub fn new_with_crypto(
+        storage: Storage,
+        keypair: StoredKeypair,
+        hpke_info: Vec<u8>,
+        payload_aad: Vec<u8>,
+    ) -> Self {
+        let my_peer_id = keypair.id.clone();
+        Self {
+            storage,
+            keypair,
+            my_peer_id,
+            hpke_info,
+            payload_aad,
+            pending_group_keys: Vec::new(),
         }
     }
 
@@ -298,6 +334,235 @@ impl StorageMessageHandler {
         }
     }
 
+    fn build_meta_envelope(&self, to_peer_id: &str, now: u64, meta: &MetaMessage) -> Option<Envelope> {
+        let Ok(payload) = build_meta_payload(meta) else {
+            return None;
+        };
+        build_envelope_from_payload(
+            self.keypair.id.clone(),
+            to_peer_id.to_string(),
+            None,
+            None,
+            now,
+            HANDLER_DEFAULT_TTL_SECONDS,
+            MessageKind::Meta,
+            None,
+            None,
+            payload,
+            &self.keypair.signing_private_key_hex,
+        )
+        .ok()
+    }
+
+    fn process_group_invite(
+        &mut self,
+        inviter_id: &str,
+        group_id: &str,
+        message: Option<&str>,
+        now: u64,
+    ) -> Option<Envelope> {
+        // Dedup: skip if we already have this incoming invite.
+        if let Ok(Some(_)) = self
+            .storage
+            .find_group_invite(group_id, inviter_id, &self.my_peer_id, "incoming")
+        {
+            crate::tlog!(
+                "handler: duplicate group invite for {} from {}, skipping",
+                group_id,
+                crate::logging::peer_id(inviter_id)
+            );
+            return None;
+        }
+
+        // Insert incoming invite as pending.
+        let row = GroupInviteRow {
+            id: 0,
+            group_id: group_id.to_string(),
+            from_peer_id: inviter_id.to_string(),
+            to_peer_id: self.my_peer_id.clone(),
+            status: "pending".to_string(),
+            message: message.map(|s| s.to_string()),
+            direction: "incoming".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let invite_id = self.storage.insert_group_invite(&row).unwrap_or(0);
+
+        // Auto-accept: update status to "accepted".
+        if invite_id > 0 {
+            let _ = self.storage.update_group_invite_status(invite_id, "accepted");
+        } else if let Ok(Some(existing)) = self
+            .storage
+            .find_group_invite(group_id, inviter_id, &self.my_peer_id, "incoming")
+        {
+            let _ = self
+                .storage
+                .update_group_invite_status(existing.id, "accepted");
+        }
+
+        crate::tlog!(
+            "handler: auto-accepting group invite for {} from {}",
+            group_id,
+            crate::logging::peer_id(inviter_id)
+        );
+
+        // Build GroupInviteAccept envelope addressed to the inviter.
+        let accept = MetaMessage::GroupInviteAccept {
+            peer_id: self.my_peer_id.clone(),
+            group_id: group_id.to_string(),
+        };
+        self.build_meta_envelope(inviter_id, now, &accept)
+    }
+
+    fn process_group_invite_accept(
+        &mut self,
+        accepter_id: &str,
+        group_id: &str,
+        now: u64,
+    ) -> Option<Envelope> {
+        // Find the outgoing invite we sent to this peer.
+        let invite = self
+            .storage
+            .find_group_invite(group_id, &self.my_peer_id, accepter_id, "outgoing")
+            .unwrap_or(None)?;
+
+        if invite.status != "pending" {
+            return None; // Already processed.
+        }
+
+        let _ = self
+            .storage
+            .update_group_invite_status(invite.id, "accepted");
+
+        // Load the group from storage to get the key.
+        let group_row = self
+            .storage
+            .get_group(group_id)
+            .unwrap_or(None)?;
+
+        // Load the accepter's encryption public key.
+        let peer_row = self
+            .storage
+            .get_peer(accepter_id)
+            .unwrap_or(None)?;
+        let enc_key = peer_row.encryption_public_key?;
+
+        // Only proceed if crypto params are configured.
+        if self.hpke_info.is_empty() || self.payload_aad.is_empty() {
+            crate::tlog!(
+                "handler: skipping group_key_distribution to {} — no crypto params configured",
+                crate::logging::peer_id(accepter_id)
+            );
+            return None;
+        }
+
+        // Build group_key_distribution Direct message body.
+        let body = serde_json::json!({
+            "type": "group_key_distribution",
+            "group_id": group_id,
+            "group_key": hex::encode(&group_row.group_key),
+            "key_version": group_row.key_version,
+            "creator_id": group_row.creator_id,
+        });
+        let body_str = serde_json::to_string(&body).ok()?;
+
+        // Generate content key and nonce.
+        let content_key = generate_content_key();
+        let mut nonce = [0u8; NONCE_SIZE];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+        // Encrypt the payload.
+        let payload = build_encrypted_payload(
+            body_str.as_bytes(),
+            &enc_key,
+            &self.payload_aad,
+            &self.hpke_info,
+            &content_key,
+            &nonce,
+            None,
+        )
+        .ok()?;
+
+        // Build the envelope.
+        let envelope = build_envelope_from_payload(
+            self.my_peer_id.clone(),
+            accepter_id.to_string(),
+            None,
+            None,
+            now,
+            HANDLER_DEFAULT_TTL_SECONDS,
+            MessageKind::Direct,
+            None,
+            None,
+            payload,
+            &self.keypair.signing_private_key_hex,
+        )
+        .ok()?;
+
+        // Add accepter as a group member.
+        let _ = self.storage.insert_group_member(&GroupMemberRow {
+            group_id: group_id.to_string(),
+            peer_id: accepter_id.to_string(),
+            joined_at: now,
+        });
+
+        crate::tlog!(
+            "handler: sent group_key_distribution for {} to {}",
+            group_id,
+            crate::logging::peer_id(accepter_id)
+        );
+
+        Some(envelope)
+    }
+
+    /// Drain and return pending group keys to be applied to the client's GroupManager.
+    pub fn take_pending_group_keys(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.pending_group_keys)
+    }
+
+    /// Persist a newly created group into storage and record outgoing invite rows.
+    ///
+    /// Called by `RelayClient::create_group` / `SimulationClient::create_group` via the
+    /// `MessageHandler::on_group_created` trait method.
+    pub fn on_group_created_impl(
+        &mut self,
+        group_id: &str,
+        group_key: &[u8; 32],
+        creator_id: &str,
+        members: &[String],
+    ) {
+        let now = now_secs();
+        let _ = self.storage.insert_group(&GroupRow {
+            group_id: group_id.to_string(),
+            group_key: group_key.to_vec(),
+            creator_id: creator_id.to_string(),
+            created_at: now,
+            key_version: 1,
+        });
+        let _ = self.storage.insert_group_member(&GroupMemberRow {
+            group_id: group_id.to_string(),
+            peer_id: creator_id.to_string(),
+            joined_at: now,
+        });
+        // Record outgoing invite rows for non-creator members.
+        for member_id in members {
+            if member_id == creator_id {
+                continue;
+            }
+            let _ = self.storage.insert_group_invite(&GroupInviteRow {
+                id: 0,
+                group_id: group_id.to_string(),
+                from_peer_id: creator_id.to_string(),
+                to_peer_id: member_id.clone(),
+                status: "pending".to_string(),
+                message: None,
+                direction: "outgoing".to_string(),
+                created_at: now,
+                updated_at: now,
+            });
+        }
+    }
+
     fn build_friend_accept_envelope(&self, to_peer_id: &str, now: u64) -> Option<Envelope> {
         let meta_msg = MetaMessage::FriendAccept {
             peer_id: self.keypair.id.clone(),
@@ -365,7 +630,66 @@ impl MessageHandler for StorageMessageHandler {
                 return Vec::new();
             }
             if msg_type == Some("group_key_distribution") {
-                // Group key distribution messages are not stored as timeline messages.
+                // Validate consent, store the group key, and signal the caller to update
+                // the in-memory GroupManager via take_pending_group_keys().
+                let sender_id = envelope.header.sender_id.clone();
+                let group_id = parsed
+                    .get("group_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let group_key_hex = parsed
+                    .get("group_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let key_version = parsed
+                    .get("key_version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u32;
+                let creator_id = parsed
+                    .get("creator_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&sender_id)
+                    .to_string();
+
+                if !group_id.is_empty() {
+                    // Validate consent: must have an accepted incoming invite for this group.
+                    let has_consent = self
+                        .storage
+                        .find_group_invite(&group_id, &sender_id, &self.my_peer_id, "incoming")
+                        .unwrap_or(None)
+                        .map(|inv| inv.status == "accepted")
+                        .unwrap_or(false);
+
+                    if has_consent {
+                        if let Ok(key_bytes) = hex::decode(group_key_hex) {
+                            if key_bytes.len() == 32 {
+                                let _ = self.storage.insert_group(&GroupRow {
+                                    group_id: group_id.clone(),
+                                    group_key: key_bytes.clone(),
+                                    creator_id,
+                                    created_at: now,
+                                    key_version,
+                                });
+                                let _ = self.storage.insert_group_member(&GroupMemberRow {
+                                    group_id: group_id.clone(),
+                                    peer_id: self.my_peer_id.clone(),
+                                    joined_at: now,
+                                });
+                                self.pending_group_keys.push((group_id, key_bytes));
+                                crate::tlog!(
+                                    "handler: stored group key from {}",
+                                    crate::logging::peer_id(&sender_id)
+                                );
+                            }
+                        }
+                    } else {
+                        crate::tlog!(
+                            "handler: ignoring group_key_distribution from {} — no accepted invite",
+                            crate::logging::peer_id(&sender_id)
+                        );
+                    }
+                }
                 return Vec::new();
             }
         }
@@ -495,6 +819,23 @@ impl MessageHandler for StorageMessageHandler {
             MetaMessage::MessageRequest { .. } => {
                 // Not handled at the storage layer.
             }
+            MetaMessage::GroupInvite {
+                peer_id,
+                group_id,
+                message,
+                ..
+            } => {
+                // peer_id is the inviter. Auto-accept and send back GroupInviteAccept.
+                if let Some(env) = self.process_group_invite(peer_id, group_id, message.as_deref(), now) {
+                    outgoing.push(env);
+                }
+            }
+            MetaMessage::GroupInviteAccept { peer_id, group_id } => {
+                // peer_id is the accepter. Send them the group key.
+                if let Some(env) = self.process_group_invite_accept(peer_id, group_id, now) {
+                    outgoing.push(env);
+                }
+            }
         }
         outgoing
     }
@@ -560,6 +901,20 @@ impl MessageHandler for StorageMessageHandler {
             }
         }
         Vec::new()
+    }
+
+    fn take_pending_group_keys(&mut self) -> Vec<(String, Vec<u8>)> {
+        StorageMessageHandler::take_pending_group_keys(self)
+    }
+
+    fn on_group_created(
+        &mut self,
+        group_id: &str,
+        group_key: &[u8; 32],
+        creator_id: &str,
+        members: &[String],
+    ) {
+        self.on_group_created_impl(group_id, group_key, creator_id, members);
     }
 }
 
@@ -649,7 +1004,7 @@ mod tests {
         let alice = generate_keypair();
         let bob = generate_keypair();
 
-        let mut storage = open_memory_storage();
+        let storage = open_memory_storage();
         // Register Alice as a peer in Bob's storage.
         let peer_row = PeerRow {
             peer_id: alice.id.clone(),
@@ -756,7 +1111,7 @@ mod tests {
         let alice = generate_keypair();
         let bob = generate_keypair();
 
-        let mut storage = open_memory_storage();
+        let storage = open_memory_storage();
         let peer_row = PeerRow {
             peer_id: alice.id.clone(),
             display_name: None,
@@ -791,7 +1146,7 @@ mod tests {
         let alice = generate_keypair();
         let bob = generate_keypair();
 
-        let mut storage = open_memory_storage();
+        let storage = open_memory_storage();
         let peer_row = PeerRow {
             peer_id: alice.id.clone(),
             display_name: None,

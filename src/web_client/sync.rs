@@ -11,7 +11,11 @@ use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::client::{ClientConfig, ClientEncryption, RelayClient, SyncEventOutcome};
-use crate::protocol::{build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage};
+use crate::crypto::{generate_content_key, NONCE_SIZE};
+use crate::protocol::{
+    build_encrypted_payload, build_envelope_from_payload, build_meta_payload, MessageKind,
+    MetaMessage,
+};
 use crate::relay_transport::post_envelope;
 use crate::web_client::config::{
     DEFAULT_TTL_SECONDS, SYNC_INTERVAL_SECS, WEB_HPKE_INFO, WEB_PAYLOAD_AAD,
@@ -274,6 +278,35 @@ async fn process_meta_event(
             )
             .await;
         }
+        MetaMessage::GroupInvite {
+            peer_id: from_peer_id,
+            group_id,
+            message,
+            ..
+        } => {
+            process_incoming_group_invite(
+                state,
+                from_peer_id,
+                group_id,
+                message.clone(),
+                now,
+            )
+            .await;
+        }
+        MetaMessage::GroupInviteAccept {
+            peer_id: from_peer_id,
+            group_id,
+        } => {
+            process_group_invite_accept(
+                state,
+                keypair,
+                relay_url,
+                from_peer_id,
+                group_id,
+                now,
+            )
+            .await;
+        }
         MetaMessage::MessageRequest { .. } => {}
     }
 }
@@ -377,6 +410,8 @@ async fn process_message_event(
             return false;
         }
         if msg_type == Some("group_key_distribution") {
+            drop(st);
+            process_group_key_distribution(state, sender_id, &parsed, now).await;
             return false;
         }
     }
@@ -1061,4 +1096,351 @@ pub async fn announce_online(state: SharedState) -> Result<(), String> {
 
     crate::tlog!("announced online status to {} peers", peers.len());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Group invite helpers
+// ---------------------------------------------------------------------------
+
+/// Process an incoming GroupInvite meta message: store the invite, create a
+/// notification, and broadcast a WsEvent to the UI.
+async fn process_incoming_group_invite(
+    state: &SharedState,
+    from_peer_id: &str,
+    group_id: &str,
+    message: Option<String>,
+    now: u64,
+) {
+    crate::tlog!(
+        "sync: received group_invite for {} from {}",
+        group_id,
+        crate::logging::peer_id(from_peer_id)
+    );
+
+    let st = state.lock().await;
+    let my_id = st.keypair.id.clone();
+
+    // Dedup: if an incoming invite for this (group_id, from, me) already exists, skip.
+    let existing = st
+        .storage
+        .find_group_invite(group_id, from_peer_id, &my_id, "incoming")
+        .unwrap_or(None);
+    if existing.is_some() {
+        crate::tlog!(
+            "sync: duplicate group_invite for {} from {}, ignoring",
+            group_id,
+            crate::logging::peer_id(from_peer_id)
+        );
+        return;
+    }
+
+    let invite_row = crate::storage::GroupInviteRow {
+        id: 0,
+        group_id: group_id.to_string(),
+        from_peer_id: from_peer_id.to_string(),
+        to_peer_id: my_id.clone(),
+        status: "pending".to_string(),
+        message: message.clone(),
+        direction: "incoming".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+
+    match st.storage.insert_group_invite(&invite_row) {
+        Ok(invite_id) => {
+            let _ = st.ws_tx.send(WsEvent::GroupInviteReceived {
+                invite_id,
+                group_id: group_id.to_string(),
+                from_peer_id: from_peer_id.to_string(),
+                message: message.clone(),
+                created_at: now,
+            });
+
+            let notif = crate::storage::NotificationRow {
+                id: 0,
+                notification_type: "group_invite".to_string(),
+                message_id: format!("group_invite_{invite_id}"),
+                sender_id: from_peer_id.to_string(),
+                created_at: now,
+                seen: false,
+                read: false,
+            };
+            if let Ok(notif_id) = st.storage.insert_notification(&notif) {
+                let _ = st.ws_tx.send(WsEvent::Notification {
+                    id: notif_id,
+                    notification_type: "group_invite".to_string(),
+                    message_id: format!("group_invite_{invite_id}"),
+                    sender_id: from_peer_id.to_string(),
+                    created_at: now,
+                });
+            }
+
+            crate::tlog!(
+                "sync: stored group_invite for {} from {} (id={})",
+                group_id,
+                crate::logging::peer_id(from_peer_id),
+                invite_id
+            );
+        }
+        Err(e) => {
+            crate::tlog!(
+                "sync: failed to store group_invite for {} from {}: {}",
+                group_id,
+                crate::logging::peer_id(from_peer_id),
+                e
+            );
+        }
+    }
+}
+
+/// Process an incoming GroupInviteAccept meta message: mark the outgoing invite
+/// accepted, add the peer as an active group member, then distribute the group
+/// key to them.
+async fn process_group_invite_accept(
+    state: &SharedState,
+    keypair: &crate::crypto::StoredKeypair,
+    relay_url: &str,
+    from_peer_id: &str,
+    group_id: &str,
+    now: u64,
+) {
+    crate::tlog!(
+        "sync: received group_invite_accept for {} from {}",
+        group_id,
+        crate::logging::peer_id(from_peer_id)
+    );
+
+    // Lock: update invite status, add member, collect data needed for key distribution.
+    let (group_key, key_version, recipient_enc_key) = {
+        let st = state.lock().await;
+
+        // Mark the outgoing invite as accepted.
+        if let Ok(Some(invite)) =
+            st.storage
+                .find_group_invite(group_id, &keypair.id, from_peer_id, "outgoing")
+        {
+            let _ = st.storage.update_group_invite_status(invite.id, "accepted");
+        } else {
+            crate::tlog!(
+                "sync: no outgoing invite found for {} to {}, ignoring accept",
+                group_id,
+                crate::logging::peer_id(from_peer_id)
+            );
+            return;
+        }
+
+        let group = match st.storage.get_group(group_id) {
+            Ok(Some(g)) => g,
+            _ => {
+                crate::tlog!(
+                    "sync: group {} not found when processing invite accept from {}",
+                    group_id,
+                    crate::logging::peer_id(from_peer_id)
+                );
+                return;
+            }
+        };
+
+        let peer = match st.storage.get_peer(from_peer_id) {
+            Ok(Some(p)) => p,
+            _ => {
+                crate::tlog!(
+                    "sync: peer {} not found when processing invite accept",
+                    crate::logging::peer_id(from_peer_id)
+                );
+                return;
+            }
+        };
+
+        let enc_key = match peer.encryption_public_key {
+            Some(k) => k,
+            None => {
+                crate::tlog!(
+                    "sync: peer {} has no encryption key; cannot distribute group key",
+                    crate::logging::peer_id(from_peer_id)
+                );
+                return;
+            }
+        };
+
+        let gk: [u8; 32] = match group.group_key.try_into() {
+            Ok(k) => k,
+            Err(_) => {
+                crate::tlog!("sync: invalid group key for {}", group_id);
+                return;
+            }
+        };
+
+        // Add accepted peer as an active group member.
+        let member = crate::storage::GroupMemberRow {
+            group_id: group_id.to_string(),
+            peer_id: from_peer_id.to_string(),
+            joined_at: now,
+        };
+        let _ = st.storage.insert_group_member(&member);
+
+        let _ = st.ws_tx.send(WsEvent::GroupMemberJoined {
+            group_id: group_id.to_string(),
+            peer_id: from_peer_id.to_string(),
+        });
+
+        (gk, group.key_version, enc_key)
+    };
+    // Lock released — now do crypto and I/O.
+
+    let key_distribution = serde_json::json!({
+        "type": "group_key_distribution",
+        "group_id": group_id,
+        "group_key": hex::encode(group_key),
+        "key_version": key_version,
+        "creator_id": keypair.id,
+    });
+
+    let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
+
+    let content_key = generate_content_key();
+    let mut nonce = [0u8; NONCE_SIZE];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+    let payload = match build_encrypted_payload(
+        &key_dist_bytes,
+        &recipient_enc_key,
+        crate::web_client::config::WEB_PAYLOAD_AAD,
+        crate::web_client::config::WEB_HPKE_INFO,
+        &content_key,
+        &nonce,
+        None,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::tlog!(
+                "sync: failed to encrypt group key for {}: {}",
+                crate::logging::peer_id(from_peer_id),
+                e
+            );
+            return;
+        }
+    };
+
+    let envelope = match build_envelope_from_payload(
+        keypair.id.clone(),
+        from_peer_id.to_string(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Direct,
+        None,
+        None,
+        payload,
+        &keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            crate::tlog!(
+                "sync: failed to build group key envelope for {}: {}",
+                crate::logging::peer_id(from_peer_id),
+                e
+            );
+            return;
+        }
+    };
+
+    match post_envelope(relay_url, &envelope) {
+        Ok(()) => crate::tlog!(
+            "sync: distributed group key for {} to {}",
+            group_id,
+            crate::logging::peer_id(from_peer_id)
+        ),
+        Err(e) => crate::tlog!(
+            "sync: failed to distribute group key for {} to {}: {}",
+            group_id,
+            crate::logging::peer_id(from_peer_id),
+            e
+        ),
+    }
+}
+
+/// Process an incoming group_key_distribution Direct message: validate consent
+/// via an accepted invite, then store the group key locally.
+async fn process_group_key_distribution(
+    state: &SharedState,
+    sender_id: &str,
+    payload: &serde_json::Value,
+    now: u64,
+) {
+    let group_id = match payload.get("group_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+    let group_key_hex = match payload.get("group_key").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return,
+    };
+    let key_version = payload
+        .get("key_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let creator_id = payload
+        .get("creator_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(sender_id)
+        .to_string();
+
+    let group_key = match hex::decode(group_key_hex) {
+        Ok(k) if k.len() == 32 => k,
+        _ => {
+            crate::tlog!(
+                "sync: invalid group_key in key_distribution for {}",
+                group_id
+            );
+            return;
+        }
+    };
+
+    let st = state.lock().await;
+
+    // Consent check: only store the key if we have an accepted invite for this group.
+    let has_accepted_invite = st
+        .storage
+        .find_group_invite(group_id, sender_id, &st.keypair.id, "incoming")
+        .unwrap_or(None)
+        .map(|inv| inv.status == "accepted")
+        .unwrap_or(false);
+
+    if !has_accepted_invite {
+        crate::tlog!(
+            "sync: ignoring group_key_distribution for {} from {} — no accepted invite",
+            group_id,
+            crate::logging::peer_id(sender_id)
+        );
+        return;
+    }
+
+    let group_row = crate::storage::GroupRow {
+        group_id: group_id.to_string(),
+        group_key,
+        creator_id,
+        created_at: now,
+        key_version,
+    };
+
+    if let Err(e) = st.storage.insert_group(&group_row) {
+        crate::tlog!(
+            "sync: failed to store group key for {}: {}",
+            group_id,
+            e
+        );
+        return;
+    }
+
+    // Add ourselves as an active member.
+    let member = crate::storage::GroupMemberRow {
+        group_id: group_id.to_string(),
+        peer_id: st.keypair.id.clone(),
+        joined_at: now,
+    };
+    let _ = st.storage.insert_group_member(&member);
+
+    crate::tlog!("sync: stored group key for {}", group_id);
 }

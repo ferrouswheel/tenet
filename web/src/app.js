@@ -3,6 +3,8 @@
 // ---------------------------------------------------------------------------
 let myPeerId = '';
 let currentFilter = 'public'; // 'public' or 'friend_group'
+let groups = [];
+let groupInvites = [];
 let currentView = 'timeline'; // 'timeline', 'friends', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
 let messages = [];
 let oldestTimestamp = null;
@@ -386,9 +388,9 @@ function loadMore() {
 // ---------------------------------------------------------------------------
 // Filter & View Switching
 // ---------------------------------------------------------------------------
-document.querySelectorAll('.filters button').forEach(btn => {
+document.querySelectorAll('.filters button[data-kind]').forEach(btn => {
     btn.addEventListener('click', () => {
-        document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.filters button[data-kind]').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
 
         currentView = 'timeline';
@@ -413,31 +415,66 @@ function hideAllViews() {
     document.getElementById('compose-box').style.display = '';
     // Hide filters on non-timeline views
     document.querySelector('.filters').style.display = '';
+    // Hide group UI elements
+    const gcf = document.getElementById('group-create-form');
+    if (gcf) gcf.style.display = 'none';
+    const gnb = document.getElementById('groups-new-btn');
+    if (gnb) gnb.style.display = 'none';
+    const gip = document.getElementById('group-invites-panel');
+    if (gip) gip.style.display = 'none';
 }
 
-function showTimelineView() {
+async function showTimelineView() {
     hideAllViews();
     document.getElementById('timeline').style.display = '';
     document.getElementById('load-more').style.display = '';
     document.querySelector('.filters').style.display = '';
     document.getElementById('compose-box').style.display = '';
+    const gnb = document.getElementById('groups-new-btn');
+    if (gnb) gnb.style.display = currentFilter === 'friend_group' ? '' : 'none';
+    if (currentFilter === 'friend_group') {
+        await loadGroups();
+        await loadGroupInvites();
+        renderGroupInvitesPanel();
+    }
     updateComposeForTimeline();
 }
 
 function updateComposeForTimeline() {
     const select = document.getElementById('compose-kind');
     select.innerHTML = '';
+    const groupSelect = document.getElementById('compose-group-id');
 
     if (currentFilter === 'friend_group') {
         const opt = document.createElement('option');
         opt.value = 'group';
         opt.textContent = 'Group';
         select.appendChild(opt);
+        if (groupSelect) {
+            groupSelect.style.display = '';
+            groupSelect.innerHTML = '';
+            if (groups.length === 0) {
+                const o = document.createElement('option');
+                o.value = '';
+                o.textContent = '— create a group first —';
+                o.disabled = true;
+                o.selected = true;
+                groupSelect.appendChild(o);
+            } else {
+                for (const g of groups) {
+                    const o = document.createElement('option');
+                    o.value = g.group_id;
+                    o.textContent = g.group_id;
+                    groupSelect.appendChild(o);
+                }
+            }
+        }
     } else {
         const opt = document.createElement('option');
         opt.value = 'public';
         opt.textContent = 'Public';
         select.appendChild(opt);
+        if (groupSelect) groupSelect.style.display = 'none';
     }
 }
 
@@ -758,6 +795,15 @@ async function sendMessage() {
         if (kind === 'public') {
             endpoint = '/api/messages/public';
             payload = { body: body || '', attachments: uploadedAttachments };
+        } else if (kind === 'group') {
+            const groupId = document.getElementById('compose-group-id').value;
+            if (!groupId) {
+                showToast('Select a group to post to');
+                btn.disabled = false;
+                return;
+            }
+            endpoint = '/api/messages/group';
+            payload = { group_id: groupId, body: body || '', attachments: uploadedAttachments };
         } else {
             showToast('Unsupported message kind for compose');
             btn.disabled = false;
@@ -905,6 +951,134 @@ async function markRead(messageId) {
         try {
             await apiPost(`/api/messages/${messageId}/read`, {});
         } catch (_) {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Groups management
+// ---------------------------------------------------------------------------
+async function loadGroups() {
+    try {
+        groups = await apiGet('/api/groups');
+    } catch (e) {
+        console.error('Failed to load groups:', e);
+    }
+}
+
+function toggleGroupCreateForm() {
+    const form = document.getElementById('group-create-form');
+    if (!form) return;
+    const isHidden = form.style.display === 'none' || form.style.display === '';
+    if (isHidden) {
+        // Populate member checkboxes with friends
+        const container = document.getElementById('group-member-checkboxes');
+        const friends = peers.filter(p => p.is_friend);
+        if (friends.length === 0) {
+            container.innerHTML = '<p style="color:#888;font-size:0.85rem;">No friends yet. Add friends first.</p>';
+        } else {
+            container.innerHTML = friends.map(p => {
+                const name = escapeHtml(p.display_name || p.peer_id.substring(0, 16) + '...');
+                const pid = escapeHtml(p.peer_id);
+                return `<label class="group-member-checkbox"><input type="checkbox" value="${pid}" /> ${name}</label>`;
+            }).join('');
+        }
+        document.getElementById('group-id-input').value = '';
+        form.style.display = '';
+    } else {
+        form.style.display = 'none';
+    }
+}
+
+async function submitCreateGroup() {
+    const groupId = document.getElementById('group-id-input').value.trim();
+    if (!groupId) {
+        showToast('Group ID cannot be empty');
+        return;
+    }
+    const checked = Array.from(document.querySelectorAll('#group-member-checkboxes input[type="checkbox"]:checked'));
+    const memberIds = checked.map(el => el.value);
+
+    const btn = document.querySelector('#group-create-form .btn-primary');
+    if (btn) btn.disabled = true;
+    try {
+        await apiPost('/api/groups', { group_id: groupId, member_ids: memberIds });
+        if (memberIds.length > 0) {
+            showToast(`Group "${groupId}" created — invites sent to ${memberIds.length} member(s)`);
+        } else {
+            showToast('Group "' + groupId + '" created');
+        }
+        document.getElementById('group-create-form').style.display = 'none';
+        await loadGroups();
+        updateComposeForTimeline();
+    } catch (e) {
+        showToast('Failed to create group: ' + e.message);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group invites
+// ---------------------------------------------------------------------------
+async function loadGroupInvites() {
+    try {
+        groupInvites = await apiGet('/api/group-invites?direction=incoming&status=pending');
+    } catch (e) {
+        console.error('Failed to load group invites:', e);
+    }
+}
+
+function renderGroupInvitesPanel() {
+    const panel = document.getElementById('group-invites-panel');
+    if (!panel) return;
+    if (groupInvites.length === 0) {
+        panel.style.display = 'none';
+        return;
+    }
+    panel.style.display = '';
+    panel.innerHTML = `<div class="group-invites-panel">
+        <h3>Group Invites (${groupInvites.length})</h3>
+        ${groupInvites.map(inv => renderGroupInviteItem(inv)).join('')}
+    </div>`;
+}
+
+function renderGroupInviteItem(inv) {
+    const fromPeer = peers.find(p => p.peer_id === inv.from_peer_id);
+    const fromName = escapeHtml(fromPeer?.display_name || inv.from_peer_id.substring(0, 14) + '...');
+    const msgHtml = inv.message ? `<div class="group-invite-msg">"${escapeHtml(inv.message)}"</div>` : '';
+    return `<div class="group-invite-item" id="ginv-${inv.id}">
+        <div class="group-invite-item-header">
+            <span class="group-invite-group">${escapeHtml(inv.group_id)}</span>
+            <span class="group-invite-from">from ${fromName}</span>
+            <span class="group-invite-time" title="${exactTime(inv.created_at)}">${timeAgo(inv.created_at)}</span>
+        </div>
+        ${msgHtml}
+        <div class="group-invite-actions">
+            <button class="gi-accept" onclick="acceptGroupInvite(${inv.id})">Accept</button>
+            <button class="gi-ignore" onclick="ignoreGroupInvite(${inv.id})">Ignore</button>
+        </div>
+    </div>`;
+}
+
+async function acceptGroupInvite(id) {
+    try {
+        const result = await apiPost(`/api/group-invites/${id}/accept`, {});
+        groupInvites = groupInvites.filter(inv => inv.id !== id);
+        renderGroupInvitesPanel();
+        showToast(`Accepted invite to "${result.group_id}" — waiting for group key...`);
+    } catch (e) {
+        showToast('Failed to accept invite: ' + e.message);
+    }
+}
+
+async function ignoreGroupInvite(id) {
+    try {
+        await apiPost(`/api/group-invites/${id}/ignore`, {});
+        groupInvites = groupInvites.filter(inv => inv.id !== id);
+        renderGroupInvitesPanel();
+        showToast('Invite ignored');
+    } catch (e) {
+        showToast('Failed to ignore invite: ' + e.message);
     }
 }
 
@@ -1246,6 +1420,26 @@ function handleWsEvent(event) {
         showToast('Friend request accepted by ' + event.from_peer_id.substring(0, 12) + '...');
         loadFriendRequests();
         loadPeers();
+    } else if (event.type === 'group_invite_received') {
+        const newInvite = {
+            id: event.invite_id,
+            group_id: event.group_id,
+            from_peer_id: event.from_peer_id,
+            message: event.message || null,
+            direction: 'incoming',
+            status: 'pending',
+            created_at: event.created_at,
+        };
+        groupInvites.unshift(newInvite);
+        if (currentFilter === 'friend_group') {
+            renderGroupInvitesPanel();
+        }
+        showToast(`Group invite: "${event.group_id}" from ${event.from_peer_id.substring(0, 12)}...`);
+    } else if (event.type === 'group_member_joined') {
+        showToast(`${event.peer_id.substring(0, 12)}... joined group "${event.group_id}"`);
+        if (currentFilter === 'friend_group') {
+            loadGroups().then(() => updateComposeForTimeline());
+        }
     } else if (event.type === 'relay_status') {
         updateRelayBanner(event.connected, event.relay_url);
         if (event.connected && relayConnected === false) {
@@ -1428,7 +1622,7 @@ function setActiveHeaderNav(activeId) {
 }
 
 function navToFeed() {
-    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.filters button[data-kind]').forEach(b => b.classList.remove('active'));
     document.querySelector('.filters button[data-kind="public"]').classList.add('active');
     currentFilter = 'public';
     oldestTimestamp = null;
@@ -1439,7 +1633,7 @@ function navToFeed() {
 }
 
 function navToGroups() {
-    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.filters button[data-kind]').forEach(b => b.classList.remove('active'));
     document.querySelector('.filters button[data-kind="friend_group"]').classList.add('active');
     currentFilter = 'friend_group';
     oldestTimestamp = null;
@@ -1771,6 +1965,9 @@ function renderNotificationItem(n) {
         case 'friend_request':
             message = `${senderName} sent a friend request`;
             break;
+        case 'group_invite':
+            message = `${senderName} invited you to a group`;
+            break;
         default:
             message = `${senderName} - ${typeLabel}`;
     }
@@ -1792,6 +1989,7 @@ function getNotificationTypeLabel(type) {
         case 'reply': return 'Comment';
         case 'reaction': return 'Reaction';
         case 'friend_request': return 'Friend Request';
+        case 'group_invite': return 'Group Invite';
         default: return 'Notification';
     }
 }
@@ -1802,6 +2000,7 @@ function getNotificationIcon(type) {
         case 'reply': return '&#128172;'; // speech bubble
         case 'reaction': return '&#9650;'; // upvote arrow
         case 'friend_request': return '&#128100;'; // person
+        case 'group_invite': return '&#128101;'; // group of people
         default: return '&#128276;'; // bell
     }
 }
@@ -1842,6 +2041,8 @@ async function handleNotificationClick(id, type, messageId, senderId) {
     } else if (type === 'friend_request') {
         pendingFriendRequestHighlight = senderId;
         navigateTo('friends');
+    } else if (type === 'group_invite') {
+        navToGroups();
     }
 }
 

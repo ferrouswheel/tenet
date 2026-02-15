@@ -1106,9 +1106,9 @@ fn log_message(config: &RelayConfig, message: String) {
     } else {
         let ts = crate::logging::format_timestamp();
         if crate::logging::colour_enabled() {
-            println!("\x1b[2m{ts}\x1b[0m {message}");
+            eprintln!("\x1b[2m{ts}\x1b[0m {message}");
         } else {
-            println!("{ts} - {message}");
+            eprintln!("{ts} - {message}");
         }
     }
 }

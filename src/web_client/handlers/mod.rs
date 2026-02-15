@@ -3,6 +3,7 @@
 pub mod attachments;
 pub mod conversations;
 pub mod friends;
+pub mod group_invites;
 pub mod groups;
 pub mod health;
 pub mod messages;

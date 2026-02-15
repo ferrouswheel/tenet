@@ -323,6 +323,20 @@ pub enum MetaMessage {
         signing_public_key: String,
         encryption_public_key: String,
     },
+    /// Sent by a group creator to invite a prospective member.
+    GroupInvite {
+        peer_id: String,
+        group_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        group_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Sent by an invitee back to the creator to accept the group invite.
+    GroupInviteAccept {
+        peer_id: String,
+        group_id: String,
+    },
 }
 
 #[derive(Debug)]

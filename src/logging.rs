@@ -6,21 +6,37 @@
 //! 20260211T21:33:12.000 - src/bin/tenet-web.rs:42 - sync: fetched 5 envelope(s)
 //! ```
 //!
-//! When stderr is a terminal, output is colour-coded:
+//! When writing to a terminal, output is colour-coded:
 //! - Timestamps and source locations are dimmed
 //! - Peer IDs and message IDs get consistent colours based on their content
+//!
+//! By default log lines go to stderr.  Call [`set_writer`] to redirect output
+//! to any [`std::io::Write`] implementor (file, in-memory buffer, TUI channel
+//! adapter, etc.).  Installing a custom writer also disables ANSI colour codes.
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 static COLOUR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+static LOG_WRITER: LazyLock<Mutex<Box<dyn Write + Send>>> =
+    LazyLock::new(|| Mutex::new(Box::new(io::stderr())));
 
 /// Initialize the logging system. Call once at startup before any logging.
 /// Detects whether stderr supports ANSI colours.
 pub fn init() {
     let is_terminal = std::io::stderr().is_terminal();
     COLOUR_ENABLED.store(is_terminal, Ordering::Relaxed);
+}
+
+/// Replace the log writer.  All subsequent [`tlog!`] output goes to `w`.
+/// Also disables ANSI colour codes, since the new writer is unlikely to be
+/// a colour terminal.
+pub fn set_writer(w: Box<dyn Write + Send>) {
+    COLOUR_ENABLED.store(false, Ordering::Relaxed);
+    *LOG_WRITER.lock().unwrap() = w;
 }
 
 /// Returns whether ANSI colour output is enabled.
@@ -125,7 +141,24 @@ pub fn format_timestamp() -> String {
     )
 }
 
-/// Emit a log line to stderr with timestamp and source location.
+/// Write a single log line to the current writer.
+///
+/// Called by the [`tlog!`] macro; not intended for direct use.
+pub fn emit(file: &str, line: u32, msg: &str) {
+    let ts = format_timestamp();
+    let formatted = if colour_enabled() {
+        format!("{DIM}{ts}{RESET} {DIM}{file}:{line}{RESET} {msg}")
+    } else {
+        format!("{ts} - {file}:{line} - {msg}")
+    };
+    let mut writer = LOG_WRITER.lock().unwrap();
+    let _ = writeln!(*writer, "{formatted}");
+}
+
+/// Emit a log line to the current writer with timestamp and source location.
+///
+/// By default writes to stderr.  Install a different destination with
+/// [`set_writer`].
 ///
 /// # Usage
 ///
@@ -136,22 +169,6 @@ pub fn format_timestamp() -> String {
 #[macro_export]
 macro_rules! tlog {
     ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        let ts = $crate::logging::format_timestamp();
-        let file = file!();
-        let line = line!();
-        if $crate::logging::colour_enabled() {
-            eprintln!(
-                "{DIM}{ts}{RST} {DIM}{file}:{line}{RST} {msg}",
-                DIM = "\x1b[2m",
-                RST = "\x1b[0m",
-                ts = ts,
-                file = file,
-                line = line,
-                msg = msg,
-            );
-        } else {
-            eprintln!("{ts} - {file}:{line} - {msg}");
-        }
+        $crate::logging::emit(file!(), line!(), &format!($($arg)*));
     }};
 }

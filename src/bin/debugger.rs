@@ -10,8 +10,10 @@ use rustyline::DefaultEditor;
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient, SyncEventOutcome};
 use tenet::crypto::generate_keypair;
-use tenet::protocol::MessageKind;
-use tenet::storage::{MessageRow, OutboxRow, PeerRow, Storage};
+use tenet::protocol::{
+    build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage,
+};
+use tenet::storage::{GroupInviteRow, MessageRow, OutboxRow, PeerRow, Storage};
 
 const DEFAULT_TTL_SECONDS: u64 = 3600;
 const HPKE_INFO: &[u8] = b"tenet-hpke";
@@ -678,27 +680,189 @@ fn sync_one(
         println!("{} failed to process message: {error}", peers[index].name);
     }
 
-    // Persist received messages to storage.
     let now = now_secs();
+
+    // outcome is owned (not borrowed from peers), so iterating it while accessing peers[index] is fine.
     for event in &outcome.events {
-        if let SyncEventOutcome::Message(msg) = &event.outcome {
-            let envelope_json = serde_json::to_string(&event.envelope).ok();
-            let kind = message_kind_str(&event.envelope.header.message_kind);
-            let row = MessageRow {
-                message_id: msg.message_id.clone(),
-                sender_id: msg.sender_id.clone(),
-                recipient_id: event.envelope.header.recipient_id.clone(),
-                message_kind: kind.to_string(),
-                group_id: event.envelope.header.group_id.clone(),
-                body: Some(msg.body.clone()),
-                timestamp: msg.timestamp,
-                received_at: now,
-                ttl_seconds: event.envelope.header.ttl_seconds,
-                is_read: false,
-                raw_envelope: envelope_json,
-                reply_to: None,
-            };
-            let _ = peers[index].storage.insert_message(&row);
+        match &event.outcome {
+            SyncEventOutcome::Message(msg) => {
+                // Check for group_key_distribution before storing.
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg.body) {
+                    if parsed.get("type").and_then(|v| v.as_str()) == Some("group_key_distribution") {
+                        let group_id = parsed.get("group_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let key_hex = parsed.get("group_key").and_then(|v| v.as_str()).unwrap_or("");
+                        let key_version = parsed.get("key_version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                        let creator_id = parsed.get("creator_id").and_then(|v| v.as_str()).unwrap_or(&msg.sender_id).to_string();
+                        let sender_id = msg.sender_id.clone();
+                        if !group_id.is_empty() {
+                            if let Ok(key_bytes) = hex::decode(key_hex) {
+                                if key_bytes.len() == 32 {
+                                    // Validate consent via storage.
+                                    let has_consent = peers[index]
+                                        .storage
+                                        .find_group_invite(&group_id, &sender_id, peers[index].client.id(), "incoming")
+                                        .unwrap_or(None)
+                                        .map(|inv| inv.status == "accepted")
+                                        .unwrap_or(false);
+                                    if has_consent {
+                                        peers[index].client.group_manager_mut().add_group_key(group_id.clone(), key_bytes.clone());
+                                        use tenet::storage::GroupRow;
+                                        let _ = peers[index].storage.insert_group(&GroupRow {
+                                            group_id: group_id.clone(),
+                                            group_key: key_bytes,
+                                            creator_id,
+                                            created_at: now,
+                                            key_version,
+                                        });
+                                        use tenet::storage::GroupMemberRow;
+                                        let _ = peers[index].storage.insert_group_member(&GroupMemberRow {
+                                            group_id: group_id.clone(),
+                                            peer_id: peers[index].client.id().to_string(),
+                                            joined_at: now,
+                                        });
+                                        println!("{} received group key for '{}'", peers[index].name, group_id);
+                                    } else {
+                                        println!("{} ignoring group_key_distribution for '{}' — no accepted invite", peers[index].name, group_id);
+                                    }
+                                }
+                            }
+                        }
+                        continue; // Don't store as a regular message.
+                    }
+                }
+                // Persist regular received messages to storage.
+                let envelope_json = serde_json::to_string(&event.envelope).ok();
+                let kind = message_kind_str(&event.envelope.header.message_kind);
+                let row = MessageRow {
+                    message_id: msg.message_id.clone(),
+                    sender_id: msg.sender_id.clone(),
+                    recipient_id: event.envelope.header.recipient_id.clone(),
+                    message_kind: kind.to_string(),
+                    group_id: event.envelope.header.group_id.clone(),
+                    body: Some(msg.body.clone()),
+                    timestamp: msg.timestamp,
+                    received_at: now,
+                    ttl_seconds: event.envelope.header.ttl_seconds,
+                    is_read: false,
+                    raw_envelope: envelope_json,
+                    reply_to: None,
+                };
+                let _ = peers[index].storage.insert_message(&row);
+            }
+            SyncEventOutcome::Meta(meta) => {
+                match meta {
+                    MetaMessage::GroupInvite { peer_id: inviter_id, group_id, .. } => {
+                        // Auto-accept: record invite and send back GroupInviteAccept.
+                        let my_id = peers[index].client.id().to_string();
+                        // Dedup check.
+                        let already = peers[index]
+                            .storage
+                            .find_group_invite(group_id.as_str(), inviter_id.as_str(), &my_id, "incoming")
+                            .unwrap_or(None)
+                            .is_some();
+                        if !already {
+                            let invite_id = peers[index].storage.insert_group_invite(&GroupInviteRow {
+                                id: 0,
+                                group_id: group_id.clone(),
+                                from_peer_id: inviter_id.clone(),
+                                to_peer_id: my_id.clone(),
+                                status: "pending".to_string(),
+                                message: None,
+                                direction: "incoming".to_string(),
+                                created_at: now,
+                                updated_at: now,
+                            }).unwrap_or(0);
+                            if invite_id > 0 {
+                                let _ = peers[index].storage.update_group_invite_status(invite_id, "accepted");
+                            }
+                            // Build and post GroupInviteAccept to inviter.
+                            let accept = MetaMessage::GroupInviteAccept {
+                                peer_id: my_id.clone(),
+                                group_id: group_id.clone(),
+                            };
+                            let payload = build_meta_payload(&accept)?;
+                            let signing_key = peers[index].client.signing_private_key_hex().to_string();
+                            let envelope = build_envelope_from_payload(
+                                my_id.clone(),
+                                inviter_id.clone(),
+                                None, None, now, DEFAULT_TTL_SECONDS, MessageKind::Meta,
+                                None, None, payload, &signing_key,
+                            )?;
+                            peers[index].client.post_envelope(&envelope)?;
+                            println!("{} auto-accepted invite to group '{}' from {}", peers[index].name, group_id, &inviter_id[..8.min(inviter_id.len())]);
+                        }
+                    }
+                    MetaMessage::GroupInviteAccept { peer_id: accepter_id, group_id } => {
+                        // Find our outgoing invite and send the group key.
+                        let my_id = peers[index].client.id().to_string();
+                        let invite = peers[index]
+                            .storage
+                            .find_group_invite(group_id.as_str(), &my_id, accepter_id.as_str(), "outgoing")
+                            .unwrap_or(None);
+                        if let Some(inv) = invite {
+                            if inv.status == "pending" {
+                                let _ = peers[index].storage.update_group_invite_status(inv.id, "accepted");
+                            }
+                        }
+                        // Get group key from in-memory group manager.
+                        let group_key = peers[index].client.get_group(group_id.as_str()).map(|g| g.group_key);
+                        if let Some(key) = group_key {
+                            // Get accepter's encryption key from storage.
+                            let enc_key = peers[index]
+                                .storage
+                                .get_peer(accepter_id.as_str())
+                                .unwrap_or(None)
+                                .and_then(|p| p.encryption_public_key);
+                            if let Some(enc_key) = enc_key {
+                                use tenet::crypto::{generate_content_key, NONCE_SIZE};
+                                let content_key = generate_content_key();
+                                let mut nonce = [0u8; NONCE_SIZE];
+                                use rand::RngCore as _;
+                                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                                let body = serde_json::json!({
+                                    "type": "group_key_distribution",
+                                    "group_id": group_id,
+                                    "group_key": hex::encode(key),
+                                    "key_version": 1u32,
+                                    "creator_id": my_id,
+                                });
+                                let body_str = serde_json::to_string(&body)?;
+                                use tenet::protocol::build_encrypted_payload;
+                                if let Ok(payload) = build_encrypted_payload(
+                                    body_str.as_bytes(),
+                                    &enc_key,
+                                    PAYLOAD_AAD,
+                                    HPKE_INFO,
+                                    &content_key,
+                                    &nonce,
+                                    None,
+                                ) {
+                                    let signing_key = peers[index].client.signing_private_key_hex().to_string();
+                                    let envelope = build_envelope_from_payload(
+                                        my_id.clone(),
+                                        accepter_id.clone(),
+                                        None, None, now, DEFAULT_TTL_SECONDS,
+                                        MessageKind::Direct, None, None, payload, &signing_key,
+                                    )?;
+                                    peers[index].client.post_envelope(&envelope)?;
+                                    // Record accepter as group member.
+                                    use tenet::storage::GroupMemberRow;
+                                    let _ = peers[index].storage.insert_group_member(&GroupMemberRow {
+                                        group_id: group_id.clone(),
+                                        peer_id: accepter_id.clone(),
+                                        joined_at: now,
+                                    });
+                                    println!("{} sent group key for '{}' to {}", peers[index].name, group_id, &accepter_id[..8.min(accepter_id.len())]);
+                                }
+                            } else {
+                                println!("{} cannot send group key — {} not in peer registry with enc key", peers[index].name, &accepter_id[..8.min(accepter_id.len())]);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -854,48 +1018,80 @@ fn create_group(
     let owner_name = owner_name.ok_or("create-group requires <peer> <group-id>")?;
     let group_id = group_id.ok_or("create-group requires <peer> <group-id>")?;
 
-    // Build full member list (owner always included).
+    // Collect non-owner member IDs.
     let owner_id = find_peer(peers, owner_name)?.client.id().to_string();
-    let mut all_member_ids: Vec<String> = vec![owner_id];
+    let mut invitee_ids: Vec<String> = Vec::new();
     for &name in member_names {
-        let id = find_peer(peers, name)?.client.id().to_string();
-        if !all_member_ids.contains(&id) {
-            all_member_ids.push(id);
-        }
-    }
-
-    // Create group on owner (generates the symmetric key).
-    let group_key = {
-        let owner = find_peer_mut(peers, owner_name)?;
-        let info = owner
-            .client
-            .create_group(group_id.to_string(), all_member_ids.clone())?;
-        info.group_key
-    };
-
-    // Distribute key directly to each non-owner member (in-process shortcut).
-    for &member_name in member_names {
-        if member_name == owner_name {
+        if name == owner_name {
             continue;
         }
-        let member = find_peer_mut(peers, member_name)?;
-        member
-            .client
-            .group_manager_mut()
-            .add_group_key(group_id.to_string(), group_key.to_vec());
-        // Populate membership so send_group_message works for this peer.
-        if let Some(group) = member.client.group_manager_mut().get_group_mut(group_id) {
-            for m_id in &all_member_ids {
-                let _ = group.add_member(m_id.clone());
-            }
+        let id = find_peer(peers, name)?.client.id().to_string();
+        if !invitee_ids.contains(&id) {
+            invitee_ids.push(id);
         }
     }
+    let mut all_member_ids = vec![owner_id.clone()];
+    all_member_ids.extend_from_slice(&invitee_ids);
 
-    println!(
-        "created group '{}' with {} members",
-        group_id,
-        all_member_ids.len()
-    );
+    // Create the group on the owner — generates the symmetric key in-memory.
+    {
+        let owner = find_peer_mut(peers, owner_name)?;
+        owner
+            .client
+            .create_group(group_id.to_string(), all_member_ids.clone())?;
+    }
+
+    // Send a GroupInvite meta message via the relay for each non-owner member.
+    let now = now_secs();
+    for invitee_id in &invitee_ids {
+        let meta = MetaMessage::GroupInvite {
+            peer_id: owner_id.clone(),
+            group_id: group_id.to_string(),
+            group_name: None,
+            message: None,
+        };
+        let payload = build_meta_payload(&meta)?;
+        let owner = find_peer_mut(peers, owner_name)?;
+        let signing_key = owner.client.signing_private_key_hex().to_string();
+        let sender_id = owner.client.id().to_string();
+        let envelope = build_envelope_from_payload(
+            sender_id.clone(),
+            invitee_id.clone(),
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::Meta,
+            None,
+            None,
+            payload,
+            &signing_key,
+        )?;
+        owner.client.post_envelope(&envelope)?;
+        // Record the outgoing invite row.
+        let _ = owner.storage.insert_group_invite(&GroupInviteRow {
+            id: 0,
+            group_id: group_id.to_string(),
+            from_peer_id: sender_id.clone(),
+            to_peer_id: invitee_id.clone(),
+            status: "pending".to_string(),
+            message: None,
+            direction: "outgoing".to_string(),
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    if invitee_ids.is_empty() {
+        println!("created group '{}' (no invites needed)", group_id);
+    } else {
+        println!(
+            "created group '{}' and sent {} invite(s) — sync invitees then sync {} to distribute key",
+            group_id,
+            invitee_ids.len(),
+            owner_name
+        );
+    }
     Ok(())
 }
 
@@ -998,37 +1194,57 @@ fn add_group_member(
 
     let new_member_id = find_peer(peers, new_member_name)?.client.id().to_string();
 
-    // Add to owner's group manager and retrieve updated membership.
-    let (group_key, all_member_ids) = {
+    // Add to the owner's in-memory group manager.
+    {
         let owner = find_peer_mut(peers, owner_name)?;
         owner
             .client
             .group_manager_mut()
             .add_member(group_id, &new_member_id)?;
-        let group = owner
-            .client
-            .get_group(group_id)
-            .ok_or_else(|| format!("group '{}' not found", group_id))?;
-        let key = group.group_key;
-        let members: Vec<String> = group.members.iter().cloned().collect();
-        (key, members)
+    }
+
+    // Send a GroupInvite via the relay (real protocol flow).
+    let now = now_secs();
+    let meta = MetaMessage::GroupInvite {
+        peer_id: find_peer(peers, owner_name)?.client.id().to_string(),
+        group_id: group_id.to_string(),
+        group_name: None,
+        message: None,
     };
+    let payload = build_meta_payload(&meta)?;
+    let owner = find_peer_mut(peers, owner_name)?;
+    let signing_key = owner.client.signing_private_key_hex().to_string();
+    let sender_id = owner.client.id().to_string();
+    let envelope = build_envelope_from_payload(
+        sender_id.clone(),
+        new_member_id.clone(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Meta,
+        None,
+        None,
+        payload,
+        &signing_key,
+    )?;
+    owner.client.post_envelope(&envelope)?;
+    let _ = owner.storage.insert_group_invite(&GroupInviteRow {
+        id: 0,
+        group_id: group_id.to_string(),
+        from_peer_id: sender_id.clone(),
+        to_peer_id: new_member_id.clone(),
+        status: "pending".to_string(),
+        message: None,
+        direction: "outgoing".to_string(),
+        created_at: now,
+        updated_at: now,
+    });
 
-    // Distribute key and membership to the new member.
-    let member = find_peer_mut(peers, new_member_name)?;
-    if !member.client.group_manager().has_group(group_id) {
-        member
-            .client
-            .group_manager_mut()
-            .add_group_key(group_id.to_string(), group_key.to_vec());
-    }
-    if let Some(group) = member.client.group_manager_mut().get_group_mut(group_id) {
-        for m_id in &all_member_ids {
-            let _ = group.add_member(m_id.clone());
-        }
-    }
-
-    println!("added {} to group '{}'", new_member_name, group_id);
+    println!(
+        "invited {} to group '{}' — sync {} then sync {} to distribute key",
+        new_member_name, group_id, new_member_name, owner_name
+    );
     Ok(())
 }
 

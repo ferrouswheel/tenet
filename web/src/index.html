@@ -81,6 +81,23 @@
             <div class="filters">
                 <button class="active" data-kind="public">Public</button>
                 <button data-kind="friend_group">Groups</button>
+                <button id="groups-new-btn" style="display:none;" onclick="toggleGroupCreateForm()">+ New Group</button>
+            </div>
+
+            <!-- Group invites panel (shown when in groups view, if there are pending invites) -->
+            <div id="group-invites-panel" style="display:none;"></div>
+
+            <!-- Group create form (shown when in groups view) -->
+            <div id="group-create-form" class="group-create-form" style="display:none;">
+                <h3>Create Group</h3>
+                <label>Group ID</label>
+                <input type="text" id="group-id-input" placeholder="e.g. friends, work-team" />
+                <label>Members (from your friends)</label>
+                <div id="group-member-checkboxes" class="group-member-list"></div>
+                <div class="form-actions">
+                    <button class="btn-secondary" onclick="toggleGroupCreateForm()">Cancel</button>
+                    <button class="btn-primary" onclick="submitCreateGroup()">Create Group</button>
+                </div>
             </div>
 
             <!-- Compose box -->
@@ -97,6 +114,7 @@
                     <select id="compose-kind">
                         <option value="public">Public</option>
                     </select>
+                    <select id="compose-group-id" style="display:none;"></select>
                     <button id="compose-send" onclick="sendMessage()">Send</button>
                 </div>
             </div>

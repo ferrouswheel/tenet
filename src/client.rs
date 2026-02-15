@@ -288,6 +288,23 @@ pub trait MessageHandler: Send {
 
     /// Called when a message is rejected (bad signature, unknown sender, etc.).
     fn on_rejected(&mut self, _envelope: &Envelope, _reason: &str) {}
+
+    /// Drain and return group keys received via `group_key_distribution` messages.
+    /// The caller should apply these to the client's in-memory `GroupManager`.
+    fn take_pending_group_keys(&mut self) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
+
+    /// Called when the local peer creates a new group so that the handler can persist
+    /// the group and outgoing invite rows to storage.
+    fn on_group_created(
+        &mut self,
+        _group_id: &str,
+        _group_key: &[u8; 32],
+        _creator_id: &str,
+        _members: &[String],
+    ) {
+    }
 }
 
 /// Result of `RelayClient::sync_inbox()`.
@@ -462,8 +479,14 @@ impl RelayClient {
         group_id: String,
         members: Vec<String>,
     ) -> Result<GroupInfo, GroupError> {
-        self.group_manager
-            .create_group(group_id, members, self.id().to_string())
+        let info = self
+            .group_manager
+            .create_group(group_id, members, self.id().to_string())?;
+        if let Some(ref mut h) = self.handler {
+            let members_vec: Vec<String> = info.members.iter().cloned().collect();
+            h.on_group_created(&info.group_id, &info.group_key, &info.creator_id, &members_vec);
+        }
+        Ok(info)
     }
 
     pub fn get_group(&self, group_id: &str) -> Option<&GroupInfo> {
@@ -484,6 +507,10 @@ impl RelayClient {
 
     pub fn signing_public_key_hex(&self) -> &str {
         &self.keypair.signing_public_key_hex
+    }
+
+    pub fn signing_private_key_hex(&self) -> &str {
+        &self.keypair.signing_private_key_hex
     }
 
     pub fn is_online(&self) -> bool {
@@ -1067,6 +1094,13 @@ impl RelayClient {
         // Restore the handler.
         self.handler = handler;
 
+        // Drain any group keys received via group_key_distribution into the GroupManager.
+        if let Some(ref mut h) = self.handler {
+            for (group_id, key) in h.take_pending_group_keys() {
+                self.group_manager.add_group_key(group_id, key);
+            }
+        }
+
         Ok(SyncOutcome {
             events,
             fetched,
@@ -1123,7 +1157,7 @@ impl RelayClient {
         }
     }
 
-    fn post_envelope(&self, envelope: &Envelope) -> Result<(), ClientError> {
+    pub fn post_envelope(&self, envelope: &Envelope) -> Result<(), ClientError> {
         let url = format!(
             "{}/envelopes",
             self.config.relay_url().trim_end_matches('/')
@@ -1602,8 +1636,14 @@ impl SimulationClient {
         group_id: String,
         members: Vec<String>,
     ) -> Result<GroupInfo, GroupError> {
-        self.group_manager
-            .create_group(group_id, members, self.id.clone())
+        let info = self
+            .group_manager
+            .create_group(group_id, members, self.id.clone())?;
+        if let Some(ref mut h) = self.handler {
+            let members_vec: Vec<String> = info.members.iter().cloned().collect();
+            h.on_group_created(&info.group_id, &info.group_key, &info.creator_id, &members_vec);
+        }
+        Ok(info)
     }
 
     pub fn get_group(&self, group_id: &str) -> Option<&GroupInfo> {
@@ -2437,6 +2477,30 @@ impl Client for SimulationClient {
                         .record_send(message, step, &envelope);
                     envelopes.push(envelope);
                 }
+                MessageKind::Meta => {
+                    // Meta messages (e.g. GroupInvite) — send as-is to the named recipient.
+                    let envelope = match build_envelope_from_payload(
+                        message.sender.clone(),
+                        message.recipient.clone(),
+                        None,
+                        None,
+                        timestamp,
+                        context.ttl_seconds,
+                        MessageKind::Meta,
+                        None,
+                        None,
+                        message.payload.clone(),
+                        &sender_keypair.signing_private_key_hex,
+                    ) {
+                        Ok(envelope) => envelope,
+                        Err(_) => continue,
+                    };
+                    self.record_message_send(message, step, &envelope, context);
+                    context
+                        .metrics_tracker
+                        .record_send(message, step, &envelope);
+                    envelopes.push(envelope);
+                }
                 _ => {
                     // Direct messages and any other kind - original behavior
                     let envelope = match build_envelope_from_payload(
@@ -2522,6 +2586,16 @@ impl Client for SimulationClient {
         let mut handler = self.handler.take();
 
         for envelope in envelopes {
+            // Handle Meta messages before signature-gated decode.
+            if envelope.header.message_kind == MessageKind::Meta {
+                if let Ok(meta) = decode_meta_payload(&envelope.payload) {
+                    if let Some(ref mut h) = handler {
+                        outgoing.extend(h.on_meta(&meta));
+                    }
+                }
+                continue;
+            }
+
             match self.decode_envelope_action(&envelope, &self.id, context) {
                 Some(IncomingEnvelopeAction::DirectMessage(ref message)) => {
                     if let Some(latency) =
@@ -2550,6 +2624,14 @@ impl Client for SimulationClient {
         }
 
         self.handler = handler;
+
+        // Drain any group keys received via group_key_distribution into the GroupManager.
+        if let Some(ref mut h) = self.handler {
+            for (group_id, key) in h.take_pending_group_keys() {
+                self.group_manager.add_group_key(group_id, key);
+            }
+        }
+
         ClientInboxOutcome { received, outgoing }
     }
 

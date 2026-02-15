@@ -10,11 +10,14 @@ use crate::crypto::{generate_keypair_with_rng, StoredKeypair, CONTENT_KEY_SIZE, 
 use crate::groups::GroupInfo;
 use crate::message_handler::StorageMessageHandler;
 use crate::protocol::{
-    build_encrypted_payload, build_plaintext_payload, ContentId, Envelope, MessageKind, Payload,
+    build_encrypted_payload, build_meta_payload, build_plaintext_payload, ContentId, Envelope,
+    MessageKind, MetaMessage, Payload,
 };
-use crate::storage::Storage;
+use crate::storage::{PeerRow, Storage};
 
 use super::random::{generate_message_body, sample_poisson, sample_weighted_index, sample_zipf};
+use crate::client::Client;
+
 use super::{
     start_relay, ClusteringConfig, FriendRequestConfig, FriendsPerNode, GroupMembershipsPerNode,
     GroupSizeDistribution, LatencyDistribution, MessageEncryption, MessageType, MessageTypeWeights,
@@ -283,7 +286,7 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
     }
 
     // Build groups if configured
-    let (groups, node_groups) = build_groups(config, &mut rng);
+    let (mut groups, node_groups) = build_groups(config, &mut rng);
 
     let planned_sends = build_planned_sends(
         config,
@@ -299,6 +302,19 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             None
         },
     );
+    // Minimum step at which group content messages may be scheduled.
+    // This leaves time for the GroupInvite → GroupInviteAccept → group_key_distribution
+    // round-trip to complete before members attempt to send group messages.
+    const GROUP_SETUP_MIN_STEP: usize = 300;
+
+    // Offset any group-content planned sends to start after the setup window.
+    let mut planned_sends = planned_sends;
+    for send in &mut planned_sends {
+        if send.message.message_kind == MessageKind::FriendGroup {
+            send.step = send.step.max(GROUP_SETUP_MIN_STEP);
+        }
+    }
+
     let mut direct_links = HashSet::new();
     let mut clients = Vec::new();
     for node_id in &config.node_ids {
@@ -314,17 +330,95 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             .unwrap_or_default();
         let mut client = SimulationHarness::build_client(node_id, schedule);
 
-        // Attach a per-peer in-memory StorageMessageHandler so received
-        // messages are persisted in an in-memory SQLite database.
+        // Attach a per-peer in-memory StorageMessageHandler with crypto params so
+        // the group invite flow (GroupInvite → GroupInviteAccept → group_key_distribution)
+        // can complete automatically during inbox processing.
         if let Some(keypair) = keypairs.get(node_id) {
             if let Ok(storage) = Storage::open_in_memory(std::path::Path::new("/tmp")) {
-                let handler = StorageMessageHandler::new(storage, keypair.clone());
+                // Pre-populate all other peers so on_meta(GroupInviteAccept) can look up
+                // their encryption public keys when building group_key_distribution messages.
+                for (peer_id, peer_kp) in &keypairs {
+                    if peer_id == node_id {
+                        continue;
+                    }
+                    let _ = storage.insert_peer(&PeerRow {
+                        peer_id: peer_id.clone(),
+                        display_name: None,
+                        signing_public_key: peer_kp.signing_public_key_hex.clone(),
+                        encryption_public_key: Some(peer_kp.public_key_hex.clone()),
+                        added_at: 0,
+                        is_friend: true,
+                        last_seen_online: None,
+                        online: false,
+                    });
+                }
+                let handler = StorageMessageHandler::new_with_crypto(
+                    storage,
+                    keypair.clone(),
+                    SIMULATION_HPKE_INFO.to_vec(),
+                    SIMULATION_PAYLOAD_AAD.to_vec(),
+                );
                 client.set_handler(Box::new(handler));
             }
         }
 
         clients.push(client);
     }
+
+    // For each group, call create_group on the creator's client so that the group key
+    // is generated and persisted to the handler's storage via on_group_created.
+    // Then schedule GroupInvite meta messages at step 0 for each non-creator member.
+    let groups_setup: Vec<(String, String, Vec<String>)> = groups
+        .iter()
+        .map(|(gid, info)| {
+            (
+                gid.clone(),
+                info.creator_id.clone(),
+                info.members.iter().cloned().collect(),
+            )
+        })
+        .collect();
+
+    for (group_id, creator_id, members) in &groups_setup {
+        let creator_idx = clients.iter().position(|c| c.id() == creator_id);
+        let Some(idx) = creator_idx else { continue };
+
+        if let Ok(info) = clients[idx].create_group(group_id.clone(), members.clone()) {
+            // Update the groups map to reflect the key actually generated by create_group.
+            if let Some(group_info) = groups.get_mut(group_id) {
+                group_info.group_key = info.group_key;
+            }
+        }
+
+        // Schedule a GroupInvite meta message at step 0 for each non-creator member.
+        for member_id in members {
+            if member_id == creator_id {
+                continue;
+            }
+            let meta = MetaMessage::GroupInvite {
+                peer_id: creator_id.clone(),
+                group_id: group_id.clone(),
+                group_name: None,
+                message: None,
+            };
+            let Ok(payload) = build_meta_payload(&meta) else {
+                continue;
+            };
+            planned_sends.push(PlannedSend {
+                step: 0,
+                message: SimMessage {
+                    id: format!("setup-invite-{}-{}", group_id, member_id),
+                    sender: creator_id.clone(),
+                    recipient: member_id.clone(),
+                    body: payload.body.clone(),
+                    payload,
+                    message_kind: MessageKind::Meta,
+                    group_id: None,
+                },
+            });
+        }
+    }
+
     SimulationInputs {
         clients,
         planned_sends,

@@ -57,6 +57,18 @@ pub enum WsEvent {
         bio: Option<String>,
         avatar_hash: Option<String>,
     },
+    GroupInviteReceived {
+        invite_id: i64,
+        group_id: String,
+        from_peer_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        created_at: u64,
+    },
+    GroupMemberJoined {
+        group_id: String,
+        peer_id: String,
+    },
 }
 
 pub struct AppState {

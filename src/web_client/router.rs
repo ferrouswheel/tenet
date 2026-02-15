@@ -126,6 +126,19 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/friend-requests/:id/block",
             post(handlers::friends::block_friend_request_handler),
         )
+        // Group Invites API
+        .route(
+            "/api/group-invites",
+            get(handlers::group_invites::list_group_invites_handler),
+        )
+        .route(
+            "/api/group-invites/:id/accept",
+            post(handlers::group_invites::accept_group_invite_handler),
+        )
+        .route(
+            "/api/group-invites/:id/ignore",
+            post(handlers::group_invites::ignore_group_invite_handler),
+        )
         // Conversations API
         .route(
             "/api/conversations",

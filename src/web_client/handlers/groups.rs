@@ -5,10 +5,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::crypto::{generate_content_key, NONCE_SIZE};
-use crate::protocol::{build_encrypted_payload, build_envelope_from_payload, MessageKind};
+use crate::protocol::{build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage};
 use crate::relay_transport::post_envelope;
-use crate::web_client::config::{DEFAULT_TTL_SECONDS, WEB_HPKE_INFO, WEB_PAYLOAD_AAD};
+use crate::web_client::config::DEFAULT_TTL_SECONDS;
 use crate::web_client::state::SharedState;
 use crate::web_client::utils::{api_error, now_secs};
 
@@ -40,9 +39,20 @@ pub async fn get_group_handler(
     let st = state.lock().await;
     match st.storage.get_group(&group_id) {
         Ok(Some(g)) => {
-            // Get group members
+            // Get accepted group members.
             let members = st.storage.list_group_members(&group_id).unwrap_or_default();
             let member_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+
+            // Get pending invitees (outgoing invites that haven't been accepted yet).
+            let pending_invites = st
+                .storage
+                .list_group_invites(Some("pending"), Some("outgoing"))
+                .unwrap_or_default();
+            let pending_ids: Vec<String> = pending_invites
+                .iter()
+                .filter(|inv| inv.group_id == group_id)
+                .map(|inv| inv.to_peer_id.clone())
+                .collect();
 
             let json = serde_json::json!({
                 "group_id": g.group_id,
@@ -50,6 +60,7 @@ pub async fn get_group_handler(
                 "created_at": g.created_at,
                 "key_version": g.key_version,
                 "members": member_ids,
+                "pending_invites": pending_ids,
             });
             (StatusCode::OK, axum::Json(json)).into_response()
         }
@@ -62,6 +73,8 @@ pub async fn get_group_handler(
 pub struct CreateGroupRequest {
     group_id: String,
     member_ids: Vec<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 pub async fn create_group_handler(
@@ -74,12 +87,12 @@ pub async fn create_group_handler(
 
     let now = now_secs();
 
-    // Generate a new symmetric key for the group
+    // Generate a new symmetric key for the group.
     let mut group_key = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_key);
 
-    // Short lock: insert group + members atomically, extract peer data for key distribution
-    let (keypair_id, signing_key, relay_url, all_members, member_enc_keys) = {
+    // Short lock: insert group (creator only as active member), record outgoing invites.
+    let (keypair_id, keypair_signing_key, relay_url, invitee_ids, group_name) = {
         let st = state.lock().await;
 
         let group_row = crate::storage::GroupRow {
@@ -90,165 +103,148 @@ pub async fn create_group_handler(
             key_version: 1,
         };
 
-        let mut all_members = req.member_ids.clone();
-        if !all_members.contains(&st.keypair.id) {
-            all_members.push(st.keypair.id.clone());
-        }
-
-        let member_rows: Vec<crate::storage::GroupMemberRow> = all_members
-            .iter()
-            .map(|member_id| crate::storage::GroupMemberRow {
-                group_id: req.group_id.clone(),
-                peer_id: member_id.clone(),
-                joined_at: now,
-            })
-            .collect();
+        // Creator is the only active member initially.
+        let creator_member = crate::storage::GroupMemberRow {
+            group_id: req.group_id.clone(),
+            peer_id: st.keypair.id.clone(),
+            joined_at: now,
+        };
 
         if let Err(e) = st
             .storage
-            .insert_group_with_members(&group_row, &member_rows)
+            .insert_group_with_members(&group_row, &[creator_member])
         {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
 
-        // Collect encryption keys for members we need to distribute to
-        let mut member_enc_keys: Vec<(String, Option<String>)> = Vec::new();
+        // Record an outgoing invite for each requested member (skip self).
+        let mut invitee_ids: Vec<String> = Vec::new();
         for member_id in &req.member_ids {
             if member_id == &st.keypair.id {
                 continue;
             }
-            let enc_key = st
-                .storage
-                .get_peer(member_id)
-                .ok()
-                .flatten()
-                .and_then(|p| p.encryption_public_key);
-            member_enc_keys.push((member_id.clone(), enc_key));
+            let invite_row = crate::storage::GroupInviteRow {
+                id: 0,
+                group_id: req.group_id.clone(),
+                from_peer_id: st.keypair.id.clone(),
+                to_peer_id: member_id.clone(),
+                status: "pending".to_string(),
+                message: req.message.clone(),
+                direction: "outgoing".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            match st.storage.insert_group_invite(&invite_row) {
+                Ok(_) => invitee_ids.push(member_id.clone()),
+                Err(e) => {
+                    crate::tlog!(
+                        "create_group: failed to record invite for {}: {}",
+                        crate::logging::peer_id(member_id),
+                        e
+                    );
+                }
+            }
         }
 
         (
             st.keypair.id.clone(),
             st.keypair.signing_private_key_hex.clone(),
             st.relay_url.clone(),
-            all_members,
-            member_enc_keys,
+            invitee_ids,
+            req.group_id.clone(),
         )
     };
-    // Lock released
+    // Lock released.
 
-    // Distribute group key to each member (crypto + I/O, no lock held)
-    let mut key_distribution_failed: Vec<String> = Vec::new();
+    // Send a GroupInvite meta message to each invitee (I/O, no lock held).
+    let mut invite_failed: Vec<String> = Vec::new();
 
-    for (member_id, enc_key) in &member_enc_keys {
-        let recipient_enc_key = match enc_key {
-            Some(k) => k.clone(),
-            None => {
-                crate::tlog!(
-                    "peer {} not found or has no encryption key; skipping",
-                    crate::logging::peer_id(member_id)
-                );
-                key_distribution_failed.push(member_id.clone());
-                continue;
+    if let Some(ref relay) = relay_url {
+        for invitee_id in &invitee_ids {
+            let meta_msg = MetaMessage::GroupInvite {
+                peer_id: keypair_id.clone(),
+                group_id: req.group_id.clone(),
+                group_name: Some(group_name.clone()),
+                message: req.message.clone(),
+            };
+
+            match build_meta_payload(&meta_msg) {
+                Ok(payload) => {
+                    match build_envelope_from_payload(
+                        keypair_id.clone(),
+                        invitee_id.clone(),
+                        None,
+                        None,
+                        now,
+                        DEFAULT_TTL_SECONDS,
+                        MessageKind::Meta,
+                        None,
+                        None,
+                        payload,
+                        &keypair_signing_key,
+                    ) {
+                        Ok(envelope) => {
+                            if let Err(e) = post_envelope(relay, &envelope) {
+                                crate::tlog!(
+                                    "create_group: failed to send invite to {}: {}",
+                                    crate::logging::peer_id(invitee_id),
+                                    e
+                                );
+                                invite_failed.push(invitee_id.clone());
+                            } else {
+                                crate::tlog!(
+                                    "create_group: sent group invite for {} to {}",
+                                    req.group_id,
+                                    crate::logging::peer_id(invitee_id)
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            crate::tlog!(
+                                "create_group: failed to build invite envelope for {}: {}",
+                                crate::logging::peer_id(invitee_id),
+                                e
+                            );
+                            invite_failed.push(invitee_id.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::tlog!(
+                        "create_group: failed to build invite payload for {}: {}",
+                        crate::logging::peer_id(invitee_id),
+                        e
+                    );
+                    invite_failed.push(invitee_id.clone());
+                }
             }
-        };
-
-        let key_distribution = serde_json::json!({
-            "type": "group_key_distribution",
-            "group_id": req.group_id,
-            "group_key": hex::encode(group_key),
-            "key_version": 1,
-            "creator_id": keypair_id,
-        });
-
-        let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
-
-        let content_key = generate_content_key();
-        let mut nonce = [0u8; NONCE_SIZE];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-
-        let payload = match build_encrypted_payload(
-            &key_dist_bytes,
-            &recipient_enc_key,
-            WEB_PAYLOAD_AAD,
-            WEB_HPKE_INFO,
-            &content_key,
-            &nonce,
-            None,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::tlog!(
-                    "failed to encrypt key distribution for {}: {}",
-                    crate::logging::peer_id(member_id),
-                    e
-                );
-                key_distribution_failed.push(member_id.clone());
-                continue;
-            }
-        };
-
-        let envelope = match build_envelope_from_payload(
-            keypair_id.clone(),
-            member_id.clone(),
-            None,
-            None,
-            now,
-            DEFAULT_TTL_SECONDS,
-            MessageKind::Direct,
-            None,
-            None,
-            payload,
-            &signing_key,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                crate::tlog!(
-                    "failed to build envelope for {}: {}",
-                    crate::logging::peer_id(member_id),
-                    e
-                );
-                key_distribution_failed.push(member_id.clone());
-                continue;
-            }
-        };
-
-        if let Some(ref relay_url) = relay_url {
-            if let Err(e) = post_envelope(relay_url, &envelope) {
-                crate::tlog!(
-                    "failed to distribute group key to {}: {}",
-                    crate::logging::peer_id(member_id),
-                    e
-                );
-                key_distribution_failed.push(member_id.clone());
-            }
-        } else {
-            key_distribution_failed.push(member_id.clone());
         }
+    } else if !invitee_ids.is_empty() {
+        crate::tlog!("create_group: no relay configured; invites stored locally only");
     }
+
+    crate::tlog!(
+        "send: created group {} (invites_sent={}/{})",
+        req.group_id,
+        invitee_ids.len() - invite_failed.len(),
+        invitee_ids.len()
+    );
 
     let mut json = serde_json::json!({
         "group_id": req.group_id,
         "creator_id": keypair_id,
         "created_at": now,
         "key_version": 1,
-        "members": all_members,
+        "members": [keypair_id],
+        "pending_invites": invitee_ids,
     });
 
-    if !key_distribution_failed.is_empty() {
+    if !invite_failed.is_empty() {
         json.as_object_mut().unwrap().insert(
-            "key_distribution_failed".to_string(),
-            serde_json::json!(key_distribution_failed),
+            "invite_failed".to_string(),
+            serde_json::json!(invite_failed),
         );
     }
-
-    let keys_sent = member_enc_keys.len() - key_distribution_failed.len();
-    crate::tlog!(
-        "send: created group {} with {} members (keys_distributed={}/{})",
-        req.group_id,
-        all_members.len(),
-        keys_sent,
-        member_enc_keys.len()
-    );
 
     (StatusCode::CREATED, axum::Json(json)).into_response()
 }
@@ -256,6 +252,8 @@ pub async fn create_group_handler(
 #[derive(Deserialize)]
 pub struct AddGroupMemberRequest {
     peer_id: String,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 pub async fn add_group_member_handler(
@@ -269,111 +267,101 @@ pub async fn add_group_member_handler(
 
     let now = now_secs();
 
-    // Short lock: validate, insert member, extract data for key distribution
-    let (keypair_id, signing_key, relay_url, recipient_enc_key, group_key, key_version, creator_id) = {
+    // Short lock: validate group exists, record outgoing invite.
+    let (keypair_id, keypair_signing_key, relay_url) = {
         let st = state.lock().await;
 
-        let group = match st.storage.get_group(&group_id) {
-            Ok(Some(g)) => g,
-            Ok(None) => return api_error(StatusCode::NOT_FOUND, "group not found"),
-            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-
-        let member_row = crate::storage::GroupMemberRow {
-            group_id: group_id.clone(),
-            peer_id: req.peer_id.clone(),
-            joined_at: now,
-        };
-
-        if let Err(e) = st.storage.insert_group_member(&member_row) {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        if st.storage.get_group(&group_id).ok().flatten().is_none() {
+            return api_error(StatusCode::NOT_FOUND, "group not found");
         }
 
-        let peer = match st.storage.get_peer(&req.peer_id) {
-            Ok(Some(p)) => p,
-            Ok(None) => return api_error(StatusCode::NOT_FOUND, "peer not found"),
-            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
+        // Check peer exists.
+        if st
+            .storage
+            .get_peer(&req.peer_id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return api_error(StatusCode::NOT_FOUND, "peer not found");
+        }
 
-        let enc_key = match peer.encryption_public_key.as_deref() {
-            Some(k) => k.to_string(),
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "peer has no encryption key; cannot distribute group key",
-                )
-            }
+        let invite_row = crate::storage::GroupInviteRow {
+            id: 0,
+            group_id: group_id.clone(),
+            from_peer_id: st.keypair.id.clone(),
+            to_peer_id: req.peer_id.clone(),
+            status: "pending".to_string(),
+            message: req.message.clone(),
+            direction: "outgoing".to_string(),
+            created_at: now,
+            updated_at: now,
         };
-
-        let gk: [u8; 32] = match group.group_key.try_into() {
-            Ok(k) => k,
-            Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid group key"),
-        };
+        if let Err(e) = st.storage.insert_group_invite(&invite_row) {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
 
         (
             st.keypair.id.clone(),
             st.keypair.signing_private_key_hex.clone(),
             st.relay_url.clone(),
-            enc_key,
-            gk,
-            group.key_version,
-            group.creator_id.clone(),
         )
     };
-    // Lock released
+    // Lock released.
 
-    // Build key distribution envelope (crypto, no lock needed)
-    let key_distribution = serde_json::json!({
-        "type": "group_key_distribution",
-        "group_id": group_id,
-        "group_key": hex::encode(group_key),
-        "key_version": key_version,
-        "creator_id": creator_id,
-    });
+    // Send the GroupInvite meta message (I/O, no lock held).
+    let relay_sent = if let Some(ref relay) = relay_url {
+        let meta_msg = MetaMessage::GroupInvite {
+            peer_id: keypair_id.clone(),
+            group_id: group_id.clone(),
+            group_name: Some(group_id.clone()),
+            message: req.message.clone(),
+        };
 
-    let key_dist_bytes = serde_json::to_vec(&key_distribution).unwrap_or_default();
-
-    let content_key = generate_content_key();
-    let mut nonce = [0u8; NONCE_SIZE];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-
-    let payload = match build_encrypted_payload(
-        &key_dist_bytes,
-        &recipient_enc_key,
-        WEB_PAYLOAD_AAD,
-        WEB_HPKE_INFO,
-        &content_key,
-        &nonce,
-        None,
-    ) {
-        Ok(p) => p,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("crypto: {e}")),
-    };
-
-    let envelope = match build_envelope_from_payload(
-        keypair_id,
-        req.peer_id.clone(),
-        None,
-        None,
-        now,
-        DEFAULT_TTL_SECONDS,
-        MessageKind::Direct,
-        None,
-        None,
-        payload,
-        &signing_key,
-    ) {
-        Ok(e) => e,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")),
-    };
-
-    // Post to relay (blocking I/O, no lock held)
-    let relay_delivered = if let Some(ref relay_url) = relay_url {
-        match post_envelope(relay_url, &envelope) {
-            Ok(()) => true,
+        match build_meta_payload(&meta_msg) {
+            Ok(payload) => match build_envelope_from_payload(
+                keypair_id.clone(),
+                req.peer_id.clone(),
+                None,
+                None,
+                now,
+                DEFAULT_TTL_SECONDS,
+                MessageKind::Meta,
+                None,
+                None,
+                payload,
+                &keypair_signing_key,
+            ) {
+                Ok(envelope) => match post_envelope(relay, &envelope) {
+                    Ok(()) => {
+                        crate::tlog!(
+                            "send: group invite for {} to {} via relay",
+                            group_id,
+                            crate::logging::peer_id(&req.peer_id)
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        crate::tlog!(
+                            "add_group_member: failed to post invite to relay for {}: {}",
+                            crate::logging::peer_id(&req.peer_id),
+                            e
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    crate::tlog!(
+                        "add_group_member: failed to build envelope for {}: {}",
+                        crate::logging::peer_id(&req.peer_id),
+                        e
+                    );
+                    false
+                }
+            },
             Err(e) => {
                 crate::tlog!(
-                    "failed to distribute group key to {}: {}",
+                    "add_group_member: failed to build payload for {}: {}",
                     crate::logging::peer_id(&req.peer_id),
                     e
                 );
@@ -381,21 +369,15 @@ pub async fn add_group_member_handler(
             }
         }
     } else {
+        crate::tlog!("add_group_member: no relay configured; invite stored locally only");
         false
     };
 
-    crate::tlog!(
-        "send: group key to {} for {} (relay={})",
-        crate::logging::peer_id(&req.peer_id),
-        group_id,
-        relay_delivered
-    );
-
     let json = serde_json::json!({
-        "status": "added",
+        "status": "invited",
         "group_id": group_id,
         "peer_id": req.peer_id,
-        "key_delivered": relay_delivered,
+        "invite_sent": relay_sent,
     });
     (StatusCode::OK, axum::Json(json)).into_response()
 }

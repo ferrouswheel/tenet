@@ -47,6 +47,37 @@ enum InputAction {
     Quit,
 }
 
+/// Adapts the `tlog!` global writer to the TUI log channel.
+///
+/// Lines written by [`tlog!`] (from any module — message handler, sync loop,
+/// etc.) are forwarded as [`LogEntry`] values and appear in the TUI log panel
+/// alongside relay and peer entries.
+struct TuiLogWriter {
+    tx: mpsc::UnboundedSender<LogEntry>,
+    sim_time: Arc<Mutex<f64>>,
+}
+
+impl std::io::Write for TuiLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(s) = std::str::from_utf8(buf) {
+            let msg = s.trim_end_matches('\n').to_string();
+            if !msg.is_empty() {
+                let sim_t = *self.sim_time.lock().unwrap();
+                let _ = self.tx.send(LogEntry {
+                    sim_time: sim_t,
+                    source: "tlog".to_string(),
+                    message: msg,
+                });
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
@@ -84,15 +115,10 @@ async fn run_with_tui(
 ) -> Result<tenet::simulation::SimulationReport, String> {
     const LOG_LIMIT: usize = 500;
     const SPEED_STEP: f64 = 0.10;
-    enable_raw_mode().map_err(|err| err.to_string())?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|err| err.to_string())?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|err| err.to_string())?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    // Single combined log channel for all sources (sim, relay, peers).
+    // Single combined log channel for all sources (sim, relay, peers, tlog).
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
 
@@ -100,6 +126,19 @@ async fn run_with_tui(
     // sim time.  The harness updates it right after every clock jump (before
     // processing events), so relay HTTP calls see the correct sim time.
     let relay_sim_time: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+
+    // Route tlog! output into the TUI log panel instead of stderr, before raw
+    // mode is enabled so no log lines can corrupt the terminal display.
+    tenet::logging::set_writer(Box::new(TuiLogWriter {
+        tx: log_tx.clone(),
+        sim_time: relay_sim_time.clone(),
+    }));
+
+    enable_raw_mode().map_err(|err| err.to_string())?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).map_err(|err| err.to_string())?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(|err| err.to_string())?;
 
     let mut relay_config = scenario.relay.clone().into_relay_config();
     {

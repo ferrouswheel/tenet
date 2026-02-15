@@ -238,11 +238,27 @@ pub struct FriendRequestRow {
     pub updated_at: u64,
 }
 
+/// Group invite row stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupInviteRow {
+    pub id: i64,
+    pub group_id: String,
+    pub from_peer_id: String,
+    pub to_peer_id: String,
+    /// "pending", "accepted", "ignored"
+    pub status: String,
+    pub message: Option<String>,
+    /// "incoming" or "outgoing" from the local peer's perspective
+    pub direction: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// Notification row stored in the database (Phase 11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationRow {
     pub id: i64,
-    /// "direct_message", "reply", "reaction", "friend_request"
+    /// "direct_message", "reply", "reaction", "friend_request", "group_invite"
     pub notification_type: String,
     pub message_id: String,
     pub sender_id: String,
@@ -414,6 +430,26 @@ impl Storage {
                 ON friend_requests(to_peer_id, status);
             CREATE INDEX IF NOT EXISTS idx_friend_requests_from
                 ON friend_requests(from_peer_id, status);
+
+            -- Group Invites
+            CREATE TABLE IF NOT EXISTS group_invites (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id        TEXT NOT NULL,
+                from_peer_id    TEXT NOT NULL,
+                to_peer_id      TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                message         TEXT,
+                direction       TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_group_invites_unique
+                ON group_invites(group_id, from_peer_id, to_peer_id, direction);
+            CREATE INDEX IF NOT EXISTS idx_group_invites_to
+                ON group_invites(to_peer_id, status);
+            CREATE INDEX IF NOT EXISTS idx_group_invites_from
+                ON group_invites(from_peer_id, status);
 
             -- Profiles (Phase 10)
             CREATE TABLE IF NOT EXISTS profiles (
@@ -1832,6 +1868,179 @@ impl Storage {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Group Invites CRUD
+    // -----------------------------------------------------------------------
+
+    /// Insert a new group invite. Returns the new invite ID.
+    /// Uses INSERT OR IGNORE so duplicate (group_id, from, to, direction) is a no-op.
+    pub fn insert_group_invite(&self, row: &GroupInviteRow) -> Result<i64, StorageError> {
+        let affected = self.conn.execute(
+            "INSERT OR IGNORE INTO group_invites
+             (group_id, from_peer_id, to_peer_id, status, message, direction, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                row.group_id,
+                row.from_peer_id,
+                row.to_peer_id,
+                row.status,
+                row.message,
+                row.direction,
+                row.created_at as i64,
+                row.updated_at as i64,
+            ],
+        )?;
+        if affected == 0 {
+            // Row already existed; return the existing id.
+            let existing_id: i64 = self.conn.query_row(
+                "SELECT id FROM group_invites
+                 WHERE group_id = ?1 AND from_peer_id = ?2 AND to_peer_id = ?3 AND direction = ?4",
+                params![row.group_id, row.from_peer_id, row.to_peer_id, row.direction],
+                |r| r.get(0),
+            )?;
+            return Ok(existing_id);
+        }
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get a group invite by ID.
+    pub fn get_group_invite(&self, id: i64) -> Result<Option<GroupInviteRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, group_id, from_peer_id, to_peer_id, status, message, direction,
+                    created_at, updated_at
+             FROM group_invites WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id], |row| {
+                Ok(GroupInviteRow {
+                    id: row.get(0)?,
+                    group_id: row.get(1)?,
+                    from_peer_id: row.get(2)?,
+                    to_peer_id: row.get(3)?,
+                    status: row.get(4)?,
+                    message: row.get(5)?,
+                    direction: row.get(6)?,
+                    created_at: row.get::<_, i64>(7)? as u64,
+                    updated_at: row.get::<_, i64>(8)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List group invites with optional status filter.
+    pub fn list_group_invites(
+        &self,
+        status_filter: Option<&str>,
+        direction_filter: Option<&str>,
+    ) -> Result<Vec<GroupInviteRow>, StorageError> {
+        let sql = match (status_filter, direction_filter) {
+            (Some(_), Some(_)) => {
+                "SELECT id, group_id, from_peer_id, to_peer_id, status, message, direction,
+                        created_at, updated_at
+                 FROM group_invites WHERE status = ?1 AND direction = ?2
+                 ORDER BY created_at DESC"
+            }
+            (Some(_), None) => {
+                "SELECT id, group_id, from_peer_id, to_peer_id, status, message, direction,
+                        created_at, updated_at
+                 FROM group_invites WHERE status = ?1
+                 ORDER BY created_at DESC"
+            }
+            (None, Some(_)) => {
+                "SELECT id, group_id, from_peer_id, to_peer_id, status, message, direction,
+                        created_at, updated_at
+                 FROM group_invites WHERE direction = ?1
+                 ORDER BY created_at DESC"
+            }
+            (None, None) => {
+                "SELECT id, group_id, from_peer_id, to_peer_id, status, message, direction,
+                        created_at, updated_at
+                 FROM group_invites
+                 ORDER BY created_at DESC"
+            }
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(GroupInviteRow {
+                id: row.get(0)?,
+                group_id: row.get(1)?,
+                from_peer_id: row.get(2)?,
+                to_peer_id: row.get(3)?,
+                status: row.get(4)?,
+                message: row.get(5)?,
+                direction: row.get(6)?,
+                created_at: row.get::<_, i64>(7)? as u64,
+                updated_at: row.get::<_, i64>(8)? as u64,
+            })
+        };
+
+        let rows = match (status_filter, direction_filter) {
+            (Some(s), Some(d)) => stmt.query_map(params![s, d], map_row)?,
+            (Some(s), None) => stmt.query_map(params![s], map_row)?,
+            (None, Some(d)) => stmt.query_map(params![d], map_row)?,
+            (None, None) => stmt.query_map([], map_row)?,
+        };
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Update the status of a group invite.
+    pub fn update_group_invite_status(
+        &self,
+        id: i64,
+        status: &str,
+    ) -> Result<bool, StorageError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let affected = self.conn.execute(
+            "UPDATE group_invites SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now as i64, id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Find a group invite by the (group_id, from, to, direction) unique key.
+    pub fn find_group_invite(
+        &self,
+        group_id: &str,
+        from_peer_id: &str,
+        to_peer_id: &str,
+        direction: &str,
+    ) -> Result<Option<GroupInviteRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, group_id, from_peer_id, to_peer_id, status, message, direction,
+                    created_at, updated_at
+             FROM group_invites
+             WHERE group_id = ?1 AND from_peer_id = ?2 AND to_peer_id = ?3 AND direction = ?4
+             LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![group_id, from_peer_id, to_peer_id, direction], |row| {
+                Ok(GroupInviteRow {
+                    id: row.get(0)?,
+                    group_id: row.get(1)?,
+                    from_peer_id: row.get(2)?,
+                    to_peer_id: row.get(3)?,
+                    status: row.get(4)?,
+                    message: row.get(5)?,
+                    direction: row.get(6)?,
+                    created_at: row.get::<_, i64>(7)? as u64,
+                    updated_at: row.get::<_, i64>(8)? as u64,
+                })
+            })
+            .optional()?;
+        Ok(row)
     }
 
     // -----------------------------------------------------------------------
