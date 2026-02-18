@@ -4,34 +4,23 @@ This document describes patterns and recommendations for building clients on top
 library, with a focus on message processing, storage integration, and the `StorageMessageHandler`
 design.
 
-## The Core Problem: Split Message Processing
+## Background: Message Processing Architecture
 
-Message processing is currently split across two places:
+Message processing uses `RelayClient.sync_inbox()` (`src/client.rs`) as the central point for
+fetching from the relay, verifying signatures, decrypting, and emitting typed `SyncEventOutcome`
+events for all message kinds (`Direct`, `Public`, `FriendGroup`, `Meta`, `StoreForPeer`).
 
-1. **`RelayClient.sync_inbox()`** (`src/client.rs`) — fetches from relay, verifies signatures,
-   decrypts `Direct` messages, deduplicates, and returns a `SyncOutcome`. Only handles `Direct`
-   messages; returns an error for all other kinds.
+The web client's `sync_once()` (`src/web_client/sync.rs`) consumes these events and handles
+storage writes plus WebSocket broadcasts. It does **not** yet use `StorageMessageHandler`
+directly — it still has its own `process_meta_event`, `process_message_event`, etc. functions
+that duplicate some of the storage logic. Migrating `sync.rs` to delegate to
+`StorageMessageHandler` is planned but not yet done (see Migration Path below).
 
-2. **`sync_once()`** (`src/web_client/sync.rs`) — the web client's sync loop. It bypasses
-   `RelayClient` entirely, re-implementing envelope fetching, signature verification, and
-   decryption, while also handling `Meta`, `Public`, `FriendGroup`, reactions, profile updates,
-   and group key distribution.
+## Design: `MessageHandler` Trait
 
-This creates two problems:
-
-- **Duplication**: `sync.rs` reimplements logic already in `RelayClient`. Any protocol change
-  must be applied in both places.
-- **High bar for new clients**: a new client (CLI, mobile) wanting more than `Direct` messages
-  must bypass `RelayClient` the same way the web client does.
-
-## Proposed Design: `MessageHandler` Trait
-
-The recommended direction is to make `sync_inbox()` emit richer, kind-aware output for all
-message types via two complementary mechanisms:
-
-1. **Richer `SyncOutcome`** — a pull API: callers iterate over typed events.
-2. **`MessageHandler` trait** — an optional push API: callers implement a trait and register it
-   on the client; the client calls hooks during sync.
+`sync_inbox()` emits typed `SyncEventOutcome` events for all message kinds. Callers can also
+register a `MessageHandler` implementation on the client for a push-style integration where
+storage writes happen during sync rather than after it returns.
 
 ### Typed Sync Events
 
@@ -108,56 +97,61 @@ impl RelayClient {
 
 ## `StorageMessageHandler`
 
-The recommended shared persistence layer for any full client. It lives in
-`src/message_handler.rs` (part of the library, not `web_client/`).
+`StorageMessageHandler` is implemented in `src/message_handler.rs` (part of the library, not
+`web_client/`). It handles all standard protocol-level persistence automatically during sync.
 
 ### What it handles
 
-**Protocol-level persistence** — nothing web-specific; any full client would want this:
-- `storage.insert_message()` for Direct, Public, FriendGroup messages
-- `storage.insert_attachment()` / `storage.insert_message_attachment()` for inline attachments
-- `storage.update_peer_online()` on `Meta::Online` / `Meta::Ack`
-- `storage.upsert_reaction()` for reaction meta messages
-- `storage.upsert_profile()` for profile update messages
-- `storage.insert_notification()` for direct messages and replies targeting our own messages
+- `Direct`, `Public`, `FriendGroup`, `StoreForPeer` message storage
+- Inline attachment data (stored per `AttachmentRow`)
+- Peer online status updates on `Meta::Online` / `Meta::Ack`
 - Friend request state machine: insert, refresh, block/ignore checks, auto-accept on mutual request
-- On `Meta::FriendAccept`: `storage.insert_peer()` to add the new friend
+- On `Meta::FriendAccept`: adds the new friend as a peer
+- Reaction storage from raw meta payloads
+- Profile updates (`tenet.profile` message type)
+- Notifications for direct messages, replies, reactions, and group invites
+- Group invite flow: **auto-accepts** incoming `GroupInvite` meta messages (sends back
+  `GroupInviteAccept` immediately without user confirmation — see note below)
+- Group key distribution: validates consent via accepted invite, stores group key
+
+> **Note on group invites**: `StorageMessageHandler` auto-accepts all group invites. This is
+> appropriate for automated clients (debugger, simulations). The web client's own `sync.rs`
+> does NOT use `StorageMessageHandler` for this — it stores the invite as pending and shows a
+> UI prompt, letting the user explicitly accept or ignore via `/api/group-invites/:id/accept`.
 
 **NOT** its responsibility:
 - WebSocket / push notification events (web client concern)
-- Group key distribution (currently in API handlers)
+- Relay posting of outgoing envelopes (caller must drain and post them)
 
 ### Struct definition
 
 ```rust
-pub struct StorageMessageHandler {
-    storage: Storage,
-    keypair: StoredKeypair,    // needed to sign outgoing envelopes (e.g. auto-accept)
-    relay_url: Option<String>, // needed to post protocol replies
-    my_peer_id: String,
-}
+pub struct StorageMessageHandler { /* ... */ }
 
 impl StorageMessageHandler {
-    pub fn new(storage: Storage, keypair: StoredKeypair, relay_url: Option<String>) -> Self { ... }
+    /// Basic constructor; group key distribution disabled (no HPKE params).
+    pub fn new(storage: Storage, keypair: StoredKeypair) -> Self { ... }
+
+    /// Full constructor with HPKE params for group key distribution.
+    pub fn new_with_crypto(
+        storage: Storage,
+        keypair: StoredKeypair,
+        hpke_info: Vec<u8>,
+        payload_aad: Vec<u8>,
+    ) -> Self { ... }
+
     pub fn storage(&self) -> &Storage { ... }
+    pub fn storage_mut(&mut self) -> &mut Storage { ... }
     pub fn into_storage(self) -> Storage { ... }
-}
 
-impl MessageHandler for StorageMessageHandler {
-    fn on_message(&mut self, envelope: &Envelope, message: &ClientMessage) {
-        // insert_message, inline attachments, insert_notification if DM/reply to us
-    }
-
-    fn on_meta(&mut self, meta: &MetaMessage) {
-        // update_peer_online, friend request state machine,
-        // insert_peer on FriendAccept, post auto-accept envelope if mutual request
-    }
-
-    fn on_raw_meta(&mut self, envelope: &Envelope, body: &str) {
-        // upsert_reaction, upsert_profile
-    }
+    /// Return any group keys received during sync (to apply to GroupManager).
+    pub fn take_pending_group_keys(&mut self) -> Vec<(String, Vec<u8>)> { ... }
 }
 ```
+
+`on_meta` and `on_message` return `Vec<Envelope>` — outgoing envelopes the caller must post to
+the relay (e.g. auto-accept friend request responses, group invite acceptances). The caller is
+responsible for posting these via `relay_transport::post_envelope()`.
 
 ## Composing Handlers
 
@@ -194,9 +188,12 @@ With this composition, `sync.rs` shrinks to: build a `WebClientHandler`, call
 
 ```rust
 let storage = Storage::open(&data_dir.join("tenet.db"))?;
-let handler = StorageMessageHandler::new(storage, keypair.clone(), Some(relay_url.clone()));
+let handler = StorageMessageHandler::new(storage, keypair.clone());
 client.set_handler(Box::new(handler));
 ```
+
+Use `new_with_crypto(storage, keypair, hpke_info, payload_aad)` if you need the handler to send
+group key distribution envelopes when processing `GroupInviteAccept` messages.
 
 After `client.sync_inbox()` returns, storage is already populated — no manual write calls needed.
 The full friend request state machine, presence tracking, and reaction storage all work
@@ -220,16 +217,15 @@ The following are explicitly **not** moved into `StorageMessageHandler`:
 
 ## Migration Path
 
-This design is backward-compatible from the caller's perspective if `SyncOutcome.messages` and
-`SyncOutcome.errors` are kept as convenience fields.
+| Step | Status | Change |
+|------|--------|--------|
+| 1 | ✅ Done | `SyncOutcome` with `events: Vec<SyncEvent>`; `sync_inbox()` handles all message kinds |
+| 2 | ✅ Done | `MessageHandler` trait and `RelayClient::set_handler()` |
+| 3 | ✅ Done | `StorageMessageHandler` in `src/message_handler.rs` |
+| 4 | ⬜ TODO | Refactor `web_client/sync.rs` to use `WebClientHandler` wrapping `StorageMessageHandler` |
+| 5 | ⬜ TODO | Use `StorageMessageHandler` in the debugger (currently uses direct storage writes) |
 
-| Step | Change |
-|------|--------|
-| 1 | Expand `SyncOutcome` with `events: Vec<SyncEvent>`; update `sync_inbox()` to handle all message kinds |
-| 2 | Add `MessageHandler` trait and `RelayClient::set_handler()` |
-| 3 | Introduce `StorageMessageHandler` in `src/message_handler.rs`; move protocol-level persistence out of `sync.rs` |
-| 4 | Refactor `web_client/sync.rs` to use `WebClientHandler` wrapping `StorageMessageHandler` |
-| 5 | Use `StorageMessageHandler` in the debugger |
-
-**Note**: As of this writing, this design is a proposal. The current implementation has the split
-described at the top of this document. See `src/web_client/sync.rs` for the current state.
+Step 4 is the main remaining work: the web client's `sync.rs` still contains its own
+`process_meta_event`, `process_message_event`, etc. that duplicate logic in
+`StorageMessageHandler`. Once step 4 is complete, `sync.rs` shrinks to building a
+`WebClientHandler` and calling `relay_client.sync_inbox()`.

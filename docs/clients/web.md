@@ -130,10 +130,12 @@ The sync loop is implemented in `src/web_client/sync.rs`.
 |----------|--------|-------------|
 | `/api/groups` | GET | List groups |
 | `/api/groups` | POST | Create group `{ group_id, member_ids, message? }` |
-| `/api/groups/:id` | GET | Group detail + members + pending invites |
-| `/api/groups/:id/members` | POST | Invite a member `{ peer_id }` |
+| `/api/groups/:group_id` | GET | Group detail + members + pending invites |
+| `/api/groups/:group_id/members` | POST | Invite a member `{ peer_id }` |
+| `/api/groups/:group_id/members/:peer_id` | DELETE | Remove a member (no key rotation yet) |
+| `/api/groups/:group_id/leave` | POST | Leave the group (no key rotation yet) |
 | `/api/group-invites` | GET | List invites (`?status=pending`) |
-| `/api/group-invites/:id/accept` | POST | Accept invite |
+| `/api/group-invites/:id/accept` | POST | Accept invite (sends `GroupInviteAccept` to creator) |
 | `/api/group-invites/:id/ignore` | POST | Ignore invite |
 
 ### Profiles
@@ -150,6 +152,14 @@ The sync loop is implemented in `src/web_client/sync.rs`.
 | `/api/attachments` | POST | Upload file (multipart) |
 | `/api/attachments/:hash` | GET | Download attachment |
 
+Attachments are stored as **plaintext bytes** in the local SQLite `attachments` table, keyed by
+SHA256 content hash. When a message with attachments is sent, the attachment bytes are base64-encoded
+and embedded as inline `data` fields inside `AttachmentRef` entries in the message `Payload`. For
+`Direct` and `FriendGroup` messages the entire payload — including attachment data — is
+HPKE/ChaCha20Poly1305-encrypted before transmission. For `Public` messages, attachment data travels
+in plaintext. There is no separate encrypted attachment transport; attachments ride the envelope
+encryption.
+
 ### Notifications
 
 | Endpoint | Method | Description |
@@ -158,12 +168,14 @@ The sync loop is implemented in `src/web_client/sync.rs`.
 | `/api/notifications/count` | GET | Unread count |
 | `/api/notifications/:id/read` | POST | Mark read |
 | `/api/notifications/read-all` | POST | Mark all read |
+| `/api/notifications/seen-all` | POST | Mark all seen (clears badge count) |
 
-### Health
+### Health and Sync
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/health` | GET | Returns peer ID and relay connection status |
+| `/api/sync` | POST | Trigger an immediate relay sync (outside normal interval) |
 | `/api/ws` | WebSocket | Real-time event stream |
 
 ## WebSocket Events
@@ -237,4 +249,4 @@ Key tables:
 | Group invite flow | Implemented |
 | Real-time updates (WebSocket) | Implemented |
 | Hash-based URL routing | Implemented |
-| Friend Groups UI | Partial (protocol exists, basic filtering) |
+| Friend Groups UI | Partial — create group, send group message, accept/ignore invites work; no UI for add member, remove member, or leave group |

@@ -63,14 +63,20 @@ Creator                        Relay                       Recipient
 
 ### Receiving an Invite
 
-When a peer receives a `GroupInvite`:
+Behavior depends on the client:
 
+**Web client** (`sync.rs`):
 1. The invite is stored in `group_invites` with `status = "pending"` and `direction = "incoming"`.
-2. A `WsEvent::GroupInviteReceived` is broadcast to connected web clients.
+2. A `WsEvent::GroupInviteReceived` is broadcast to connected browser clients.
 3. A notification is created in the `notifications` table.
-4. The user sees an Accept / Ignore prompt in the UI.
+4. The user sees an Accept / Ignore prompt in the UI and must explicitly act.
 
-Duplicate invites (same `group_id`, `from_peer_id`, `to_peer_id`) are deduplicated and ignored.
+**Library / debugger** (`StorageMessageHandler`):
+- Invites are **auto-accepted** immediately. A `GroupInviteAccept` is sent back without user
+  confirmation. This is appropriate for automated clients but not for interactive ones.
+
+Both paths deduplicate: if an invite for the same `(group_id, from_peer_id, to_peer_id)` already
+exists, the duplicate is ignored.
 
 ### Accepting an Invite
 

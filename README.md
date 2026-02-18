@@ -12,6 +12,8 @@ A protocol concept for a peer-to-peer social network and a Rust reference implem
 | [docs/groups.md](docs/groups.md) | Group creation, invite flow, and key distribution |
 | [docs/relay.md](docs/relay.md) | Relay server operation and HTTP API |
 | [docs/clients/web.md](docs/clients/web.md) | Web client (`tenet-web`): API, WebSocket events, SPA |
+| [docs/clients/cli.md](docs/clients/cli.md) | CLI tool (`tenet`): key management and direct messaging |
+| [docs/clients/identity.md](docs/clients/identity.md) | Multi-identity management and device setup |
 | [docs/clients/debugger.md](docs/clients/debugger.md) | Interactive REPL debugger reference |
 | [docs/clients/howto.md](docs/clients/howto.md) | How to build clients; `StorageMessageHandler` design |
 | [docs/sim/simulation.md](docs/sim/simulation.md) | Simulation execution model, metrics, TUI |
@@ -54,7 +56,7 @@ TENET_RELAY_URL=http://127.0.0.1:8080 cargo run --bin tenet-web
 
 ### Utilities
 
-Run the CLI to work on the same local database as the web
+Run the CLI for key management and direct messaging (uses a separate `peers.json`, not the web client's SQLite peers table — see [docs/clients/cli.md](docs/clients/cli.md)):
 
 ```bash
 cargo run --bin tenet -- init

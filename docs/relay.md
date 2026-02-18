@@ -58,6 +58,13 @@ Clients poll `GET /inbox/{recipient_id}` to fetch envelopes addressed to them. T
 all non-expired envelopes for that recipient ID. After successful delivery, the relay does not
 automatically delete envelopes (they expire via TTL).
 
+### WebSocket Push
+
+`GET /ws/{recipient_id}` upgrades to a WebSocket connection. The relay pushes envelopes to the
+connected client in real time as they arrive, eliminating the need to poll. The web client
+connects to this endpoint via `relay_ws_listen_loop` and uses a `Notify` signal to wake the sync
+loop immediately when an envelope arrives, giving near-real-time message delivery.
+
 ## Dashboard
 
 The relay serves a built-in HTML dashboard at `/` showing:
@@ -88,8 +95,9 @@ Peers connect to the relay using the `RelayClient` (HTTP). The connection flow i
    fetch pending envelopes.
 3. **Send messages**: outgoing envelopes are `POST`ed to `/envelopes`. The relay stores them in
    the recipient's inbox until fetched or TTL expires.
-4. **WebSocket** (optional): clients can open a WebSocket connection at `/ws/{recipient_id}` for
-   real-time push delivery instead of polling.
+4. **WebSocket push**: the web client also opens a WebSocket at `/ws/{recipient_id}` to receive
+   envelopes in real time. When the relay pushes a new envelope over this connection, the web
+   client wakes its sync loop immediately rather than waiting for the next polling interval.
 
 The web client's sync loop (`src/web_client/sync.rs`) runs as a background Tokio task and
 handles inbox polling, envelope decryption, and storage writes.
