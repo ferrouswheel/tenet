@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite;
 
-use tenet::crypto::{decrypt_payload, encrypt_payload, unwrap_content_key, wrap_content_key};
+use tenet::crypto::{
+    decrypt_payload, encrypt_payload, generate_keypair, make_relay_auth_token, unwrap_content_key,
+    wrap_content_key,
+};
 use tenet::relay::{app, RelayConfig, RelayState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,8 +88,9 @@ fn post_envelope(base_url: &str, envelope: &Envelope) {
     assert!(response.status() < 400, "relay rejected envelope");
 }
 
-fn fetch_inbox(base_url: &str, recipient_id: &str) -> Vec<Envelope> {
+fn fetch_inbox(base_url: &str, recipient_id: &str, auth_token: &str) -> Vec<Envelope> {
     let response = ureq::get(&format!("{}/inbox/{}", base_url, recipient_id))
+        .set("Authorization", &format!("Bearer {}", auth_token))
         .call()
         .expect("fetch inbox");
     let body = response.into_string().expect("inbox body");
@@ -107,11 +111,14 @@ async fn relay_expires_messages_after_ttl() {
     })
     .await;
 
+    let recipient_kp = generate_keypair();
+    let recipient_id = recipient_kp.id.clone();
+
     let envelope = Envelope {
         message_id: "expire-test".to_string(),
         header: Header {
             sender_id: "sender".to_string(),
-            recipient_id: "recipient".to_string(),
+            recipient_id: recipient_id.clone(),
             timestamp: 1,
             content_type: "text/plain".to_string(),
         },
@@ -137,7 +144,11 @@ async fn relay_expires_messages_after_ttl() {
 
     let inbox = tokio::task::spawn_blocking({
         let base_url = base_url.clone();
-        move || fetch_inbox(&base_url, "recipient")
+        let signing_priv = recipient_kp.signing_private_key_hex.clone();
+        move || {
+            let token = make_relay_auth_token(&signing_priv, &recipient_id).expect("token");
+            fetch_inbox(&base_url, &recipient_id, &token)
+        }
     })
     .await
     .expect("fetch task");
@@ -161,11 +172,14 @@ async fn relay_deduplicates_by_message_id() {
     })
     .await;
 
+    let recipient_kp = generate_keypair();
+    let recipient_id = recipient_kp.id.clone();
+
     let envelope = Envelope {
         message_id: "dedupe-test".to_string(),
         header: Header {
             sender_id: "sender".to_string(),
-            recipient_id: "recipient".to_string(),
+            recipient_id: recipient_id.clone(),
             timestamp: 1,
             content_type: "text/plain".to_string(),
         },
@@ -192,7 +206,11 @@ async fn relay_deduplicates_by_message_id() {
 
     let inbox = tokio::task::spawn_blocking({
         let base_url = base_url.clone();
-        move || fetch_inbox(&base_url, "recipient")
+        let signing_priv = recipient_kp.signing_private_key_hex.clone();
+        move || {
+            let token = make_relay_auth_token(&signing_priv, &recipient_id).expect("token");
+            fetch_inbox(&base_url, &recipient_id, &token)
+        }
     })
     .await
     .expect("fetch task");
@@ -218,11 +236,12 @@ async fn node_can_send_and_receive_through_relay() {
 
     let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
     let (recipient_private, recipient_public) = X25519HkdfSha256::gen_keypair(&mut rng);
-    let recipient_id = "recipient-node";
+    let recipient_kp = generate_keypair();
+    let recipient_id = recipient_kp.id.clone();
 
     let header = Header {
         sender_id: "sender-node".to_string(),
-        recipient_id: recipient_id.to_string(),
+        recipient_id: recipient_id.clone(),
         timestamp: 123,
         content_type: "text/plain".to_string(),
     };
@@ -265,7 +284,11 @@ async fn node_can_send_and_receive_through_relay() {
 
     let inbox = tokio::task::spawn_blocking({
         let base_url = base_url.clone();
-        move || fetch_inbox(&base_url, recipient_id)
+        let signing_priv = recipient_kp.signing_private_key_hex.clone();
+        move || {
+            let token = make_relay_auth_token(&signing_priv, &recipient_id).expect("token");
+            fetch_inbox(&base_url, &recipient_id, &token)
+        }
     })
     .await
     .expect("fetch task");
@@ -302,9 +325,9 @@ fn test_relay_config() -> RelayConfig {
     }
 }
 
-fn ws_url(http_url: &str, recipient_id: &str) -> String {
+fn ws_url(http_url: &str, recipient_id: &str, auth_token: &str) -> String {
     let ws_base = http_url.replacen("http://", "ws://", 1);
-    format!("{ws_base}/ws/{recipient_id}")
+    format!("{ws_base}/ws/{recipient_id}?token={auth_token}")
 }
 
 fn make_test_envelope(sender: &str, recipient: &str, msg_id: &str) -> Envelope {
@@ -330,16 +353,19 @@ fn make_test_envelope(sender: &str, recipient: &str, msg_id: &str) -> Envelope {
 #[tokio::test]
 async fn websocket_receives_messages_in_realtime() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
-    let recipient = "ws-recipient-1";
+    let recipient_kp = generate_keypair();
+    let recipient = recipient_kp.id.clone();
+    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
+        .expect("ws token");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws connect");
 
     // Small delay for the server to register the subscriber
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let envelope = make_test_envelope("sender-a", recipient, "ws-msg-1");
+    let envelope = make_test_envelope("sender-a", &recipient, "ws-msg-1");
     let base_url_clone = base_url.clone();
     let envelope_clone = envelope.clone();
     tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope_clone))
@@ -372,18 +398,21 @@ async fn websocket_receives_messages_in_realtime() {
 #[tokio::test]
 async fn websocket_multiple_subscribers_same_recipient() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
-    let recipient = "ws-multi-recipient";
+    let recipient_kp = generate_keypair();
+    let recipient = recipient_kp.id.clone();
+    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
+        .expect("ws token");
 
-    let (mut ws1, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (mut ws1, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws1 connect");
-    let (mut ws2, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (mut ws2, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws2 connect");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let envelope = make_test_envelope("sender-b", recipient, "ws-multi-msg");
+    let envelope = make_test_envelope("sender-b", &recipient, "ws-multi-msg");
     let base_url_clone = base_url.clone();
     tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
         .await
@@ -414,14 +443,23 @@ async fn websocket_multiple_subscribers_same_recipient() {
 async fn websocket_does_not_receive_other_recipients_messages() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
 
-    let (mut ws_alice, _) = tokio_tungstenite::connect_async(ws_url(&base_url, "alice"))
-        .await
-        .expect("ws alice connect");
+    let alice_kp = generate_keypair();
+    let alice_id = alice_kp.id.clone();
+    let alice_token =
+        make_relay_auth_token(&alice_kp.signing_private_key_hex, &alice_id).expect("alice token");
+
+    let bob_kp = generate_keypair();
+    let bob_id = bob_kp.id.clone();
+
+    let (mut ws_alice, _) =
+        tokio_tungstenite::connect_async(ws_url(&base_url, &alice_id, &alice_token))
+            .await
+            .expect("ws alice connect");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Send a message to bob, not alice
-    let envelope = make_test_envelope("sender-c", "bob", "msg-for-bob");
+    let envelope = make_test_envelope("sender-c", &bob_id, "msg-for-bob");
     let base_url_clone = base_url.clone();
     tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
         .await
@@ -438,15 +476,18 @@ async fn websocket_does_not_receive_other_recipients_messages() {
 #[tokio::test]
 async fn websocket_and_polling_coexist() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
-    let recipient = "ws-poll-recipient";
+    let recipient_kp = generate_keypair();
+    let recipient = recipient_kp.id.clone();
+    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
+        .expect("ws token");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws connect");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let envelope = make_test_envelope("sender-d", recipient, "ws-poll-msg");
+    let envelope = make_test_envelope("sender-d", &recipient, "ws-poll-msg");
     let base_url_clone = base_url.clone();
     let envelope_clone = envelope.clone();
     tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope_clone))
@@ -470,9 +511,13 @@ async fn websocket_and_polling_coexist() {
 
     // Polling should also still work (message was consumed from WS but still in queue)
     let base_url_clone = base_url.clone();
-    let inbox = tokio::task::spawn_blocking(move || fetch_inbox(&base_url_clone, recipient))
-        .await
-        .expect("fetch");
+    let signing_priv = recipient_kp.signing_private_key_hex.clone();
+    let inbox = tokio::task::spawn_blocking(move || {
+        let poll_token = make_relay_auth_token(&signing_priv, &recipient).expect("poll token");
+        fetch_inbox(&base_url_clone, &recipient, &poll_token)
+    })
+    .await
+    .expect("fetch");
     // The message is still in the queue because WebSocket notification is separate from queue drain
     assert_eq!(
         inbox.len(),
@@ -487,9 +532,12 @@ async fn websocket_and_polling_coexist() {
 #[tokio::test]
 async fn websocket_receives_multiple_messages_sequentially() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
-    let recipient = "ws-seq-recipient";
+    let recipient_kp = generate_keypair();
+    let recipient = recipient_kp.id.clone();
+    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
+        .expect("ws token");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws connect");
 
@@ -497,7 +545,7 @@ async fn websocket_receives_multiple_messages_sequentially() {
 
     // Send 3 messages
     for i in 0..3 {
-        let envelope = make_test_envelope("sender-e", recipient, &format!("ws-seq-msg-{}", i));
+        let envelope = make_test_envelope("sender-e", &recipient, &format!("ws-seq-msg-{}", i));
         let base_url_clone = base_url.clone();
         tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
             .await
@@ -535,9 +583,12 @@ async fn websocket_receives_multiple_messages_sequentially() {
 #[tokio::test]
 async fn websocket_batch_store_notifies_subscribers() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
-    let recipient = "ws-batch-recipient";
+    let recipient_kp = generate_keypair();
+    let recipient = recipient_kp.id.clone();
+    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
+        .expect("ws token");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws connect");
 
@@ -545,8 +596,8 @@ async fn websocket_batch_store_notifies_subscribers() {
 
     // Post a batch of 2 envelopes for the same recipient
     let envelopes = vec![
-        make_test_envelope("sender-f", recipient, "ws-batch-1"),
-        make_test_envelope("sender-g", recipient, "ws-batch-2"),
+        make_test_envelope("sender-f", &recipient, "ws-batch-1"),
+        make_test_envelope("sender-g", &recipient, "ws-batch-2"),
     ];
     let base_url_clone = base_url.clone();
     tokio::task::spawn_blocking(move || {
@@ -584,10 +635,13 @@ async fn websocket_batch_store_notifies_subscribers() {
 #[tokio::test]
 async fn websocket_disconnect_does_not_break_relay() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
-    let recipient = "ws-disconnect-recipient";
+    let recipient_kp = generate_keypair();
+    let recipient = recipient_kp.id.clone();
+    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
+        .expect("ws token");
 
     // Connect and immediately disconnect
-    let (ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, recipient))
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
         .expect("ws connect");
     drop(ws);
@@ -595,7 +649,7 @@ async fn websocket_disconnect_does_not_break_relay() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Posting a message should still work fine
-    let envelope = make_test_envelope("sender-h", recipient, "after-disconnect");
+    let envelope = make_test_envelope("sender-h", &recipient, "after-disconnect");
     let base_url_clone = base_url.clone();
     tokio::task::spawn_blocking(move || post_envelope(&base_url_clone, &envelope))
         .await
@@ -603,9 +657,13 @@ async fn websocket_disconnect_does_not_break_relay() {
 
     // Polling should still work
     let base_url_clone = base_url.clone();
-    let inbox = tokio::task::spawn_blocking(move || fetch_inbox(&base_url_clone, recipient))
-        .await
-        .expect("fetch");
+    let signing_priv = recipient_kp.signing_private_key_hex.clone();
+    let inbox = tokio::task::spawn_blocking(move || {
+        let poll_token = make_relay_auth_token(&signing_priv, &recipient).expect("poll token");
+        fetch_inbox(&base_url_clone, &recipient, &poll_token)
+    })
+    .await
+    .expect("fetch");
     assert_eq!(inbox.len(), 1);
 
     shutdown_tx.send(()).ok();

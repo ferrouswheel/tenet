@@ -102,6 +102,11 @@ struct InboxQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct WsAuthQuery {
+    token: Option<String>,
+}
+
 #[derive(Serialize)]
 struct StoreResponse {
     message_id: String,
@@ -367,10 +372,19 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(recipient_id): Path<String>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(auth): Query<WsAuthQuery>,
     State(state): State<RelayState>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    let token = match auth.token {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "missing token").into_response(),
+    };
+    if crate::crypto::verify_relay_auth_token(&token, &recipient_id).is_err() {
+        return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
+    }
     let ip = addr.ip().to_string();
     ws.on_upgrade(move |socket| handle_ws_connection(socket, recipient_id, ip, state))
+        .into_response()
 }
 
 async fn handle_ws_connection(
@@ -384,7 +398,7 @@ async fn handle_ws_connection(
     {
         let mut inner = state.inner.lock().await;
         let now = Instant::now();
-        record_peer_connection(&state.config, &mut inner, &recipient_id, now);
+        touch_peer(&mut inner, &recipient_id, now);
     }
 
     let conn_id = {
@@ -642,7 +656,16 @@ async fn fetch_inbox(
     State(state): State<RelayState>,
     Path(recipient_id): Path<String>,
     Query(query): Query<InboxQuery>,
-) -> impl IntoResponse {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "missing Authorization header").into_response(),
+    };
+    if crate::crypto::verify_relay_auth_token(&token, &recipient_id).is_err() {
+        return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
+    }
+
     let mut inner = match lock_with_retry(&state).await {
         Ok(inner) => inner,
         Err(status) => return (status, "relay busy").into_response(),
@@ -662,6 +685,14 @@ async fn fetch_inbox(
     prune_dedup(&mut inner.dedup);
 
     (StatusCode::OK, Json(envelopes)).into_response()
+}
+
+fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_string)
 }
 
 async fn fetch_inbox_batch(
@@ -883,10 +914,10 @@ fn store_envelope_locked(
     let sender_id = sender_id_from(&payload);
     let is_broadcast = recipient_id == "*";
     if !is_broadcast {
-        record_peer_connection(config, inner, &recipient_id, now);
+        touch_peer(inner, &recipient_id, now);
     }
     if let Some(sender_id) = sender_id.as_deref() {
-        record_peer_connection(config, inner, sender_id, now);
+        touch_peer(inner, sender_id, now);
     }
 
     let body_bytes = serde_json::to_vec(&payload)
@@ -983,10 +1014,14 @@ fn store_envelope_locked(
     };
     let mut evicted_ids = Vec::new();
     {
-        let queue = inner
-            .queues
-            .entry(recipient_id.clone())
-            .or_insert_with(VecDeque::new);
+        let entry = inner.queues.entry(recipient_id.clone());
+        if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
+            log_message(
+                config,
+                format!("relay: inbox created {}", format_peer_id(&recipient_id)),
+            );
+        }
+        let queue = entry.or_insert_with(VecDeque::new);
         evicted_ids.extend(prune_expired(queue, now));
 
         while queue.len() >= config.max_messages
@@ -1078,6 +1113,8 @@ enum ExpiresAt {
     Valid(Instant),
 }
 
+/// Update `peer_last_seen` and log "peer polled inbox" (rate-limited to once
+/// per `peer_log_window`).  Call only from HTTP inbox poll handlers.
 fn record_peer_connection(
     config: &RelayConfig,
     inner: &mut RelayStateInner,
@@ -1092,9 +1129,16 @@ fn record_peer_connection(
     if should_log {
         log_message(
             config,
-            format!("relay: peer connected {}", format_peer_id(peer_id)),
+            format!("relay: peer polled inbox {}", format_peer_id(peer_id)),
         );
     }
+}
+
+/// Update `peer_last_seen` silently — no "peer connected" log.  Use when a
+/// peer ID is seen as an envelope sender or recipient but has not explicitly
+/// connected to fetch its inbox.
+fn touch_peer(inner: &mut RelayStateInner, peer_id: &str, now: Instant) {
+    inner.peer_last_seen.insert(peer_id.to_string(), now);
 }
 
 fn log_message(config: &RelayConfig, message: String) {

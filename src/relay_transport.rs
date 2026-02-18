@@ -19,11 +19,19 @@ pub fn post_envelope(relay_url: &str, envelope: &Envelope) -> Result<(), String>
 /// Fetch all envelopes from a relay inbox for the given peer.
 ///
 /// The relay typically drains messages on fetch, so callers must process
-/// all returned envelopes.
-pub fn fetch_inbox(relay_url: &str, peer_id: &str) -> Result<Vec<Envelope>, String> {
+/// all returned envelopes. `signing_private_key_hex` is the Ed25519 signing
+/// key used to generate the `Authorization: Bearer` auth token.
+pub fn fetch_inbox(
+    relay_url: &str,
+    peer_id: &str,
+    signing_private_key_hex: &str,
+) -> Result<Vec<Envelope>, String> {
     let base = relay_url.trim_end_matches('/');
     let inbox_url = format!("{}/inbox/{}", base, peer_id);
+    let token = crate::crypto::make_relay_auth_token(signing_private_key_hex, peer_id)
+        .map_err(|e| format!("auth token: {e}"))?;
     let envelopes: Vec<Envelope> = ureq::get(&inbox_url)
+        .set("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|e| format!("relay fetch failed: {e}"))?
         .into_json()

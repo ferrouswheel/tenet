@@ -1183,7 +1183,13 @@ impl RelayClient {
         } else {
             format!("{base}/inbox/{}", self.id())
         };
+        let token = crate::crypto::make_relay_auth_token(
+            &self.keypair.signing_private_key_hex,
+            self.id(),
+        )
+        .map_err(|e| ClientError::Protocol(format!("auth token: {e}")))?;
         let response = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
             .call()
             .map_err(|error| ClientError::Http(error.to_string()))?;
         response

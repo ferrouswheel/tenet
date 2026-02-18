@@ -72,7 +72,7 @@ Groups are created and distributed entirely in-process:
    `send_group_message` membership checks pass.
 
 This is a deliberate in-process shortcut for the debugger; production key distribution
-uses encrypted `Direct` envelopes (see `src/web_client/handlers/groups.rs`).
+uses the consent-based invite flow (see [groups.md](../groups.md)).
 
 ## Commands
 

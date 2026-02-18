@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -294,6 +295,8 @@ impl Storage {
             attachment_dir,
         };
         storage.create_schema()?;
+        storage.migrate_identity_ids()?;
+        storage.migrate_peer_ids()?;
         Ok(storage)
     }
 
@@ -548,6 +551,102 @@ impl Storage {
                 .execute_batch("ALTER TABLE attachments DROP COLUMN data;");
         }
 
+        Ok(())
+    }
+
+    /// Re-derive IDs for known peers from their stored Ed25519 signing keys and
+    /// update all tables that reference those IDs.  Fixes databases created
+    /// before the peer-ID derivation was changed from X25519 to Ed25519.
+    fn migrate_peer_ids(&self) -> Result<(), StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_id, signing_public_key FROM peers")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+
+        for (old_id, signing_pub_hex) in rows {
+            if let Ok(bytes) = hex::decode(&signing_pub_hex) {
+                if bytes.len() == 32 {
+                    let new_id = crate::crypto::derive_user_id_from_public_key(&bytes);
+                    if new_id != old_id {
+                        self.conn.execute(
+                            "UPDATE peers SET peer_id = ?1 WHERE peer_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE group_members SET peer_id = ?1 WHERE peer_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE friend_requests SET from_peer_id = ?1 WHERE from_peer_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE friend_requests SET to_peer_id = ?1 WHERE to_peer_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE group_invites SET from_peer_id = ?1 WHERE from_peer_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE group_invites SET to_peer_id = ?1 WHERE to_peer_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE profiles SET user_id = ?1 WHERE user_id = ?2",
+                            params![new_id, old_id],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-derive peer IDs from Ed25519 signing keys and update any rows whose
+    /// stored ID was computed from the old X25519 encryption key.
+    fn migrate_identity_ids(&self) -> Result<(), StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, public_key, signing_pub FROM identity")?;
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+
+        for (current_id, public_key_hex, signing_pub_hex) in rows {
+            // Compute the new Ed25519-based ID and migrate identity if not yet done.
+            let new_id = if let Ok(bytes) = hex::decode(&signing_pub_hex) {
+                if bytes.len() == 32 {
+                    let id = crate::crypto::derive_user_id_from_public_key(&bytes);
+                    if id != current_id {
+                        self.conn.execute(
+                            "UPDATE identity SET id = ?1 WHERE id = ?2",
+                            params![id, current_id],
+                        )?;
+                    }
+                    id
+                } else {
+                    current_id.clone()
+                }
+            } else {
+                current_id.clone()
+            };
+
+            // The profile may carry the old X25519-based ID regardless of whether
+            // the identity row was just migrated or was already migrated in a prior
+            // run.  Compute the old ID from public_key and re-point the profile.
+            if let Ok(bytes) = hex::decode(&public_key_hex) {
+                let old_id = crate::crypto::derive_user_id_from_public_key(&bytes);
+                if old_id != new_id {
+                    self.conn.execute(
+                        "UPDATE profiles SET user_id = ?1 WHERE user_id = ?2",
+                        params![new_id, old_id],
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 

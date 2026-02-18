@@ -974,15 +974,28 @@ pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>, web_u
     const MAX_BACKOFF_SECS: u64 = 60;
 
     loop {
-        let (relay_url, peer_id) = {
+        let (relay_url, peer_id, signing_priv) = {
             let st = state.lock().await;
             match st.relay_url.clone() {
-                Some(url) => (url, st.keypair.id.clone()),
+                Some(url) => (
+                    url,
+                    st.keypair.id.clone(),
+                    st.keypair.signing_private_key_hex.clone(),
+                ),
                 None => return, // No relay configured — nothing to do.
             }
         };
 
-        let ws_url = relay_http_to_ws(&relay_url, &peer_id);
+        let token = match crate::crypto::make_relay_auth_token(&signing_priv, &peer_id) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::tlog!("relay WS: auth token error: {}", e);
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                continue;
+            }
+        };
+        let ws_url = format!("{}?token={}", relay_http_to_ws(&relay_url, &peer_id), token);
 
         match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((ws_stream, _response)) => {

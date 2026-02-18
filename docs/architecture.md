@@ -1,8 +1,9 @@
 # Tenet Architecture & Design Notes
 
-Tenet is designed around modern mobile reality: devices are frequently on the move, often behind NATs,
-connections are intermittent, and delivery is best-effort rather than guaranteed. The goal is to share
-social updates through a mesh of trusted peers without bespoke cryptography or centralized control.
+Tenet is designed around modern mobile reality: devices are frequently on the move, often behind
+NATs, connections are intermittent, and delivery is best-effort rather than guaranteed. The goal
+is to share social updates through a mesh of trusted peers without bespoke cryptography or
+centralized control.
 
 ## Core Ideas
 
@@ -15,15 +16,15 @@ social updates through a mesh of trusted peers without bespoke cryptography or c
 ## Cryptographic Model
 
 * **No bespoke crypto**: use well-vetted libraries and standard constructions.
-* **Per-recipient encryption**: messages are encrypted separately for each recipient or via standard group
-  keying if the library supports it.
+* **Per-recipient encryption**: messages are encrypted separately for each recipient, or via group keying for friend groups.
 * **Authenticated encryption**: every payload is integrity protected and bound to sender identity.
-* **Key exchange**: peers exchange long-term public keys during a friendship/peering handshake.
+* **Key exchange**: peers exchange long-term public keys during a friend request handshake.
+
+See [friend_requests.md](friend_requests.md) for the full key exchange protocol.
 
 ## Threat Model
 
-Tenet aims to reduce centralized metadata collection, but it does not prevent powerful global adversaries.
-It assumes:
+Tenet aims to reduce centralized metadata collection, but it does not prevent powerful global adversaries. It assumes:
 
 * Local adversaries may observe some traffic but not compromise all peers.
 * Malicious peers can spam or attempt to infer social graphs.
@@ -44,12 +45,14 @@ Tenet relies on a transport abstraction that supports:
 * **Direct connections** when reachable (LAN, IPv6, or public addresses).
 * **Opportunistic discovery** via known peers or DNS hints.
 
-Transports are interchangeable as long as they deliver opaque encrypted blobs and metadata (sender id,
-recipient id, timestamp, and message id).
+Transports are interchangeable as long as they deliver opaque encrypted blobs and metadata
+(sender id, recipient id, timestamp, and message id).
+
+See [relay.md](relay.md) for relay server details and configuration.
 
 ## Data Model
 
-* **User identity**: public key + stable user id.
+* **User identity**: public key + stable user id (derived from public key via SHA-256).
 * **Message**: encrypted payload + metadata header.
 * **Feed**: an ordered log of updates per user, truncated by local retention policy.
 * **Attachments**: optional blobs referenced by content hash.
@@ -65,44 +68,32 @@ Headers include:
 
 Friend-group messages are addressed to a logical group identifier (`group_id`). The payload is
 encrypted with a group-scoped key, and recipients treat the message as part of the named group
-conversation or feed.
+conversation or feed. See [groups.md](groups.md) for group creation and invite flows.
 
 Store-for-peer messages are addressed to a storage peer (`recipient_id`/`storage_peer_id`) with a
 `store_for` field identifying the intended final recipient. The payload contains an encrypted
 inner envelope that only the storage peer can decrypt while it holds the message.
 
-## MVP Feature Scope
+## Protocol Flows
 
-* **Identity**: long-term keypairs per user, stable IDs derived from public keys, and a locally stored
-  friend/peer list (manual exchange or QR/URL bootstrap).
-* **Envelope encryption**: per-recipient authenticated encryption with a signed metadata header
-  (sender ID, recipient ID, timestamp, message ID, message kind, group ID (if any), TTL, payload size).
-* **Relay transport**: store-and-forward relays for NATed/offline peers; relays retain opaque blobs
-  with minimal metadata and provide best-effort delivery.
-* **Local store**: append-only per-peer feeds with rolling retention and message ID indexing for
-  deduplication.
-* **TTL enforcement**: messages carry a TTL that bounds relay storage and local retention windows.
-
-## Minimal Protocol Flows
-
-### 1) Send
+### Send
 
 1. Sender composes payload and selects recipients.
 2. For each recipient:
-   * Encrypt payload with recipient key (or group key if supported).
+   * Encrypt payload with recipient key (or group key if friend-group).
    * Construct header: sender ID, recipient ID, timestamp, message ID, message kind, group ID (if
      friend-group), TTL, payload size.
    * Sign header.
 3. Write encrypted message to local outbox and feed.
 4. Submit envelope to relay (or direct peer if available).
 
-### 2) Relay
+### Relay
 
 1. Relay accepts envelope and stores it with minimal metadata.
 2. Relay enforces TTL and size caps; expired envelopes are dropped.
 3. Recipient polls relay (or relay pushes if supported) to fetch envelopes.
 
-### 3) Receive
+### Receive
 
 1. Recipient fetches envelopes from relay.
 2. Validate header signature, message kind, and sender ID.
@@ -110,13 +101,13 @@ inner envelope that only the storage peer can decrypt while it holds the message
 4. Decrypt payload and append to local feed.
 5. Update dedup index with message ID.
 
-### 4) Dedup
+### Deduplication
 
 1. Before storing, check message ID against local index.
 2. If already present, discard duplicate envelope.
 3. Keep latest-seen metadata (e.g., most recent relay source) for diagnostics.
 
-### 5) Peer Store-and-Forward
+### Peer Store-and-Forward
 
 1. Sender selects a mutual friend `C` when recipient `B` is offline.
 2. Sender builds a normal direct envelope for `B`.
@@ -134,34 +125,9 @@ inner envelope that only the storage peer can decrypt while it holds the message
   * Per-recipient storage cap (e.g., max total bytes per user).
   * Per-sender rate limits to mitigate spam.
   * TTL enforced; expired data is removed without notice.
-  * Relay TTLs are intentionally short (default 3600s in the simulation scenarios) and should
-    remain within protocol bounds (1s minimum, 7 days maximum).
+  * Relay TTLs are intentionally short (default 3600s) and must stay within protocol bounds
+    (1s minimum, 7 days maximum).
 * **Index bounds**: dedup index pruned alongside feed compaction.
-
-## Getting Started (Rust)
-
-Minimal crates for a Rust MVP:
-
-* `tokio` for async I/O and task scheduling.
-* `serde` + `serde_json` for message framing prior to encryption.
-* `ed25519-dalek` or `ring` for signatures and key handling.
-* `chacha20poly1305` or `aes-gcm` for authenticated encryption.
-* `libp2p` (optional) or a simple relay client for initial transport.
-
-Suggested modules:
-
-* `crypto/`: key management, encryption/decryption, signatures.
-* `transport/`: relay client, direct sockets, retry/backoff.
-* `store/`: local feed storage, retention policy, attachment cache.
-* `protocol/`: message types, serialization, validation.
-
-First steps:
-
-1. Define message types and metadata headers.
-2. Implement key generation and a simple handshake.
-3. Build an encrypted payload format with authenticated encryption.
-4. Add a relay transport with best-effort send/receive.
-5. Persist a rolling feed and enforce size/time retention.
 
 ## Non-Goals
 
@@ -173,10 +139,3 @@ First steps:
 ## Status
 
 This repository is a design sketch and prototype; it is not production-ready.
-
-## Summary
-
-Tenet is a peer-distributed, mobile-aware social protocol that favors simplicity,
-best-effort delivery, and standard cryptography. The system assumes intermittent
-connectivity, favors replaceable transport layers, and keeps local history short
-to reduce risk and storage costs.

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CONTENT_KEY_SIZE: usize = 32;
 pub const NONCE_SIZE: usize = 12;
@@ -137,11 +138,11 @@ pub fn generate_keypair_with_rng(rng: &mut (impl RngCore + CryptoRng)) -> Stored
     let (private_key, public_key) = X25519HkdfSha256::gen_keypair(rng);
     let public_key_bytes = public_key.to_bytes();
     let private_key_bytes = private_key.to_bytes();
-    let id = derive_user_id_from_public_key(&public_key_bytes);
 
-    // Generate Ed25519 signing key
+    // Generate Ed25519 signing key; peer ID is derived from the signing key
     let signing_key = SigningKey::generate(rng);
     let verifying_key = signing_key.verifying_key();
+    let id = derive_user_id_from_public_key(&verifying_key.to_bytes());
 
     StoredKeypair {
         id,
@@ -150,6 +151,98 @@ pub fn generate_keypair_with_rng(rng: &mut (impl RngCore + CryptoRng)) -> Stored
         signing_public_key_hex: hex::encode(verifying_key.to_bytes()),
         signing_private_key_hex: hex::encode(signing_key.to_bytes()),
     }
+}
+
+/// Build a signed auth token for relay inbox/WebSocket access.
+///
+/// Token format: `{ed25519_pubkey_hex}.{unix_timestamp_secs}.{signature_base64url}`
+/// Signature covers: `b"tenet-relay-auth\n{peer_id}\n{timestamp_secs}"`
+pub fn make_relay_auth_token(
+    signing_private_key_hex: &str,
+    peer_id: &str,
+) -> Result<String, CryptoError> {
+    let signing_key_bytes =
+        hex::decode(signing_private_key_hex).map_err(|_| CryptoError::InvalidLength("invalid hex"))?;
+    if signing_key_bytes.len() != 32 {
+        return Err(CryptoError::InvalidLength("signing key must be 32 bytes"));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&signing_key_bytes);
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_hex = hex::encode(verifying_key.to_bytes());
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CryptoError::InvalidLength("clock error"))?
+        .as_secs();
+
+    let message = format!("tenet-relay-auth\n{peer_id}\n{timestamp}");
+    let signature = signing_key.sign(message.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    Ok(format!("{pubkey_hex}.{timestamp}.{sig_b64}"))
+}
+
+/// Verify a relay auth token for a given peer_id.
+///
+/// Returns `Err` if the signature is invalid, the pubkey doesn't match the
+/// peer_id, or the timestamp is outside ±60 seconds.
+pub fn verify_relay_auth_token(token: &str, peer_id: &str) -> Result<(), CryptoError> {
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let pubkey_hex = parts[0];
+    let timestamp_str = parts[1];
+    let sig_b64 = parts[2];
+
+    let timestamp: u64 = timestamp_str
+        .parse()
+        .map_err(|_| CryptoError::InvalidSignature)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CryptoError::InvalidLength("clock error"))?
+        .as_secs();
+    let diff = if now >= timestamp {
+        now - timestamp
+    } else {
+        timestamp - now
+    };
+    if diff > 60 {
+        return Err(CryptoError::InvalidSignature);
+    }
+
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| CryptoError::InvalidSignature)?;
+    if pubkey_bytes.len() != 32 {
+        return Err(CryptoError::InvalidLength("pubkey must be 32 bytes"));
+    }
+    let expected_peer_id = derive_user_id_from_public_key(&pubkey_bytes);
+    if expected_peer_id != peer_id {
+        return Err(CryptoError::InvalidSignature);
+    }
+
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&pubkey_bytes);
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidSignature)?;
+
+    let message = format!("tenet-relay-auth\n{peer_id}\n{timestamp}");
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    if sig_bytes.len() != 64 {
+        return Err(CryptoError::InvalidLength("signature must be 64 bytes"));
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let signature = Signature::from_bytes(&sig_arr);
+
+    verifying_key
+        .verify(message.as_bytes(), &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
 }
 
 pub fn load_keypair(path: &Path) -> Result<StoredKeypair, KeyStoreError> {
