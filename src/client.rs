@@ -2729,6 +2729,7 @@ impl Client for SimulationClient {
         }
     }
 
+    
     fn forward_store_forwards(
         &mut self,
         step: usize,

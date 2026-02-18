@@ -28,6 +28,8 @@ let unseenNotificationCount = 0; // Phase 11 - resets to 0 when bell is clicked
 let notificationPanelOpen = false; // Phase 11
 let pendingFriendRequestHighlight = null; // peer ID to highlight on friends page
 let pendingCommentHighlight = null; // reply message ID to highlight after navigating to parent post
+let wsEverConnected = false; // tracks whether WS has connected at least once
+let serverBuildTimestamp = null; // build_timestamp from first successful health check
 const PAGE_SIZE = 50;
 const COMMENTS_PAGE_SIZE = 100;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -1318,6 +1320,20 @@ function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/api/ws`);
 
+    ws.onopen = () => {
+        fetch('/api/health').then(r => r.json()).then(data => {
+            if (!wsEverConnected) {
+                // First connection: record the build timestamp of this binary.
+                wsEverConnected = true;
+                serverBuildTimestamp = data.build_timestamp || null;
+            } else if (data.build_timestamp && serverBuildTimestamp &&
+                       data.build_timestamp !== serverBuildTimestamp) {
+                // Reconnected to a newly-built binary — prompt the user to reload.
+                showUpdateBanner();
+            }
+        }).catch(() => {});
+    };
+
     ws.onmessage = (e) => {
         try {
             const event = JSON.parse(e.data);
@@ -1331,6 +1347,14 @@ function connectWs() {
     ws.onerror = () => {
         ws.close();
     };
+}
+
+function showUpdateBanner() {
+    document.getElementById('update-banner').style.display = 'flex';
+}
+
+function dismissUpdateBanner() {
+    document.getElementById('update-banner').style.display = 'none';
 }
 
 function handleWsEvent(event) {

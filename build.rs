@@ -1,7 +1,17 @@
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    // Emit a build timestamp so the web client can detect when the binary was rebuilt.
+    // Without any cargo:rerun-if-changed directives, Cargo re-runs this script whenever
+    // any source file in the package changes, so BUILD_TIMESTAMP reflects every rebuild.
+    let build_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_secs();
+    println!("cargo:rustc-env=BUILD_TIMESTAMP={build_timestamp}");
+
     // Build the web assets
     build_web_assets();
 }
@@ -30,9 +40,4 @@ fn build_web_assets() {
 
     // Write output
     fs::write(dist_dir.join("index.html"), output).expect("Failed to write web/dist/index.html");
-
-    println!("cargo:rerun-if-changed=web/src/index.html");
-    println!("cargo:rerun-if-changed=web/src/styles.css");
-    println!("cargo:rerun-if-changed=web/src/app.js");
-    println!("cargo:rerun-if-changed=web/src/relay_dashboard.html");
 }

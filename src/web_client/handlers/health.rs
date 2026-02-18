@@ -27,6 +27,7 @@ pub async fn health_handler(State(state): State<SharedState>) -> impl IntoRespon
         "relay_connected": relay_connected,
         "peers": peer_count,
         "has_messages": message_count > 0,
+        "build_timestamp": env!("BUILD_TIMESTAMP"),
     });
     (StatusCode::OK, axum::Json(body))
 }

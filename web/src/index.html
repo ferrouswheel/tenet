@@ -54,6 +54,14 @@
         <button class="relay-retry-btn" id="relay-retry-btn" onclick="retryRelayConnection()">Retry now</button>
     </div>
 
+    <!-- Update available banner -->
+    <div class="update-banner" id="update-banner" style="display:none;">
+        <span class="update-banner-icon">&#8593;</span>
+        <span>A new version is available.</span>
+        <a class="update-reload-link" href="javascript:location.reload()">Reload</a>
+        <button class="update-dismiss-btn" onclick="dismissUpdateBanner()" title="Dismiss">&#10005;</button>
+    </div>
+
     <div class="container">
         <!-- Sidebar -->
         <div class="sidebar">
