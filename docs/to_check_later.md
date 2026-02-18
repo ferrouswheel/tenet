@@ -8,7 +8,7 @@ originally listed here have been investigated and resolved in the relevant docs.
 | Item | Finding |
 |------|---------|
 | Group invite flow implemented? | Yes — fully implemented end-to-end in `sync.rs` and `handlers/group_invites.rs` |
-| `StorageMessageHandler` proposal vs. reality | Implemented in `src/message_handler.rs`; web `sync.rs` not yet migrated to use it (step 4 of migration plan) |
+| `StorageMessageHandler` proposal vs. reality | Fully implemented and in use; web `sync.rs` migrated to `WebClientHandler` wrapping `StorageMessageHandler` (migration step 4 done) |
 | Web binary name | `tenet-web` confirmed in `Cargo.toml` |
 | `/api/groups/:id/join` endpoint | Does not exist; the old plan was superseded by the `group-invites` accept flow |
 | `/api/groups/:id/leave` endpoint | Exists and works; removes self from `group_members` |
@@ -19,6 +19,8 @@ originally listed here have been investigated and resolved in the relevant docs.
 | Multi-device / multi-identity undocumented | Resolved — `docs/clients/identity.md` documents the full system; known limitation (signing keys not portable) noted |
 | Attachment encryption in transit | Resolved — plaintext in local SQLite; encrypted in transit as inline base64 inside the HPKE-encrypted message payload for Direct/Group; plaintext for Public |
 | Friend Groups UI partial status | Resolved — create/send/accept-invite work; no UI for add-member, remove-member, or leave-group |
+| `StorageMessageHandler` auto-accepts group invites | Resolved — auto-accept removed; `GroupInvite` is now stored as `"pending"` with a notification, matching the web client's UI-prompt flow. See `src/message_handler.rs` |
+| Web `sync.rs` not yet migrated to `StorageMessageHandler` | Resolved — `sync.rs` now uses `WebClientHandler` (wrapping `StorageMessageHandler`); all duplicate `process_*` helpers removed. See `docs/clients/howto.md` |
 
 ## Genuine Gaps
 
@@ -28,22 +30,6 @@ originally listed here have been investigated and resolved in the relevant docs.
 both have `// TODO: Implement key rotation for remaining members` comments. Until this is done,
 removed members can still decrypt future group messages if they retained the group key. This is a
 protocol correctness issue.
-
-### 2. `StorageMessageHandler` auto-accepts group invites
-
-`StorageMessageHandler` (used by the debugger and any library client) auto-accepts group invites
-without user confirmation. The web client `sync.rs` does NOT delegate to
-`StorageMessageHandler` — it has its own handling that shows a UI prompt. If `sync.rs` is ever
-migrated to use `StorageMessageHandler` (migration step 4), the auto-accept behavior would
-silently change how the web client handles group invites. This needs deliberate design before
-the migration is attempted.
-
-### 3. Web `sync.rs` not yet migrated to `StorageMessageHandler`
-
-`src/web_client/sync.rs` still contains its own `process_meta_event`, `process_message_event`,
-etc. These duplicate logic in `StorageMessageHandler`. Migration step 4 (wrapping
-`StorageMessageHandler` in a `WebClientHandler`) is not done. See `docs/clients/howto.md` for
-the migration plan.
 
 ### 4. Group name vs. group ID ambiguity
 

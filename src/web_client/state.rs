@@ -1,5 +1,6 @@
 //! Shared application state and WebSocket event types.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
@@ -73,6 +74,8 @@ pub enum WsEvent {
 
 pub struct AppState {
     pub storage: Storage,
+    /// Path to the SQLite database file. Used by the sync handler to open its own connection.
+    pub db_path: PathBuf,
     pub keypair: StoredKeypair,
     pub relay_url: Option<String>,
     pub ws_tx: broadcast::Sender<WsEvent>,

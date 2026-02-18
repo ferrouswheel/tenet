@@ -77,6 +77,7 @@ pub async fn run() {
 
     let state: SharedState = Arc::new(tokio::sync::Mutex::new(AppState {
         storage,
+        db_path: db_path(&resolved.identity_dir),
         keypair: keypair.clone(),
         relay_url: relay_url.clone(),
         ws_tx,

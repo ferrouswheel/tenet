@@ -46,10 +46,10 @@ fn now_secs() -> u64 {
 /// - Inline attachment data
 /// - Peer online status updates
 /// - Friend request state machine (including auto-accept on mutual request)
-/// - Reaction and profile updates
-/// - Notification creation for direct messages, replies, and reactions
-/// - Group invite flow: auto-accept `GroupInvite`, send back `GroupInviteAccept`,
-///   distribute group key on receipt of `GroupInviteAccept`
+/// - Reaction and profile updates (including avatar attachment data)
+/// - Notification creation for direct messages, replies, reactions, and group invites
+/// - Group invite flow: stores `GroupInvite` as **pending** (no auto-accept);
+///   distributes group key on receipt of `GroupInviteAccept`
 pub struct StorageMessageHandler {
     storage: Storage,
     keypair: StoredKeypair,
@@ -374,7 +374,8 @@ impl StorageMessageHandler {
             return None;
         }
 
-        // Insert incoming invite as pending.
+        // Insert incoming invite as pending. The application layer (e.g. the web client UI)
+        // is responsible for accepting or ignoring via the appropriate API.
         let row = GroupInviteRow {
             id: 0,
             group_id: group_id.to_string(),
@@ -386,32 +387,44 @@ impl StorageMessageHandler {
             created_at: now,
             updated_at: now,
         };
-        let invite_id = self.storage.insert_group_invite(&row).unwrap_or(0);
 
-        // Auto-accept: update status to "accepted".
-        if invite_id > 0 {
-            let _ = self.storage.update_group_invite_status(invite_id, "accepted");
-        } else if let Ok(Some(existing)) = self
-            .storage
-            .find_group_invite(group_id, inviter_id, &self.my_peer_id, "incoming")
-        {
-            let _ = self
-                .storage
-                .update_group_invite_status(existing.id, "accepted");
+        match self.storage.insert_group_invite(&row) {
+            Ok(invite_id) if invite_id > 0 => {
+                let notif = NotificationRow {
+                    id: 0,
+                    notification_type: "group_invite".to_string(),
+                    message_id: format!("group_invite_{invite_id}"),
+                    sender_id: inviter_id.to_string(),
+                    created_at: now,
+                    seen: false,
+                    read: false,
+                };
+                let _ = self.storage.insert_notification(&notif);
+                crate::tlog!(
+                    "handler: stored pending group invite for {} from {} (id={})",
+                    group_id,
+                    crate::logging::peer_id(inviter_id),
+                    invite_id
+                );
+            }
+            Ok(_) => {
+                crate::tlog!(
+                    "handler: group invite insert no-op for {} from {} (likely duplicate)",
+                    group_id,
+                    crate::logging::peer_id(inviter_id)
+                );
+            }
+            Err(e) => {
+                crate::tlog!(
+                    "handler: failed to store group invite for {} from {}: {}",
+                    group_id,
+                    crate::logging::peer_id(inviter_id),
+                    e
+                );
+            }
         }
 
-        crate::tlog!(
-            "handler: auto-accepting group invite for {} from {}",
-            group_id,
-            crate::logging::peer_id(inviter_id)
-        );
-
-        // Build GroupInviteAccept envelope addressed to the inviter.
-        let accept = MetaMessage::GroupInviteAccept {
-            peer_id: self.my_peer_id.clone(),
-            group_id: group_id.to_string(),
-        };
-        self.build_meta_envelope(inviter_id, now, &accept)
+        None
     }
 
     fn process_group_invite_accept(
@@ -825,7 +838,7 @@ impl MessageHandler for StorageMessageHandler {
                 message,
                 ..
             } => {
-                // peer_id is the inviter. Auto-accept and send back GroupInviteAccept.
+                // peer_id is the inviter. Store as pending for the application layer to accept.
                 if let Some(env) = self.process_group_invite(peer_id, group_id, message.as_deref(), now) {
                     outgoing.push(env);
                 }
@@ -959,6 +972,43 @@ impl StorageMessageHandler {
                 .unwrap_or_else(|| "{}".to_string()),
             updated_at,
         };
+
+        // Store inline avatar attachment data so it can be served locally.
+        // insert_attachment is idempotent (OR IGNORE), so calling it unconditionally is safe.
+        if let Some(hash) = &profile_row.avatar_hash {
+            if let Some(data_b64) = parsed.get("avatar_data").and_then(|v| v.as_str()) {
+                match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64) {
+                    Ok(data) => {
+                        let content_type = parsed
+                            .get("avatar_content_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image/jpeg")
+                            .to_string();
+                        let att_row = AttachmentRow {
+                            content_hash: hash.clone(),
+                            content_type,
+                            size_bytes: data.len() as u64,
+                            data,
+                            created_at: now_secs(),
+                        };
+                        if let Err(e) = self.storage.insert_attachment(&att_row) {
+                            crate::tlog!(
+                                "handler: failed to store avatar for {}: {}",
+                                crate::logging::peer_id(&profile_user_id),
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        crate::tlog!(
+                            "handler: failed to decode avatar_data for {}: {}",
+                            crate::logging::peer_id(&profile_user_id),
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         match self.storage.upsert_profile_if_newer(&profile_row) {
             Ok(true) => {

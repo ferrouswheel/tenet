@@ -1956,6 +1956,32 @@ impl Storage {
     }
 
     /// Check if a notification already exists (to avoid duplicates).
+    /// Get a notification by the `message_id` field (not the primary-key `id`).
+    /// Returns the first matching row, or `None` if no notification with that message_id exists.
+    pub fn get_notification_by_message_id(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<NotificationRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, type, message_id, sender_id, created_at, seen, read
+             FROM notifications WHERE message_id = ?1 LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![message_id], |row| {
+                Ok(NotificationRow {
+                    id: row.get(0)?,
+                    notification_type: row.get(1)?,
+                    message_id: row.get(2)?,
+                    sender_id: row.get(3)?,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                    seen: row.get::<_, i32>(5)? != 0,
+                    read: row.get::<_, i32>(6)? != 0,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn has_notification(
         &self,
         notification_type: &str,
