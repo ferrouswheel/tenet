@@ -114,6 +114,10 @@ pub struct PeerRow {
     pub is_friend: bool,
     pub last_seen_online: Option<u64>,
     pub online: bool,
+    /// Unix timestamp of the last `ProfileRequest` sent to this peer (`None` = never).
+    pub last_profile_requested_at: Option<u64>,
+    /// Unix timestamp of the last profile message received from this peer (`None` = never).
+    pub last_profile_responded_at: Option<u64>,
 }
 
 /// Message row stored in the database.
@@ -511,6 +515,19 @@ impl Storage {
             "CREATE INDEX IF NOT EXISTS idx_notifications_unseen ON notifications(seen, created_at);",
         )?;
 
+        // Migration: add profile refresh columns to peers if not present
+        if self
+            .conn
+            .prepare("SELECT last_profile_requested_at FROM peers LIMIT 0")
+            .is_err()
+        {
+            self.conn.execute_batch(
+                "ALTER TABLE peers ADD COLUMN last_profile_requested_at INTEGER;
+                 ALTER TABLE peers ADD COLUMN last_profile_responded_at INTEGER;",
+            )?;
+        }
+
+
         // Migration: move any existing attachment blobs from DB to filesystem,
         // then drop the legacy `data` column. Runs only if the column still exists.
         let has_data_col = self
@@ -718,8 +735,9 @@ impl Storage {
         self.conn.execute(
             "INSERT OR REPLACE INTO peers
              (peer_id, display_name, signing_public_key, encryption_public_key,
-              added_at, is_friend, last_seen_online, online)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              added_at, is_friend, last_seen_online, online,
+              last_profile_requested_at, last_profile_responded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 row.peer_id,
                 row.display_name,
@@ -729,6 +747,8 @@ impl Storage {
                 row.is_friend as i32,
                 row.last_seen_online.map(|t| t as i64),
                 row.online as i32,
+                row.last_profile_requested_at.map(|t| t as i64),
+                row.last_profile_responded_at.map(|t| t as i64),
             ],
         )?;
         Ok(())
@@ -737,7 +757,8 @@ impl Storage {
     pub fn get_peer(&self, peer_id: &str) -> Result<Option<PeerRow>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT peer_id, display_name, signing_public_key, encryption_public_key,
-                    added_at, is_friend, last_seen_online, online
+                    added_at, is_friend, last_seen_online, online,
+                    last_profile_requested_at, last_profile_responded_at
              FROM peers WHERE peer_id = ?1",
         )?;
         let row = stmt
@@ -751,6 +772,8 @@ impl Storage {
                     is_friend: row.get::<_, i32>(5)? != 0,
                     last_seen_online: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
                     online: row.get::<_, i32>(7)? != 0,
+                    last_profile_requested_at: row.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+                    last_profile_responded_at: row.get::<_, Option<i64>>(9)?.map(|t| t as u64),
                 })
             })
             .optional()?;
@@ -760,7 +783,8 @@ impl Storage {
     pub fn list_peers(&self) -> Result<Vec<PeerRow>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT peer_id, display_name, signing_public_key, encryption_public_key,
-                    added_at, is_friend, last_seen_online, online
+                    added_at, is_friend, last_seen_online, online,
+                    last_profile_requested_at, last_profile_responded_at
              FROM peers ORDER BY added_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -773,6 +797,8 @@ impl Storage {
                 is_friend: row.get::<_, i32>(5)? != 0,
                 last_seen_online: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
                 online: row.get::<_, i32>(7)? != 0,
+                last_profile_requested_at: row.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+                last_profile_responded_at: row.get::<_, Option<i64>>(9)?.map(|t| t as u64),
             })
         })?;
         let mut result = Vec::new();
@@ -1631,6 +1657,71 @@ impl Storage {
     }
 
     // -----------------------------------------------------------------------
+    // Profile refresh tracking
+    // -----------------------------------------------------------------------
+
+    /// Record that we sent a `ProfileRequest` to `peer_id` at `now`.
+    pub fn record_profile_request_sent(
+        &self,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE peers SET last_profile_requested_at = ?1 WHERE peer_id = ?2",
+            params![now as i64, peer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record that we received a profile response from `peer_id` at `now`.
+    pub fn record_profile_response_received(
+        &self,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE peers SET last_profile_responded_at = ?1 WHERE peer_id = ?2",
+            params![now as i64, peer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return peer IDs that are due for a profile refresh request based on
+    /// two rate-limit windows:
+    /// - `missing_interval_secs`: minimum gap between requests when no response
+    ///   has ever been received (e.g. 3 600 = 1 hour).
+    /// - `responded_interval_secs`: minimum gap after a confirmed response
+    ///   (e.g. 86 400 = 24 hours).
+    pub fn get_peers_needing_profile_request(
+        &self,
+        now: u64,
+        missing_interval_secs: u64,
+        responded_interval_secs: u64,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_id FROM peers
+             WHERE
+               -- Never received a response: respect the shorter hourly rate-limit
+               (last_profile_responded_at IS NULL
+                AND (last_profile_requested_at IS NULL
+                     OR last_profile_requested_at < ?1 - ?2))
+             OR
+               -- Received a response before: only re-request after the longer window
+               (last_profile_responded_at IS NOT NULL
+                AND last_profile_responded_at < ?1 - ?3)",
+        )?;
+        let rows = stmt.query_map(
+            params![now as i64, missing_interval_secs as i64, responded_interval_secs as i64],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
     // Friend Requests CRUD
     // -----------------------------------------------------------------------
 
@@ -2211,6 +2302,8 @@ impl Storage {
                     is_friend: true,
                     last_seen_online: None,
                     online: false,
+                    last_profile_requested_at: None,
+                    last_profile_responded_at: None,
                 };
                 self.insert_peer(&row)?;
             }
@@ -2497,6 +2590,8 @@ mod tests {
             is_friend: true,
             last_seen_online: None,
             online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
         };
         storage.insert_peer(&peer).unwrap();
 

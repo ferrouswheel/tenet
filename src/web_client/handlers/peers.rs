@@ -108,6 +108,8 @@ pub async fn add_peer_handler(
         is_friend: true,
         last_seen_online: None,
         online: false,
+        last_profile_requested_at: None,
+        last_profile_responded_at: None,
     };
 
     match st.storage.insert_peer(&peer_row) {

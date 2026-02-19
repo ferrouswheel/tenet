@@ -337,6 +337,11 @@ pub enum MetaMessage {
         peer_id: String,
         group_id: String,
     },
+    /// Request that `for_peer_id` re-broadcast their public profile.
+    ProfileRequest {
+        peer_id: String,
+        for_peer_id: String,
+    },
 }
 
 #[derive(Debug)]

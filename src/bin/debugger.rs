@@ -457,6 +457,8 @@ fn add_peer(
         is_friend: true,
         last_seen_online: None,
         online: false,
+        last_profile_requested_at: None,
+        last_profile_responded_at: None,
     };
     let _ = peer.storage.insert_peer(&row);
 
@@ -497,6 +499,8 @@ fn add_all_peers(peers: &mut [DebugPeer]) -> Result<(), Box<dyn Error>> {
                 is_friend: true,
                 last_seen_online: None,
                 online: false,
+                last_profile_requested_at: None,
+                last_profile_responded_at: None,
             };
             let _ = peer.storage.insert_peer(&row);
         }

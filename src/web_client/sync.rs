@@ -60,18 +60,24 @@ pub async fn relay_sync_loop(state: SharedState, notify: Arc<Notify>) {
                 let was_disconnected = consecutive_failures > 0;
                 consecutive_failures = 0;
 
-                let st = state.lock().await;
-                let was_connected = st.relay_connected.swap(true, Ordering::Relaxed);
-                if !was_connected || was_disconnected {
-                    let relay_url = st.relay_url.clone();
-                    crate::tlog!(
-                        "relay connected: {}",
-                        relay_url.as_deref().unwrap_or("unknown")
-                    );
-                    let _ = st.ws_tx.send(WsEvent::RelayStatus {
-                        connected: true,
-                        relay_url,
-                    });
+                {
+                    let st = state.lock().await;
+                    let was_connected = st.relay_connected.swap(true, Ordering::Relaxed);
+                    if !was_connected || was_disconnected {
+                        let relay_url = st.relay_url.clone();
+                        crate::tlog!(
+                            "relay connected: {}",
+                            relay_url.as_deref().unwrap_or("unknown")
+                        );
+                        let _ = st.ws_tx.send(WsEvent::RelayStatus {
+                            connected: true,
+                            relay_url,
+                        });
+                    }
+                }
+
+                if let Err(e) = request_missing_profiles(&state).await {
+                    crate::tlog!("profile refresh: {}", e);
                 }
             }
             Err(e) => {
@@ -435,6 +441,8 @@ impl MessageHandler for WebClientHandler {
             }
 
             MetaMessage::MessageRequest { .. } => self.inner.on_meta(meta),
+
+            MetaMessage::ProfileRequest { .. } => self.inner.on_meta(meta),
         }
     }
 
@@ -574,6 +582,95 @@ pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>, web_u
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
     }
+}
+
+/// Check which known peers are missing profile data (or whose profiles are
+/// stale) and send a `ProfileRequest` to each one via the relay.
+///
+/// Rate limits:
+/// - Peers with no profile response yet: at most once per hour.
+/// - Peers that have responded (even with an empty profile): at most once per 24 h.
+pub async fn request_missing_profiles(state: &SharedState) -> Result<(), String> {
+    const MISSING_INTERVAL_SECS: u64 = 3_600;   // 1 hour
+    const RESPONDED_INTERVAL_SECS: u64 = 86_400; // 24 hours
+
+    let (keypair, relay_url, db_path) = {
+        let st = state.lock().await;
+        let relay_url = st
+            .relay_url
+            .clone()
+            .ok_or_else(|| "no relay configured".to_string())?;
+        (st.keypair.clone(), relay_url, st.db_path.clone())
+    };
+
+    let storage = Storage::open(&db_path).map_err(|e| format!("profile refresh storage: {e}"))?;
+    let now = now_secs();
+
+    let peers = storage
+        .get_peers_needing_profile_request(now, MISSING_INTERVAL_SECS, RESPONDED_INTERVAL_SECS)
+        .map_err(|e| e.to_string())?;
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    crate::tlog!(
+        "profile refresh: requesting profiles for {} peer(s)",
+        peers.len()
+    );
+
+    for peer_id in &peers {
+        let meta_msg = MetaMessage::ProfileRequest {
+            peer_id: keypair.id.clone(),
+            for_peer_id: peer_id.clone(),
+        };
+
+        let payload = match build_meta_payload(&meta_msg) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::tlog!("profile refresh: failed to build payload: {}", e);
+                continue;
+            }
+        };
+
+        let envelope = match build_envelope_from_payload(
+            keypair.id.clone(),
+            peer_id.clone(),
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::Meta,
+            None,
+            None,
+            payload,
+            &keypair.signing_private_key_hex,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                crate::tlog!("profile refresh: failed to build envelope: {}", e);
+                continue;
+            }
+        };
+
+        if let Err(e) = post_envelope(&relay_url, &envelope) {
+            crate::tlog!(
+                "profile refresh: failed to send request to {}: {}",
+                crate::logging::peer_id(peer_id),
+                e
+            );
+        }
+
+        if let Err(e) = storage.record_profile_request_sent(peer_id, now) {
+            crate::tlog!(
+                "profile refresh: failed to record request for {}: {}",
+                crate::logging::peer_id(peer_id),
+                e
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Convert an HTTP(S) relay base URL into a WS(S) URL for `/ws/<peer_id>`.

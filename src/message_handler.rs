@@ -183,6 +183,8 @@ impl StorageMessageHandler {
                     is_friend: true,
                     last_seen_online: Some(now),
                     online: false,
+                    last_profile_requested_at: None,
+                    last_profile_responded_at: None,
                 };
                 let _ = self.storage.insert_peer(&peer_row);
 
@@ -306,6 +308,8 @@ impl StorageMessageHandler {
                 is_friend: true,
                 last_seen_online: Some(now),
                 online: false,
+                last_profile_requested_at: None,
+                last_profile_responded_at: None,
             };
             let _ = self.storage.insert_peer(&peer_row);
 
@@ -832,6 +836,13 @@ impl MessageHandler for StorageMessageHandler {
             MetaMessage::MessageRequest { .. } => {
                 // Not handled at the storage layer.
             }
+            MetaMessage::ProfileRequest { for_peer_id, .. } => {
+                if for_peer_id == &self.my_peer_id {
+                    if let Some(env) = self.build_own_profile_envelope(now) {
+                        outgoing.push(env);
+                    }
+                }
+            }
             MetaMessage::GroupInvite {
                 peer_id,
                 group_id,
@@ -1010,6 +1021,12 @@ impl StorageMessageHandler {
             }
         }
 
+        // Always record that this peer responded, regardless of whether the
+        // profile was newer (so the refresh rate-limit resets on every reply).
+        let _ = self
+            .storage
+            .record_profile_response_received(&profile_user_id, now_secs());
+
         match self.storage.upsert_profile_if_newer(&profile_row) {
             Ok(true) => {
                 crate::tlog!(
@@ -1035,6 +1052,59 @@ impl StorageMessageHandler {
                 );
             }
         }
+    }
+
+    /// Build and return a plaintext `Public` envelope containing our own profile,
+    /// to be posted to the relay in response to a `ProfileRequest`.
+    fn build_own_profile_envelope(&self, now: u64) -> Option<Envelope> {
+        let profile = self.storage.get_profile(&self.my_peer_id).ok()??;
+
+        let avatar_inline: Option<(String, String)> =
+            profile.avatar_hash.as_ref().and_then(|hash| {
+                self.storage
+                    .get_attachment(hash)
+                    .ok()
+                    .flatten()
+                    .map(|att| {
+                        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&att.data);
+                        (b64, att.content_type)
+                    })
+            });
+
+        let public_fields: serde_json::Value =
+            serde_json::from_str(&profile.public_fields).unwrap_or(serde_json::json!({}));
+
+        let profile_json = serde_json::json!({
+            "type": "tenet.profile",
+            "user_id": self.my_peer_id,
+            "display_name": profile.display_name,
+            "bio": profile.bio,
+            "avatar_hash": profile.avatar_hash,
+            "avatar_data": avatar_inline.as_ref().map(|(d, _)| d),
+            "avatar_content_type": avatar_inline.as_ref().map(|(_, ct)| ct),
+            "public_fields": public_fields,
+            "updated_at": profile.updated_at,
+        });
+
+        let body = serde_json::to_string(&profile_json).ok()?;
+        let mut salt = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+
+        crate::protocol::build_plaintext_envelope(
+            self.my_peer_id.clone(),
+            "*",
+            None,
+            None,
+            now,
+            HANDLER_DEFAULT_TTL_SECONDS,
+            crate::protocol::MessageKind::Public,
+            None,
+            None,
+            &body,
+            salt,
+            &self.keypair.signing_private_key_hex,
+        )
+        .ok()
     }
 }
 
@@ -1065,6 +1135,8 @@ mod tests {
             is_friend: true,
             last_seen_online: None,
             online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
@@ -1171,6 +1243,8 @@ mod tests {
             is_friend: false,
             last_seen_online: None,
             online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
@@ -1206,6 +1280,8 @@ mod tests {
             is_friend: true,
             last_seen_online: None,
             online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 

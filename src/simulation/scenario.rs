@@ -350,6 +350,8 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
                         is_friend: true,
                         last_seen_online: None,
                         online: false,
+                        last_profile_requested_at: None,
+                        last_profile_responded_at: None,
                     });
                 }
                 let handler = StorageMessageHandler::new_with_crypto(

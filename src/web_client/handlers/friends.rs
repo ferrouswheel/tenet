@@ -243,6 +243,8 @@ pub async fn accept_friend_request_handler(
         is_friend: true,
         last_seen_online: Some(now),
         online: false,
+        last_profile_requested_at: None,
+        last_profile_responded_at: None,
     };
     if let Err(e) = st.storage.insert_peer(&peer_row) {
         crate::tlog!("failed to add peer from friend request: {}", e);
