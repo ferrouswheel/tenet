@@ -218,6 +218,7 @@ pub async fn send_direct_handler(
             is_read: true,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         });
 
         link_attachments(&st.storage, &msg_id, &req.attachments);
@@ -342,6 +343,7 @@ pub async fn send_public_handler(
             is_read: true,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         });
 
         link_attachments(&st.storage, &msg_id, &req.attachments);
@@ -480,6 +482,7 @@ pub async fn send_group_handler(
             is_read: true,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         });
 
         link_attachments(&st.storage, &msg_id, &req.attachments);

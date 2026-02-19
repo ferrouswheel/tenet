@@ -1,5 +1,6 @@
 //! Shared application state and WebSocket event types.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -81,6 +82,9 @@ pub struct AppState {
     pub ws_tx: broadcast::Sender<WsEvent>,
     pub ws_connection_count: Arc<AtomicUsize>,
     pub relay_connected: Arc<AtomicBool>,
+    /// Unix timestamp of the last `MessageRequest` sent to each peer.
+    /// Used to rate-limit mesh queries to at most once per `MESH_QUERY_INTERVAL_SECS`.
+    pub last_mesh_query_sent: HashMap<String, u64>,
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;

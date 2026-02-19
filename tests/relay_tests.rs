@@ -355,8 +355,8 @@ async fn websocket_receives_messages_in_realtime() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
     let recipient_kp = generate_keypair();
     let recipient = recipient_kp.id.clone();
-    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
-        .expect("ws token");
+    let token =
+        make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient).expect("ws token");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
@@ -400,8 +400,8 @@ async fn websocket_multiple_subscribers_same_recipient() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
     let recipient_kp = generate_keypair();
     let recipient = recipient_kp.id.clone();
-    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
-        .expect("ws token");
+    let token =
+        make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient).expect("ws token");
 
     let (mut ws1, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
@@ -478,8 +478,8 @@ async fn websocket_and_polling_coexist() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
     let recipient_kp = generate_keypair();
     let recipient = recipient_kp.id.clone();
-    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
-        .expect("ws token");
+    let token =
+        make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient).expect("ws token");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
@@ -534,8 +534,8 @@ async fn websocket_receives_multiple_messages_sequentially() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
     let recipient_kp = generate_keypair();
     let recipient = recipient_kp.id.clone();
-    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
-        .expect("ws token");
+    let token =
+        make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient).expect("ws token");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
@@ -585,8 +585,8 @@ async fn websocket_batch_store_notifies_subscribers() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
     let recipient_kp = generate_keypair();
     let recipient = recipient_kp.id.clone();
-    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
-        .expect("ws token");
+    let token =
+        make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient).expect("ws token");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))
         .await
@@ -637,8 +637,8 @@ async fn websocket_disconnect_does_not_break_relay() {
     let (base_url, shutdown_tx) = start_relay(test_relay_config()).await;
     let recipient_kp = generate_keypair();
     let recipient = recipient_kp.id.clone();
-    let token = make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient)
-        .expect("ws token");
+    let token =
+        make_relay_auth_token(&recipient_kp.signing_private_key_hex, &recipient).expect("ws token");
 
     // Connect and immediately disconnect
     let (ws, _) = tokio_tungstenite::connect_async(ws_url(&base_url, &recipient, &token))

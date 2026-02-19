@@ -111,18 +111,12 @@ pub async fn update_own_profile_handler(
         // Fetch avatar attachment bytes so recipients can store them locally.
         // The relay allows up to 5 MB per message; profile photos from phones are
         // typically 1-3 MB so no size filter is applied here.
-        let avatar_inline: Option<(String, String)> =
-            req.avatar_hash.as_ref().and_then(|hash| {
-                st.storage
-                    .get_attachment(hash)
-                    .ok()
-                    .flatten()
-                    .map(|att| {
-                        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .encode(&att.data);
-                        (b64, att.content_type)
-                    })
-            });
+        let avatar_inline: Option<(String, String)> = req.avatar_hash.as_ref().and_then(|hash| {
+            st.storage.get_attachment(hash).ok().flatten().map(|att| {
+                let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&att.data);
+                (b64, att.content_type)
+            })
+        });
 
         (
             st.keypair.id.clone(),

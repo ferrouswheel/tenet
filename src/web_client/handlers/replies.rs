@@ -214,6 +214,7 @@ pub async fn reply_handler(
             is_read: true,
             raw_envelope: None,
             reply_to: Some(parent_message_id.clone()),
+            signature_verified: true,
         });
 
         link_attachments(&st.storage, &msg_id, &req.attachments);

@@ -6,6 +6,11 @@ use clap::Parser;
 
 pub(crate) const DEFAULT_TTL_SECONDS: u64 = 3600;
 pub(crate) const SYNC_INTERVAL_SECS: u64 = 30;
+
+/// Default look-back window for public mesh queries (2 hours).
+pub(crate) const DEFAULT_MESH_WINDOW_SECS: u64 = 7_200;
+/// How often to re-query each known peer for new public messages (10 minutes).
+pub(crate) const MESH_QUERY_INTERVAL_SECS: u64 = 600;
 pub(crate) const WEB_HPKE_INFO: &[u8] = b"tenet-web";
 pub(crate) const WEB_PAYLOAD_AAD: &[u8] = b"tenet-web";
 pub(crate) const WS_CHANNEL_CAPACITY: usize = 256;

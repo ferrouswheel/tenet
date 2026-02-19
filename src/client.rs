@@ -484,7 +484,12 @@ impl RelayClient {
             .create_group(group_id, members, self.id().to_string())?;
         if let Some(ref mut h) = self.handler {
             let members_vec: Vec<String> = info.members.iter().cloned().collect();
-            h.on_group_created(&info.group_id, &info.group_key, &info.creator_id, &members_vec);
+            h.on_group_created(
+                &info.group_id,
+                &info.group_key,
+                &info.creator_id,
+                &members_vec,
+            );
         }
         Ok(info)
     }
@@ -1183,11 +1188,9 @@ impl RelayClient {
         } else {
             format!("{base}/inbox/{}", self.id())
         };
-        let token = crate::crypto::make_relay_auth_token(
-            &self.keypair.signing_private_key_hex,
-            self.id(),
-        )
-        .map_err(|e| ClientError::Protocol(format!("auth token: {e}")))?;
+        let token =
+            crate::crypto::make_relay_auth_token(&self.keypair.signing_private_key_hex, self.id())
+                .map_err(|e| ClientError::Protocol(format!("auth token: {e}")))?;
         let response = ureq::get(&url)
             .set("Authorization", &format!("Bearer {token}"))
             .call()
@@ -1647,7 +1650,12 @@ impl SimulationClient {
             .create_group(group_id, members, self.id.clone())?;
         if let Some(ref mut h) = self.handler {
             let members_vec: Vec<String> = info.members.iter().cloned().collect();
-            h.on_group_created(&info.group_id, &info.group_key, &info.creator_id, &members_vec);
+            h.on_group_created(
+                &info.group_id,
+                &info.group_key,
+                &info.creator_id,
+                &members_vec,
+            );
         }
         Ok(info)
     }
@@ -2729,7 +2737,6 @@ impl Client for SimulationClient {
         }
     }
 
-    
     fn forward_store_forwards(
         &mut self,
         step: usize,

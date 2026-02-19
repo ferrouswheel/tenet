@@ -276,13 +276,7 @@ pub async fn add_group_member_handler(
         }
 
         // Check peer exists.
-        if st
-            .storage
-            .get_peer(&req.peer_id)
-            .ok()
-            .flatten()
-            .is_none()
-        {
+        if st.storage.get_peer(&req.peer_id).ok().flatten().is_none() {
             return api_error(StatusCode::NOT_FOUND, "peer not found");
         }
 

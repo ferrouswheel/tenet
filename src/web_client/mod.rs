@@ -83,6 +83,7 @@ pub async fn run() {
         ws_tx,
         ws_connection_count,
         relay_connected: Arc::clone(&relay_connected),
+        last_mesh_query_sent: std::collections::HashMap::new(),
     }));
 
     // Start background relay sync task

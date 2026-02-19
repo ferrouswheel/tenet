@@ -128,6 +128,10 @@ pub struct PeerRow {
     pub muted_at: Option<u64>,
 }
 
+fn default_verified() -> bool {
+    true
+}
+
 /// Message row stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRow {
@@ -145,6 +149,11 @@ pub struct MessageRow {
     /// Phase 9: Optional reference to the parent message this is a reply to.
     #[serde(default)]
     pub reply_to: Option<String>,
+    /// Whether the Ed25519 signature on this message has been verified.
+    /// `false` for mesh-delivered messages from senders whose key was not
+    /// available at receipt time.  Set to `true` after backfill verification.
+    #[serde(default = "default_verified")]
+    pub signature_verified: bool,
 }
 
 /// Group row stored in the database.
@@ -351,17 +360,18 @@ impl Storage {
             );
 
             CREATE TABLE IF NOT EXISTS messages (
-                message_id      TEXT PRIMARY KEY,
-                sender_id       TEXT NOT NULL,
-                recipient_id    TEXT NOT NULL,
-                message_kind    TEXT NOT NULL,
-                group_id        TEXT,
-                body            TEXT,
-                timestamp       INTEGER NOT NULL,
-                received_at     INTEGER NOT NULL,
-                ttl_seconds     INTEGER NOT NULL,
-                is_read         INTEGER NOT NULL DEFAULT 0,
-                raw_envelope    TEXT
+                message_id          TEXT PRIMARY KEY,
+                sender_id           TEXT NOT NULL,
+                recipient_id        TEXT NOT NULL,
+                message_kind        TEXT NOT NULL,
+                group_id            TEXT,
+                body                TEXT,
+                timestamp           INTEGER NOT NULL,
+                received_at         INTEGER NOT NULL,
+                ttl_seconds         INTEGER NOT NULL,
+                is_read             INTEGER NOT NULL DEFAULT 0,
+                raw_envelope        TEXT,
+                signature_verified  INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_recipient
@@ -549,6 +559,16 @@ impl Storage {
             )?;
         }
 
+        // Migration: add signature_verified column to messages if not present
+        if self
+            .conn
+            .prepare("SELECT signature_verified FROM messages LIMIT 0")
+            .is_err()
+        {
+            self.conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN signature_verified INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
 
         // Migration: move any existing attachment blobs from DB to filesystem,
         // then drop the legacy `data` column. Runs only if the column still exists.
@@ -886,9 +906,7 @@ impl Storage {
             params![blocked as i32, now, peer_id],
         )?;
         if affected == 0 {
-            return Err(StorageError::NotFound(format!(
-                "peer not found: {peer_id}"
-            )));
+            return Err(StorageError::NotFound(format!("peer not found: {peer_id}")));
         }
         Ok(())
     }
@@ -927,19 +945,14 @@ impl Storage {
             params![muted as i32, now, peer_id],
         )?;
         if affected == 0 {
-            return Err(StorageError::NotFound(format!(
-                "peer not found: {peer_id}"
-            )));
+            return Err(StorageError::NotFound(format!("peer not found: {peer_id}")));
         }
         Ok(())
     }
 
     /// Return `(timestamp, body_preview)` of the most recent message of any
     /// non-meta kind where `sender_id = peer_id` OR `recipient_id = peer_id`.
-    pub fn peer_last_message(
-        &self,
-        peer_id: &str,
-    ) -> Result<Option<(u64, String)>, StorageError> {
+    pub fn peer_last_message(&self, peer_id: &str) -> Result<Option<(u64, String)>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp, body FROM messages
              WHERE message_kind != 'meta'
@@ -950,8 +963,7 @@ impl Storage {
             .query_row(params![peer_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
-                    row.get::<_, Option<String>>(1)?
-                        .unwrap_or_default(),
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 ))
             })
             .optional()?;
@@ -960,10 +972,7 @@ impl Storage {
 
     /// Return `(timestamp, body_preview)` of the most recent public or
     /// friend_group message sent *by* `peer_id`.
-    pub fn peer_last_post(
-        &self,
-        peer_id: &str,
-    ) -> Result<Option<(u64, String)>, StorageError> {
+    pub fn peer_last_post(&self, peer_id: &str) -> Result<Option<(u64, String)>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp, body FROM messages
              WHERE sender_id = ?1
@@ -974,8 +983,7 @@ impl Storage {
             .query_row(params![peer_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
-                    row.get::<_, Option<String>>(1)?
-                        .unwrap_or_default(),
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 ))
             })
             .optional()?;
@@ -993,7 +1001,7 @@ impl Storage {
     ) -> Result<Vec<MessageRow>, StorageError> {
         let mut sql = String::from(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to, signature_verified
              FROM messages
              WHERE sender_id = ?1
                AND message_kind IN ('public', 'friend_group', 'direct')",
@@ -1025,6 +1033,7 @@ impl Storage {
                 is_read: row.get::<_, i32>(9)? != 0,
                 raw_envelope: row.get(10)?,
                 reply_to: row.get(11)?,
+                signature_verified: row.get::<_, i32>(12)? != 0,
             })
         })?;
         let mut result = Vec::new();
@@ -1042,8 +1051,9 @@ impl Storage {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages
              (message_id, sender_id, recipient_id, message_kind, group_id,
-              body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to,
+              signature_verified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 row.message_id,
                 row.sender_id,
@@ -1057,6 +1067,7 @@ impl Storage {
                 row.is_read as i32,
                 row.raw_envelope,
                 row.reply_to,
+                row.signature_verified as i32,
             ],
         )?;
         Ok(())
@@ -1065,7 +1076,7 @@ impl Storage {
     pub fn get_message(&self, message_id: &str) -> Result<Option<MessageRow>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to, signature_verified
              FROM messages WHERE message_id = ?1",
         )?;
         let row = stmt
@@ -1083,6 +1094,7 @@ impl Storage {
                     is_read: row.get::<_, i32>(9)? != 0,
                     raw_envelope: row.get(10)?,
                     reply_to: row.get(11)?,
+                    signature_verified: row.get::<_, i32>(12)? != 0,
                 })
             })
             .optional()?;
@@ -1099,7 +1111,7 @@ impl Storage {
     ) -> Result<Vec<MessageRow>, StorageError> {
         let mut sql = String::from(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to, signature_verified
              FROM messages WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1136,6 +1148,7 @@ impl Storage {
                 is_read: row.get::<_, i32>(9)? != 0,
                 raw_envelope: row.get(10)?,
                 reply_to: row.get(11)?,
+                signature_verified: row.get::<_, i32>(12)? != 0,
             })
         })?;
         let mut result = Vec::new();
@@ -1160,6 +1173,84 @@ impl Storage {
             params![message_id],
         )?;
         Ok(affected > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Public mesh distribution queries
+    // -----------------------------------------------------------------------
+
+    /// Returns the `message_id`s of public messages whose `timestamp >= since`,
+    /// most-recent first, up to `limit`.  Used to populate `MeshAvailable`.
+    pub fn list_public_message_ids_since(
+        &self,
+        since: u64,
+        limit: u32,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id FROM messages
+             WHERE message_kind = 'public' AND timestamp >= ?1
+             ORDER BY timestamp DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since as i64, limit as i64], |row| row.get(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Returns all stored messages from `sender_id` whose signature has not
+    /// yet been verified (`signature_verified = 0`).
+    pub fn list_unverified_messages_from(
+        &self,
+        sender_id: &str,
+    ) -> Result<Vec<MessageRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to, signature_verified
+             FROM messages WHERE sender_id = ?1 AND signature_verified = 0",
+        )?;
+        let rows = stmt.query_map(params![sender_id], |row| {
+            Ok(MessageRow {
+                message_id: row.get(0)?,
+                sender_id: row.get(1)?,
+                recipient_id: row.get(2)?,
+                message_kind: row.get(3)?,
+                group_id: row.get(4)?,
+                body: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+                received_at: row.get::<_, i64>(7)? as u64,
+                ttl_seconds: row.get::<_, i64>(8)? as u64,
+                is_read: row.get::<_, i32>(9)? != 0,
+                raw_envelope: row.get(10)?,
+                reply_to: row.get(11)?,
+                signature_verified: row.get::<_, i32>(12)? != 0,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Marks all messages from `sender_id` as signature-verified.
+    pub fn mark_messages_verified(&self, sender_id: &str) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE messages SET signature_verified = 1 WHERE sender_id = ?1 AND signature_verified = 0",
+            params![sender_id],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes all messages from `sender_id`.  Used when backfill verification
+    /// reveals that stored messages have invalid signatures (tampered content).
+    pub fn delete_messages_from_sender(&self, sender_id: &str) -> Result<usize, StorageError> {
+        let affected = self.conn.execute(
+            "DELETE FROM messages WHERE sender_id = ?1",
+            params![sender_id],
+        )?;
+        Ok(affected)
     }
 
     // -----------------------------------------------------------------------
@@ -1223,7 +1314,7 @@ impl Storage {
     ) -> Result<Vec<MessageRow>, StorageError> {
         let mut sql = String::from(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to, signature_verified
              FROM messages
              WHERE message_kind = 'direct'
                AND ((sender_id = ?1 AND recipient_id = ?2)
@@ -1261,6 +1352,7 @@ impl Storage {
                 is_read: row.get::<_, i32>(9)? != 0,
                 raw_envelope: row.get(10)?,
                 reply_to: row.get(11)?,
+                signature_verified: row.get::<_, i32>(12)? != 0,
             })
         })?;
 
@@ -1753,7 +1845,7 @@ impl Storage {
     ) -> Result<Vec<MessageRow>, StorageError> {
         let mut sql = String::from(
             "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
-                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to, signature_verified
              FROM messages WHERE reply_to = ?",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -1785,6 +1877,7 @@ impl Storage {
                 is_read: row.get::<_, i32>(9)? != 0,
                 raw_envelope: row.get(10)?,
                 reply_to: row.get(11)?,
+                signature_verified: row.get::<_, i32>(12)? != 0,
             })
         })?;
 
@@ -1867,11 +1960,7 @@ impl Storage {
     // -----------------------------------------------------------------------
 
     /// Record that we sent a `ProfileRequest` to `peer_id` at `now`.
-    pub fn record_profile_request_sent(
-        &self,
-        peer_id: &str,
-        now: u64,
-    ) -> Result<(), StorageError> {
+    pub fn record_profile_request_sent(&self, peer_id: &str, now: u64) -> Result<(), StorageError> {
         self.conn.execute(
             "UPDATE peers SET last_profile_requested_at = ?1 WHERE peer_id = ?2",
             params![now as i64, peer_id],
@@ -1917,7 +2006,11 @@ impl Storage {
                 AND last_profile_responded_at < ?1 - ?3)",
         )?;
         let rows = stmt.query_map(
-            params![now as i64, missing_interval_secs as i64, responded_interval_secs as i64],
+            params![
+                now as i64,
+                missing_interval_secs as i64,
+                responded_interval_secs as i64
+            ],
             |row| row.get::<_, String>(0),
         )?;
         let mut result = Vec::new();
@@ -2319,7 +2412,12 @@ impl Storage {
             let existing_id: i64 = self.conn.query_row(
                 "SELECT id FROM group_invites
                  WHERE group_id = ?1 AND from_peer_id = ?2 AND to_peer_id = ?3 AND direction = ?4",
-                params![row.group_id, row.from_peer_id, row.to_peer_id, row.direction],
+                params![
+                    row.group_id,
+                    row.from_peer_id,
+                    row.to_peer_id,
+                    row.direction
+                ],
                 |r| r.get(0),
             )?;
             return Ok(existing_id);
@@ -2416,11 +2514,7 @@ impl Storage {
     }
 
     /// Update the status of a group invite.
-    pub fn update_group_invite_status(
-        &self,
-        id: i64,
-        status: &str,
-    ) -> Result<bool, StorageError> {
+    pub fn update_group_invite_status(&self, id: i64, status: &str) -> Result<bool, StorageError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2448,19 +2542,22 @@ impl Storage {
              LIMIT 1",
         )?;
         let row = stmt
-            .query_row(params![group_id, from_peer_id, to_peer_id, direction], |row| {
-                Ok(GroupInviteRow {
-                    id: row.get(0)?,
-                    group_id: row.get(1)?,
-                    from_peer_id: row.get(2)?,
-                    to_peer_id: row.get(3)?,
-                    status: row.get(4)?,
-                    message: row.get(5)?,
-                    direction: row.get(6)?,
-                    created_at: row.get::<_, i64>(7)? as u64,
-                    updated_at: row.get::<_, i64>(8)? as u64,
-                })
-            })
+            .query_row(
+                params![group_id, from_peer_id, to_peer_id, direction],
+                |row| {
+                    Ok(GroupInviteRow {
+                        id: row.get(0)?,
+                        group_id: row.get(1)?,
+                        from_peer_id: row.get(2)?,
+                        to_peer_id: row.get(3)?,
+                        status: row.get(4)?,
+                        message: row.get(5)?,
+                        direction: row.get(6)?,
+                        created_at: row.get::<_, i64>(7)? as u64,
+                        updated_at: row.get::<_, i64>(8)? as u64,
+                    })
+                },
+            )
             .optional()?;
         Ok(row)
     }
@@ -2549,6 +2646,7 @@ impl Storage {
                         is_read: false,
                         raw_envelope: None,
                         reply_to: None,
+                        signature_verified: true,
                     };
                     self.insert_message(&row)?;
                     report.inbox_migrated += 1;
@@ -2616,6 +2714,7 @@ impl Storage {
             is_read: false,
             raw_envelope: Some(raw),
             reply_to: None,
+            signature_verified: true,
         };
         self.insert_message(&row)
     }
@@ -2848,6 +2947,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -2904,6 +3004,7 @@ mod tests {
                 is_read: false,
                 raw_envelope: None,
                 reply_to: None,
+                signature_verified: true,
             };
             storage.insert_message(&msg).unwrap();
         }
@@ -3080,6 +3181,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -3217,6 +3319,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -3289,6 +3392,7 @@ mod tests {
             is_read: true,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         };
         storage.insert_message(&msg).unwrap();
 
@@ -3367,6 +3471,7 @@ mod tests {
             is_read: true,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         };
         storage.insert_message(&parent).unwrap();
 
@@ -3384,6 +3489,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: Some("parent-1".to_string()),
+            signature_verified: true,
         };
         let reply2 = MessageRow {
             message_id: "reply-2".to_string(),
@@ -3398,6 +3504,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: Some("parent-1".to_string()),
+            signature_verified: true,
         };
         storage.insert_message(&reply1).unwrap();
         storage.insert_message(&reply2).unwrap();
@@ -3526,6 +3633,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         }
     }
 
@@ -3634,7 +3742,11 @@ mod tests {
             .insert_message(&make_message("m2", "alice", "me", "direct", now - 10))
             .unwrap();
         let (ts, _) = storage.peer_last_post("alice").unwrap().unwrap();
-        assert_eq!(ts, now - 200, "direct message should be excluded from last post");
+        assert_eq!(
+            ts,
+            now - 200,
+            "direct message should be excluded from last post"
+        );
 
         // Friend group messages should appear
         storage
@@ -3642,5 +3754,129 @@ mod tests {
             .unwrap();
         let (ts, _) = storage.peer_last_post("alice").unwrap().unwrap();
         assert_eq!(ts, now - 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // Public mesh storage tests
+    // -----------------------------------------------------------------------
+
+    fn make_public_row(id: &str, sender: &str, ts: u64) -> MessageRow {
+        MessageRow {
+            message_id: id.to_string(),
+            sender_id: sender.to_string(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some(format!("body of {id}")),
+            timestamp: ts,
+            received_at: ts,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: Some(format!("{{\"id\":\"{id}\"}}")),
+            reply_to: None,
+            signature_verified: true,
+        }
+    }
+
+    #[test]
+    fn list_public_message_ids_since_returns_recent() {
+        let storage = test_storage();
+        let now = 1_700_000_000u64;
+        storage
+            .insert_message(&make_public_row("pub-1", "alice", now - 200))
+            .unwrap();
+        storage
+            .insert_message(&make_public_row("pub-2", "alice", now - 100))
+            .unwrap();
+        storage
+            .insert_message(&make_public_row("pub-3", "alice", now - 50))
+            .unwrap();
+        // A direct message — should NOT appear.
+        storage
+            .insert_message(&MessageRow {
+                message_id: "dm-1".to_string(),
+                sender_id: "alice".to_string(),
+                recipient_id: "bob".to_string(),
+                message_kind: "direct".to_string(),
+                group_id: None,
+                body: Some("hi".to_string()),
+                timestamp: now - 10,
+                received_at: now - 10,
+                ttl_seconds: 3600,
+                is_read: false,
+                raw_envelope: None,
+                reply_to: None,
+                signature_verified: true,
+            })
+            .unwrap();
+
+        // Since now-150: should get pub-2 and pub-3 only.
+        let ids = storage
+            .list_public_message_ids_since(now - 150, 100)
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"pub-2".to_string()));
+        assert!(ids.contains(&"pub-3".to_string()));
+        assert!(!ids.contains(&"pub-1".to_string()));
+        assert!(!ids.contains(&"dm-1".to_string()));
+    }
+
+    #[test]
+    fn list_public_message_ids_since_respects_limit() {
+        let storage = test_storage();
+        let now = 1_700_000_000u64;
+        for i in 0..10u64 {
+            storage
+                .insert_message(&make_public_row(&format!("p{i}"), "alice", now - i))
+                .unwrap();
+        }
+        let ids = storage.list_public_message_ids_since(0, 3).unwrap();
+        assert_eq!(ids.len(), 3, "limit should be respected");
+    }
+
+    #[test]
+    fn mark_messages_verified_updates_flag() {
+        let storage = test_storage();
+        let now = 1_700_000_000u64;
+        let mut row = make_public_row("unv-1", "alice", now);
+        row.signature_verified = false;
+        storage.insert_message(&row).unwrap();
+
+        let unverified = storage.list_unverified_messages_from("alice").unwrap();
+        assert_eq!(unverified.len(), 1);
+        assert!(!unverified[0].signature_verified);
+
+        storage.mark_messages_verified("alice").unwrap();
+        let after = storage.list_unverified_messages_from("alice").unwrap();
+        assert!(
+            after.is_empty(),
+            "no unverified messages after mark_verified"
+        );
+
+        let stored = storage.get_message("unv-1").unwrap().unwrap();
+        assert!(stored.signature_verified);
+    }
+
+    #[test]
+    fn delete_messages_from_sender_removes_all() {
+        let storage = test_storage();
+        let now = 1_700_000_000u64;
+        storage
+            .insert_message(&make_public_row("p1", "alice", now))
+            .unwrap();
+        storage
+            .insert_message(&make_public_row("p2", "alice", now + 1))
+            .unwrap();
+        storage
+            .insert_message(&make_public_row("p3", "bob", now))
+            .unwrap();
+
+        let deleted = storage.delete_messages_from_sender("alice").unwrap();
+        assert_eq!(deleted, 2);
+
+        assert!(storage.get_message("p1").unwrap().is_none());
+        assert!(storage.get_message("p2").unwrap().is_none());
+        // Bob's message should survive.
+        assert!(storage.get_message("p3").unwrap().is_some());
     }
 }

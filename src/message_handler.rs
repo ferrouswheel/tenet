@@ -13,6 +13,7 @@
 //! etc.) belong in a wrapper type that delegates to `StorageMessageHandler`
 //! first, then adds its own logic.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -31,6 +32,19 @@ use crate::storage::{
 
 /// Default TTL for outgoing envelopes produced by the handler (e.g. auto-accept).
 const HANDLER_DEFAULT_TTL_SECONDS: u64 = 3600;
+
+// ---------------------------------------------------------------------------
+// Public mesh protocol constants
+// ---------------------------------------------------------------------------
+
+/// Maximum look-back window a peer may request (24 hours).
+const MAX_MESH_WINDOW_SECS: u64 = 86_400;
+/// Maximum number of message IDs returned in a single `MeshAvailable`.
+const MAX_MESH_IDS: u32 = 500;
+/// Maximum number of IDs accepted in a single `MeshRequest`.
+const MAX_MESH_REQUEST_IDS: usize = 100;
+/// Maximum number of envelopes sent in a single `MeshDelivery` batch.
+const MAX_MESH_BATCH: usize = 10;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -113,6 +127,53 @@ impl StorageMessageHandler {
         &mut self.storage
     }
 
+    /// Static backfill helper — callable from outside a handler instance
+    /// (e.g. from the REST peers handler after adding a new peer).
+    pub fn backfill_for_storage(storage: &Storage, sender_id: &str, signing_key_hex: &str) {
+        let key_bytes = match hex::decode(signing_key_hex) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let derived = crate::crypto::derive_user_id_from_public_key(&key_bytes);
+        if derived != sender_id {
+            return;
+        }
+        let unverified = match storage.list_unverified_messages_from(sender_id) {
+            Ok(rows) => rows,
+            Err(_) => return,
+        };
+        if unverified.is_empty() {
+            return;
+        }
+        let mut all_valid = true;
+        for row in &unverified {
+            let Some(ref raw) = row.raw_envelope else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<Envelope>(raw) else {
+                all_valid = false;
+                break;
+            };
+            if envelope
+                .header
+                .verify_signature(crate::protocol::ProtocolVersion::V1, signing_key_hex)
+                .is_err()
+            {
+                all_valid = false;
+                break;
+            }
+        }
+        if all_valid {
+            let _ = storage.mark_messages_verified(sender_id);
+        } else {
+            let _ = storage.delete_messages_from_sender(sender_id);
+            crate::tlog!(
+                "mesh backfill (peer add): deleted messages from {} — invalid signatures",
+                crate::logging::peer_id(sender_id),
+            );
+        }
+    }
+
     /// Consume the handler and return the underlying storage.
     pub fn into_storage(self) -> Storage {
         self.storage
@@ -191,6 +252,9 @@ impl StorageMessageHandler {
                     muted_at: None,
                 };
                 let _ = self.storage.insert_peer(&peer_row);
+                // Backfill any unverified messages we received from this peer before
+                // we knew their key.
+                self.try_backfill_signatures(from_peer_id, signing_public_key);
 
                 return self.build_friend_accept_envelope(from_peer_id, now);
             }
@@ -320,6 +384,8 @@ impl StorageMessageHandler {
                 muted_at: None,
             };
             let _ = self.storage.insert_peer(&peer_row);
+            // Backfill any unverified messages received before we knew this peer's key.
+            self.try_backfill_signatures(from_peer_id, &peer_row.signing_public_key);
 
             // Archive any incoming request from this peer (race condition).
             if let Ok(Some(incoming)) = self
@@ -346,7 +412,12 @@ impl StorageMessageHandler {
         }
     }
 
-    fn build_meta_envelope(&self, to_peer_id: &str, now: u64, meta: &MetaMessage) -> Option<Envelope> {
+    fn build_meta_envelope(
+        &self,
+        to_peer_id: &str,
+        now: u64,
+        meta: &MetaMessage,
+    ) -> Option<Envelope> {
         let Ok(payload) = build_meta_payload(meta) else {
             return None;
         };
@@ -374,9 +445,9 @@ impl StorageMessageHandler {
         now: u64,
     ) -> Option<Envelope> {
         // Dedup: skip if we already have this incoming invite.
-        if let Ok(Some(_)) = self
-            .storage
-            .find_group_invite(group_id, inviter_id, &self.my_peer_id, "incoming")
+        if let Ok(Some(_)) =
+            self.storage
+                .find_group_invite(group_id, inviter_id, &self.my_peer_id, "incoming")
         {
             crate::tlog!(
                 "handler: duplicate group invite for {} from {}, skipping",
@@ -460,16 +531,10 @@ impl StorageMessageHandler {
             .update_group_invite_status(invite.id, "accepted");
 
         // Load the group from storage to get the key.
-        let group_row = self
-            .storage
-            .get_group(group_id)
-            .unwrap_or(None)?;
+        let group_row = self.storage.get_group(group_id).unwrap_or(None)?;
 
         // Load the accepter's encryption public key.
-        let peer_row = self
-            .storage
-            .get_peer(accepter_id)
-            .unwrap_or(None)?;
+        let peer_row = self.storage.get_peer(accepter_id).unwrap_or(None)?;
         let enc_key = peer_row.encryption_public_key?;
 
         // Only proceed if crypto params are configured.
@@ -585,6 +650,172 @@ impl StorageMessageHandler {
                 created_at: now,
                 updated_at: now,
             });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public mesh helpers
+    // -----------------------------------------------------------------------
+
+    /// Process a single public envelope delivered via `MeshDelivery`.
+    ///
+    /// Validates that the envelope is a public message with a valid TTL that
+    /// we haven't seen before, then stores it. If the sender's signing key is
+    /// present in `sender_keys` and validates against their peer ID, the
+    /// signature is verified immediately; otherwise the message is stored as
+    /// unverified and can be backfilled later.
+    fn handle_mesh_delivered_envelope(
+        &mut self,
+        envelope: &Envelope,
+        sender_keys: &HashMap<String, String>,
+        now: u64,
+    ) {
+        // Only accept public messages.
+        if envelope.header.message_kind != MessageKind::Public {
+            return;
+        }
+        // Reject expired envelopes.
+        if now.saturating_sub(envelope.header.timestamp) > envelope.header.ttl_seconds {
+            return;
+        }
+        let msg_id = &envelope.header.message_id.0;
+        // Dedup.
+        if self.storage.has_message(msg_id).unwrap_or(false) {
+            return;
+        }
+        let sender_id = &envelope.header.sender_id;
+        // Determine whether we can verify the signature now.
+        let verified = self.verify_mesh_envelope(envelope, sender_keys);
+        let raw = serde_json::to_string(envelope).ok();
+        let row = MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: sender_id.clone(),
+            recipient_id: self.my_peer_id.clone(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some(envelope.payload.body.clone()),
+            timestamp: envelope.header.timestamp,
+            received_at: now,
+            ttl_seconds: envelope.header.ttl_seconds,
+            is_read: false,
+            raw_envelope: raw,
+            reply_to: envelope.header.reply_to.clone(),
+            signature_verified: verified,
+        };
+        let _ = self.storage.insert_message(&row);
+        if !verified {
+            crate::tlog!(
+                "mesh: stored unverified public message {} from {}",
+                crate::logging::msg_id(msg_id),
+                crate::logging::peer_id(sender_id),
+            );
+        }
+        // If we got a valid key for this sender, also backfill any older
+        // unverified messages from them.
+        if verified {
+            if let Some(key_hex) = sender_keys.get(sender_id) {
+                self.try_backfill_signatures(sender_id, key_hex);
+            }
+        }
+    }
+
+    /// Returns `true` if the envelope's signature can be verified right now.
+    ///
+    /// Uses the sender's key from our peer list first; falls back to a key
+    /// provided in `sender_keys` after validating the key→peer_id binding.
+    fn verify_mesh_envelope(
+        &self,
+        envelope: &Envelope,
+        sender_keys: &HashMap<String, String>,
+    ) -> bool {
+        let sender_id = &envelope.header.sender_id;
+        // Try our stored peer list first.
+        if let Ok(Some(peer)) = self.storage.get_peer(sender_id) {
+            return envelope
+                .header
+                .verify_signature(
+                    crate::protocol::ProtocolVersion::V1,
+                    &peer.signing_public_key,
+                )
+                .is_ok();
+        }
+        // Fall back to the key provided in the delivery, but validate the
+        // key→peer_id binding before trusting the signature.
+        if let Some(key_hex) = sender_keys.get(sender_id) {
+            if let Ok(key_bytes) = hex::decode(key_hex) {
+                let derived = crate::crypto::derive_user_id_from_public_key(&key_bytes);
+                if derived == *sender_id {
+                    return envelope
+                        .header
+                        .verify_signature(crate::protocol::ProtocolVersion::V1, key_hex)
+                        .is_ok();
+                }
+            }
+        }
+        false // No key available — cannot verify.
+    }
+
+    /// Re-verify previously unverified messages from `sender_id` using the
+    /// now-known `signing_key_hex`.  On success marks them all verified; on
+    /// failure (any signature invalid) deletes them and logs a warning.
+    pub fn try_backfill_signatures(&self, sender_id: &str, signing_key_hex: &str) {
+        // Validate the key→ID binding first.
+        let key_bytes = match hex::decode(signing_key_hex) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let derived = crate::crypto::derive_user_id_from_public_key(&key_bytes);
+        if derived != sender_id {
+            crate::tlog!(
+                "mesh backfill: provided key does not match peer ID {} — ignoring",
+                crate::logging::peer_id(sender_id),
+            );
+            return;
+        }
+        let unverified = match self.storage.list_unverified_messages_from(sender_id) {
+            Ok(rows) => rows,
+            Err(_) => return,
+        };
+        if unverified.is_empty() {
+            return;
+        }
+        let mut all_valid = true;
+        for row in &unverified {
+            let Some(ref raw) = row.raw_envelope else {
+                // No raw envelope to verify against — mark as verified to
+                // avoid re-checking an unverifiable row on every key event.
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<Envelope>(raw) else {
+                all_valid = false;
+                break;
+            };
+            if envelope
+                .header
+                .verify_signature(crate::protocol::ProtocolVersion::V1, signing_key_hex)
+                .is_err()
+            {
+                all_valid = false;
+                break;
+            }
+        }
+        if all_valid {
+            let _ = self.storage.mark_messages_verified(sender_id);
+            crate::tlog!(
+                "mesh backfill: verified {} message(s) from {}",
+                unverified.len(),
+                crate::logging::peer_id(sender_id),
+            );
+        } else {
+            let deleted = self
+                .storage
+                .delete_messages_from_sender(sender_id)
+                .unwrap_or(0);
+            crate::tlog!(
+                "mesh backfill: deleted {} message(s) from {} — invalid signatures",
+                deleted,
+                crate::logging::peer_id(sender_id),
+            );
         }
     }
 
@@ -731,6 +962,13 @@ impl MessageHandler for StorageMessageHandler {
             }
         }
 
+        // Serialize the raw envelope for public messages so they can later be
+        // forwarded to peers requesting catch-up via the mesh protocol.
+        let raw_env = if envelope.header.message_kind == MessageKind::Public {
+            serde_json::to_string(envelope).ok()
+        } else {
+            None
+        };
         let row = MessageRow {
             message_id: message.message_id.clone(),
             sender_id: message.sender_id.clone(),
@@ -742,8 +980,9 @@ impl MessageHandler for StorageMessageHandler {
             received_at: now,
             ttl_seconds: envelope.header.ttl_seconds,
             is_read: false,
-            raw_envelope: None,
+            raw_envelope: raw_env,
             reply_to: envelope.header.reply_to.clone(),
+            signature_verified: true,
         };
 
         if self.storage.insert_message(&row).is_ok() {
@@ -853,8 +1092,116 @@ impl MessageHandler for StorageMessageHandler {
                     now,
                 );
             }
-            MetaMessage::MessageRequest { .. } => {
-                // Not handled at the storage layer.
+            MetaMessage::MessageRequest {
+                peer_id: requester_id,
+                since_timestamp,
+            } => {
+                // Cap the look-back window to prevent abuse.
+                let window_start = now
+                    .saturating_sub(MAX_MESH_WINDOW_SECS)
+                    .max(*since_timestamp);
+                let ids = self
+                    .storage
+                    .list_public_message_ids_since(window_start, MAX_MESH_IDS)
+                    .unwrap_or_default();
+                if !ids.is_empty() {
+                    let response = MetaMessage::MeshAvailable {
+                        peer_id: self.my_peer_id.clone(),
+                        message_ids: ids,
+                        since_timestamp: window_start,
+                    };
+                    if let Some(env) = self.build_meta_envelope(requester_id, now, &response) {
+                        outgoing.push(env);
+                    }
+                }
+            }
+            MetaMessage::MeshAvailable {
+                peer_id: sender_id,
+                message_ids,
+                ..
+            } => {
+                // Deduplicate: collect IDs we don't have yet.
+                let unknown: Vec<String> = message_ids
+                    .iter()
+                    .filter(|id| self.storage.has_message(id).unwrap_or(true) == false)
+                    .take(MAX_MESH_REQUEST_IDS)
+                    .cloned()
+                    .collect();
+                if !unknown.is_empty() {
+                    let request = MetaMessage::MeshRequest {
+                        peer_id: self.my_peer_id.clone(),
+                        message_ids: unknown,
+                    };
+                    if let Some(env) = self.build_meta_envelope(sender_id, now, &request) {
+                        outgoing.push(env);
+                    }
+                }
+            }
+            MetaMessage::MeshRequest {
+                peer_id: requester_id,
+                message_ids,
+            } => {
+                // Fetch raw envelopes and batch them into MeshDelivery responses.
+                let ids: Vec<&String> = message_ids.iter().take(MAX_MESH_REQUEST_IDS).collect();
+                let mut batch: Vec<serde_json::Value> = Vec::new();
+                // Collect signing keys for senders we know.
+                let mut sender_keys: HashMap<String, String> = HashMap::new();
+
+                for id in &ids {
+                    if let Ok(Some(row)) = self.storage.get_message(id) {
+                        if row.message_kind != "public" {
+                            continue; // Only forward public messages.
+                        }
+                        if let Some(raw) = &row.raw_envelope {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+                                // Include the sender's signing key if we know them.
+                                if let Ok(Some(peer)) = self.storage.get_peer(&row.sender_id) {
+                                    sender_keys.insert(
+                                        row.sender_id.clone(),
+                                        peer.signing_public_key.clone(),
+                                    );
+                                }
+                                batch.push(val);
+                                if batch.len() >= MAX_MESH_BATCH {
+                                    // Flush this batch and start a new one.
+                                    let delivery = MetaMessage::MeshDelivery {
+                                        peer_id: self.my_peer_id.clone(),
+                                        envelopes: std::mem::take(&mut batch),
+                                        sender_keys: std::mem::take(&mut sender_keys),
+                                    };
+                                    if let Some(env) =
+                                        self.build_meta_envelope(requester_id, now, &delivery)
+                                    {
+                                        outgoing.push(env);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Flush remaining batch.
+                if !batch.is_empty() {
+                    let delivery = MetaMessage::MeshDelivery {
+                        peer_id: self.my_peer_id.clone(),
+                        envelopes: batch,
+                        sender_keys,
+                    };
+                    if let Some(env) = self.build_meta_envelope(requester_id, now, &delivery) {
+                        outgoing.push(env);
+                    }
+                }
+            }
+            MetaMessage::MeshDelivery {
+                envelopes,
+                sender_keys,
+                ..
+            } => {
+                // Validate and store delivered public envelopes.
+                for env_val in envelopes {
+                    if let Ok(envelope) = serde_json::from_value::<Envelope>(env_val.clone()) {
+                        self.handle_mesh_delivered_envelope(&envelope, sender_keys, now);
+                    }
+                }
             }
             MetaMessage::ProfileRequest { for_peer_id, .. } => {
                 if for_peer_id == &self.my_peer_id {
@@ -870,7 +1217,9 @@ impl MessageHandler for StorageMessageHandler {
                 ..
             } => {
                 // peer_id is the inviter. Store as pending for the application layer to accept.
-                if let Some(env) = self.process_group_invite(peer_id, group_id, message.as_deref(), now) {
+                if let Some(env) =
+                    self.process_group_invite(peer_id, group_id, message.as_deref(), now)
+                {
                     outgoing.push(env);
                 }
             }
@@ -1081,14 +1430,10 @@ impl StorageMessageHandler {
 
         let avatar_inline: Option<(String, String)> =
             profile.avatar_hash.as_ref().and_then(|hash| {
-                self.storage
-                    .get_attachment(hash)
-                    .ok()
-                    .flatten()
-                    .map(|att| {
-                        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&att.data);
-                        (b64, att.content_type)
-                    })
+                self.storage.get_attachment(hash).ok().flatten().map(|att| {
+                    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&att.data);
+                    (b64, att.content_type)
+                })
             });
 
         let public_fields: serde_json::Value =
@@ -1331,6 +1676,7 @@ mod tests {
             is_read: false,
             raw_envelope: None,
             reply_to: None,
+            signature_verified: true,
         };
         storage.insert_message(&target_msg).expect("insert target");
 
@@ -1449,6 +1795,399 @@ mod tests {
             .storage()
             .get_message(&message.message_id)
             .expect("query ok");
-        assert!(stored.is_none(), "blocked peer's message should be discarded");
+        assert!(
+            stored.is_none(),
+            "blocked peer's message should be discarded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Public mesh protocol tests
+    // -----------------------------------------------------------------------
+
+    fn make_public_envelope(
+        keypair: &crate::crypto::StoredKeypair,
+        body: &str,
+        ts: u64,
+    ) -> Envelope {
+        let salt = ts.to_le_bytes();
+        build_plaintext_envelope(
+            &keypair.id,
+            "*",
+            None,
+            None,
+            ts,
+            3600,
+            MessageKind::Public,
+            None,
+            None,
+            body,
+            salt,
+            &keypair.signing_private_key_hex,
+        )
+        .expect("build public envelope")
+    }
+
+    fn insert_public_message(
+        storage: &Storage,
+        keypair: &crate::crypto::StoredKeypair,
+        body: &str,
+        ts: u64,
+    ) -> String {
+        let env = make_public_envelope(keypair, body, ts);
+        let msg_id = env.header.message_id.0.clone();
+        let raw = serde_json::to_string(&env).unwrap();
+        let row = MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: keypair.id.clone(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some(body.to_string()),
+            timestamp: ts,
+            received_at: ts,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: Some(raw),
+            reply_to: None,
+            signature_verified: true,
+        };
+        storage.insert_message(&row).unwrap();
+        msg_id
+    }
+
+    #[test]
+    fn message_request_returns_mesh_available() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let storage = open_memory_storage();
+        let now = super::now_secs();
+        // Insert two public messages from Alice.
+        let id1 = insert_public_message(&storage, &alice, "hello", now - 100);
+        let id2 = insert_public_message(&storage, &alice, "world", now - 50);
+
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
+
+        // Bob receives a MessageRequest from Alice asking since (now - 7200).
+        let request = MetaMessage::MessageRequest {
+            peer_id: alice.id.clone(),
+            since_timestamp: now - 7200,
+        };
+        let outgoing = handler.on_meta(&request);
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "should return one MeshAvailable envelope"
+        );
+
+        // Decode the response payload.
+        let payload_body = &outgoing[0].payload.body;
+        let meta: MetaMessage = serde_json::from_str(payload_body).expect("decode MetaMessage");
+        match meta {
+            MetaMessage::MeshAvailable { message_ids, .. } => {
+                assert!(message_ids.contains(&id1), "id1 should be available");
+                assert!(message_ids.contains(&id2), "id2 should be available");
+            }
+            other => panic!("expected MeshAvailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mesh_available_returns_mesh_request_for_unknowns() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let alice_storage = open_memory_storage();
+        let now = super::now_secs();
+        let id1 = insert_public_message(&alice_storage, &alice, "msg1", now - 100);
+        let id2 = insert_public_message(&alice_storage, &alice, "msg2", now - 50);
+        // Bob only has id1 already.
+        let bob_storage = open_memory_storage();
+        insert_public_message(&bob_storage, &alice, "msg1", now - 100);
+
+        let mut bob_handler = StorageMessageHandler::new(bob_storage, bob.clone());
+
+        let available = MetaMessage::MeshAvailable {
+            peer_id: alice.id.clone(),
+            message_ids: vec![id1.clone(), id2.clone()],
+            since_timestamp: now - 7200,
+        };
+        let outgoing = bob_handler.on_meta(&available);
+        assert_eq!(outgoing.len(), 1, "should produce one MeshRequest");
+
+        let payload_body = &outgoing[0].payload.body;
+        let meta: MetaMessage = serde_json::from_str(payload_body).unwrap();
+        match meta {
+            MetaMessage::MeshRequest { message_ids, .. } => {
+                assert!(
+                    !message_ids.contains(&id1),
+                    "id1 already known — should not be requested"
+                );
+                assert!(
+                    message_ids.contains(&id2),
+                    "id2 unknown — should be requested"
+                );
+            }
+            other => panic!("expected MeshRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mesh_request_returns_mesh_delivery() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let bob_storage = open_memory_storage();
+        let now = super::now_secs();
+        let id1 = insert_public_message(&bob_storage, &alice, "post1", now - 100);
+
+        // Bob knows Alice.
+        let peer_row = PeerRow {
+            peer_id: alice.id.clone(),
+            display_name: None,
+            signing_public_key: alice.signing_public_key_hex.clone(),
+            encryption_public_key: None,
+            added_at: 0,
+            is_friend: true,
+            last_seen_online: None,
+            online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
+        };
+        bob_storage.insert_peer(&peer_row).unwrap();
+
+        let mut carol = StorageMessageHandler::new(bob_storage, bob.clone());
+
+        let request = MetaMessage::MeshRequest {
+            peer_id: alice.id.clone(),
+            message_ids: vec![id1.clone()],
+        };
+        let outgoing = carol.on_meta(&request);
+        assert_eq!(outgoing.len(), 1, "should produce one MeshDelivery");
+
+        let meta: MetaMessage = serde_json::from_str(&outgoing[0].payload.body).unwrap();
+        match meta {
+            MetaMessage::MeshDelivery {
+                envelopes,
+                sender_keys,
+                ..
+            } => {
+                assert_eq!(envelopes.len(), 1, "one envelope delivered");
+                // Alice's key should be in sender_keys.
+                assert!(
+                    sender_keys.contains_key(&alice.id),
+                    "sender key for alice present"
+                );
+            }
+            other => panic!("expected MeshDelivery, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mesh_delivery_stores_message_with_signature_verification() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        // Build a real public envelope from Alice.
+        let now = super::now_secs();
+        let env = make_public_envelope(&alice, "hello from alice", now);
+        let env_json = serde_json::to_value(&env).unwrap();
+
+        let mut sender_keys = std::collections::HashMap::new();
+        sender_keys.insert(alice.id.clone(), alice.signing_public_key_hex.clone());
+
+        let delivery = MetaMessage::MeshDelivery {
+            peer_id: alice.id.clone(),
+            envelopes: vec![env_json],
+            sender_keys,
+        };
+
+        let storage = open_memory_storage();
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
+        handler.on_meta(&delivery);
+
+        let stored = handler
+            .storage()
+            .get_message(&env.header.message_id.0)
+            .unwrap()
+            .expect("message should be stored");
+        assert!(
+            stored.signature_verified,
+            "signature should be verified via sender_keys"
+        );
+        assert_eq!(stored.body.as_deref(), Some("hello from alice"));
+    }
+
+    #[test]
+    fn mesh_delivery_stores_unverified_for_unknown_sender() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let now = super::now_secs();
+        let env = make_public_envelope(&alice, "mystery post", now);
+        let env_json = serde_json::to_value(&env).unwrap();
+
+        // No sender_keys provided — Alice is unknown to Bob.
+        let delivery = MetaMessage::MeshDelivery {
+            peer_id: alice.id.clone(),
+            envelopes: vec![env_json],
+            sender_keys: std::collections::HashMap::new(),
+        };
+
+        let storage = open_memory_storage();
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
+        handler.on_meta(&delivery);
+
+        let stored = handler
+            .storage()
+            .get_message(&env.header.message_id.0)
+            .unwrap()
+            .expect("message should be stored even without key");
+        assert!(
+            !stored.signature_verified,
+            "should be unverified without a key"
+        );
+    }
+
+    #[test]
+    fn backfill_verifies_stored_unverified_messages() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let now = super::now_secs();
+        let env = make_public_envelope(&alice, "unverified post", now);
+        let raw = serde_json::to_string(&env).unwrap();
+
+        let storage = open_memory_storage();
+        // Insert as unverified (simulating prior mesh delivery without key).
+        let row = MessageRow {
+            message_id: env.header.message_id.0.clone(),
+            sender_id: alice.id.clone(),
+            recipient_id: bob.id.clone(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("unverified post".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: Some(raw),
+            reply_to: None,
+            signature_verified: false,
+        };
+        storage.insert_message(&row).unwrap();
+
+        let handler = StorageMessageHandler::new(storage, bob.clone());
+
+        // Now Alice's key becomes available — trigger backfill.
+        handler.try_backfill_signatures(&alice.id, &alice.signing_public_key_hex);
+
+        let stored = handler
+            .storage()
+            .get_message(&env.header.message_id.0)
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.signature_verified,
+            "backfill should mark message as verified"
+        );
+    }
+
+    #[test]
+    fn backfill_deletes_tampered_messages() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let now = super::now_secs();
+        // Build a real envelope but store it with the header timestamp changed.
+        // The signature covers header fields including timestamp, so altering it
+        // produces a message whose signature won't verify.
+        let env = make_public_envelope(&alice, "real content", now);
+        let raw = serde_json::to_string(&env).unwrap();
+
+        let storage = open_memory_storage();
+        let row = MessageRow {
+            message_id: env.header.message_id.0.clone(),
+            sender_id: alice.id.clone(),
+            recipient_id: bob.id.clone(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some("real content".to_string()),
+            timestamp: now,
+            received_at: now,
+            ttl_seconds: 3600,
+            is_read: false,
+            // Corrupt the raw envelope by changing a signed header field (timestamp).
+            raw_envelope: {
+                let mut bad = serde_json::from_str::<serde_json::Value>(&raw).unwrap();
+                bad["header"]["timestamp"] = serde_json::json!(now + 9999);
+                Some(bad.to_string())
+            },
+            reply_to: None,
+            signature_verified: false,
+        };
+        storage.insert_message(&row).unwrap();
+
+        let handler = StorageMessageHandler::new(storage, bob.clone());
+        handler.try_backfill_signatures(&alice.id, &alice.signing_public_key_hex);
+
+        // Tampered message should be deleted.
+        let stored = handler
+            .storage()
+            .get_message(&env.header.message_id.0)
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "tampered message should be deleted after backfill"
+        );
+    }
+
+    #[test]
+    fn public_messages_store_raw_envelope() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let storage = open_memory_storage();
+        let peer_row = PeerRow {
+            peer_id: alice.id.clone(),
+            display_name: None,
+            signing_public_key: alice.signing_public_key_hex.clone(),
+            encryption_public_key: None,
+            added_at: 0,
+            is_friend: true,
+            last_seen_online: None,
+            online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
+        };
+        storage.insert_peer(&peer_row).unwrap();
+
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
+
+        let now = 1_700_000_000u64;
+        let env = make_public_envelope(&alice, "raw env test", now);
+        let msg_id = env.header.message_id.0.clone();
+        let client_msg = ClientMessage {
+            message_id: msg_id.clone(),
+            sender_id: alice.id.clone(),
+            timestamp: now,
+            body: "raw env test".to_string(),
+        };
+        handler.on_message(&env, &client_msg);
+
+        let stored = handler.storage().get_message(&msg_id).unwrap().unwrap();
+        assert!(
+            stored.raw_envelope.is_some(),
+            "public messages must store raw_envelope for forwarding"
+        );
     }
 }

@@ -142,9 +142,7 @@ pub async fn accept_group_invite_handler(
             }
         }
     } else {
-        crate::tlog!(
-            "accept_group_invite: no relay configured; acceptance stored locally only"
-        );
+        crate::tlog!("accept_group_invite: no relay configured; acceptance stored locally only");
     }
 
     (

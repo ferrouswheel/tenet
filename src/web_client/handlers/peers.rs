@@ -3,9 +3,10 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use hex;
 use serde::Deserialize;
 
-use crate::crypto::validate_hex_key;
+use crate::crypto::{derive_user_id_from_public_key, validate_hex_key};
 use crate::protocol::{build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage};
 use crate::relay_transport::post_envelope;
 use crate::storage::{FriendRequestRow, PeerRow};
@@ -165,7 +166,21 @@ pub async fn add_peer_handler(
     };
 
     match st.storage.insert_peer(&peer_row) {
-        Ok(()) => (StatusCode::CREATED, axum::Json(peer_to_json(&peer_row))).into_response(),
+        Ok(()) => {
+            // Verify the key → peer_id binding and backfill any unverified
+            // messages we received from this peer before knowing their key.
+            if let Ok(key_bytes) = hex::decode(&req.signing_public_key) {
+                let derived = derive_user_id_from_public_key(&key_bytes);
+                if derived == req.peer_id {
+                    crate::message_handler::StorageMessageHandler::backfill_for_storage(
+                        &st.storage,
+                        &req.peer_id,
+                        &req.signing_public_key,
+                    );
+                }
+            }
+            (StatusCode::CREATED, axum::Json(peer_to_json(&peer_row))).into_response()
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

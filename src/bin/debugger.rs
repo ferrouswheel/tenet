@@ -670,7 +670,12 @@ impl MessageHandler for DebuggerMessageHandler {
     fn on_meta(&mut self, meta: &MetaMessage) -> Vec<Envelope> {
         let mut outgoing = self.inner.on_meta(meta);
         // Auto-accept group invites (debugger-specific behaviour; web client prompts user).
-        if let MetaMessage::GroupInvite { peer_id: inviter_id, group_id, .. } = meta {
+        if let MetaMessage::GroupInvite {
+            peer_id: inviter_id,
+            group_id,
+            ..
+        } = meta
+        {
             if let Ok(Some(invite)) = self.inner.storage_mut().find_group_invite(
                 group_id,
                 inviter_id,
@@ -678,7 +683,10 @@ impl MessageHandler for DebuggerMessageHandler {
                 "incoming",
             ) {
                 if invite.status == "pending" {
-                    let _ = self.inner.storage_mut().update_group_invite_status(invite.id, "accepted");
+                    let _ = self
+                        .inner
+                        .storage_mut()
+                        .update_group_invite_status(invite.id, "accepted");
                     let accept = MetaMessage::GroupInviteAccept {
                         peer_id: self.my_peer_id.clone(),
                         group_id: group_id.clone(),
@@ -688,8 +696,15 @@ impl MessageHandler for DebuggerMessageHandler {
                         if let Ok(env) = build_envelope_from_payload(
                             self.my_peer_id.clone(),
                             inviter_id.clone(),
-                            None, None, now, DEFAULT_TTL_SECONDS, MessageKind::Meta,
-                            None, None, payload, &self.signing_private_key_hex,
+                            None,
+                            None,
+                            now,
+                            DEFAULT_TTL_SECONDS,
+                            MessageKind::Meta,
+                            None,
+                            None,
+                            payload,
+                            &self.signing_private_key_hex,
                         ) {
                             outgoing.push(env);
                         }
@@ -721,7 +736,8 @@ impl MessageHandler for DebuggerMessageHandler {
         creator_id: &str,
         members: &[String],
     ) {
-        self.inner.on_group_created(group_id, group_key, creator_id, members);
+        self.inner
+            .on_group_created(group_id, group_key, creator_id, members);
     }
 }
 
@@ -766,12 +782,14 @@ fn sync_one(
         HPKE_INFO.to_vec(),
         PAYLOAD_AAD.to_vec(),
     );
-    peers[index].client.set_handler(Box::new(DebuggerMessageHandler {
-        inner,
-        my_peer_id: peers[index].keypair.id.clone(),
-        signing_private_key_hex: peers[index].keypair.signing_private_key_hex.clone(),
-        peer_name: peers[index].name.clone(),
-    }));
+    peers[index]
+        .client
+        .set_handler(Box::new(DebuggerMessageHandler {
+            inner,
+            my_peer_id: peers[index].keypair.id.clone(),
+            signing_private_key_hex: peers[index].keypair.signing_private_key_hex.clone(),
+            peer_name: peers[index].name.clone(),
+        }));
 
     let outcome = peers[index].client.sync_inbox(limit)?;
 

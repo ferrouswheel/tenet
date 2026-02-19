@@ -8,13 +8,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hex;
+
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
-use crate::client::{
-    ClientConfig, ClientEncryption, ClientMessage, MessageHandler, RelayClient,
-};
+use crate::client::{ClientConfig, ClientEncryption, ClientMessage, MessageHandler, RelayClient};
 use crate::message_handler::StorageMessageHandler;
 use crate::protocol::{
     build_envelope_from_payload, build_meta_payload, Envelope, MessageKind, MetaMessage,
@@ -22,7 +22,8 @@ use crate::protocol::{
 use crate::relay_transport::post_envelope;
 use crate::storage::Storage;
 use crate::web_client::config::{
-    DEFAULT_TTL_SECONDS, SYNC_INTERVAL_SECS, WEB_HPKE_INFO, WEB_PAYLOAD_AAD,
+    DEFAULT_MESH_WINDOW_SECS, DEFAULT_TTL_SECONDS, MESH_QUERY_INTERVAL_SECS, SYNC_INTERVAL_SECS,
+    WEB_HPKE_INFO, WEB_PAYLOAD_AAD,
 };
 use crate::web_client::state::{SharedState, WsEvent};
 use crate::web_client::utils::now_secs;
@@ -79,6 +80,9 @@ pub async fn relay_sync_loop(state: SharedState, notify: Arc<Notify>) {
                 if let Err(e) = request_missing_profiles(&state).await {
                     crate::tlog!("profile refresh: {}", e);
                 }
+                if let Err(e) = send_mesh_queries(&state).await {
+                    crate::tlog!("mesh queries: {}", e);
+                }
             }
             Err(e) => {
                 consecutive_failures += 1;
@@ -132,8 +136,7 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
 
     // Open a dedicated storage connection for the handler.  SQLite WAL mode
     // makes concurrent access from this connection and AppState.storage safe.
-    let handler_storage = Storage::open(&db_path)
-        .map_err(|e| format!("handler storage: {e}"))?;
+    let handler_storage = Storage::open(&db_path).map_err(|e| format!("handler storage: {e}"))?;
 
     let inner = StorageMessageHandler::new_with_crypto(
         handler_storage,
@@ -353,10 +356,7 @@ impl MessageHandler for WebClientHandler {
                         });
                         // Notification only for newly inserted requests (not refreshes).
                         if pre_incoming.is_none() {
-                            self.broadcast_notification_for(&format!(
-                                "friend_request_{}",
-                                req.id
-                            ));
+                            self.broadcast_notification_for(&format!("friend_request_{}", req.id));
                         }
                     }
                 }
@@ -418,10 +418,7 @@ impl MessageHandler for WebClientHandler {
                             message: message.clone(),
                             created_at: invite.created_at,
                         });
-                        self.broadcast_notification_for(&format!(
-                            "group_invite_{}",
-                            invite.id
-                        ));
+                        self.broadcast_notification_for(&format!("group_invite_{}", invite.id));
                     }
                 }
 
@@ -443,6 +440,59 @@ impl MessageHandler for WebClientHandler {
             MetaMessage::MessageRequest { .. } => self.inner.on_meta(meta),
 
             MetaMessage::ProfileRequest { .. } => self.inner.on_meta(meta),
+
+            // Mesh protocol: delegate storage + response-building to the inner
+            // handler.  No additional WebSocket events needed.
+            MetaMessage::MeshAvailable { .. }
+            | MetaMessage::MeshRequest { .. }
+            | MetaMessage::MeshDelivery { .. } => {
+                // When we receive MeshDelivery, any newly stored messages should
+                // be broadcast to connected UI clients.  Detect new inserts by
+                // checking whether each delivered envelope's ID is already stored
+                // before calling the inner handler.
+                if let MetaMessage::MeshDelivery {
+                    envelopes,
+                    sender_keys,
+                    ..
+                } = meta
+                {
+                    let mut new_ids: Vec<String> = Vec::new();
+                    for env_val in envelopes {
+                        if let Ok(env) = serde_json::from_value::<Envelope>(env_val.clone()) {
+                            let id = env.header.message_id.0.clone();
+                            if !self.inner.storage().has_message(&id).unwrap_or(true) {
+                                new_ids.push(id);
+                            }
+                        }
+                    }
+                    let outgoing = self.inner.on_meta(meta);
+                    for id in new_ids {
+                        if let Ok(Some(row)) = self.inner.storage().get_message(&id) {
+                            let _ = self.ws_tx.send(WsEvent::NewMessage {
+                                message_id: id.clone(),
+                                sender_id: row.sender_id.clone(),
+                                message_kind: "public".to_string(),
+                                body: row.body.clone(),
+                                timestamp: row.timestamp,
+                                reply_to: row.reply_to.clone(),
+                            });
+                        }
+                    }
+                    // Trigger backfill for any sender keys provided.
+                    for (sender_id, key_hex) in sender_keys {
+                        let key_bytes = match hex::decode(key_hex) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+                        let derived = crate::crypto::derive_user_id_from_public_key(&key_bytes);
+                        if derived == *sender_id {
+                            self.inner.try_backfill_signatures(sender_id, key_hex);
+                        }
+                    }
+                    return outgoing;
+                }
+                self.inner.on_meta(meta)
+            }
         }
     }
 
@@ -464,7 +514,8 @@ impl MessageHandler for WebClientHandler {
         creator_id: &str,
         members: &[String],
     ) {
-        self.inner.on_group_created(group_id, group_key, creator_id, members);
+        self.inner
+            .on_group_created(group_id, group_key, creator_id, members);
     }
 }
 
@@ -591,7 +642,7 @@ pub async fn relay_ws_listen_loop(state: SharedState, notify: Arc<Notify>, web_u
 /// - Peers with no profile response yet: at most once per hour.
 /// - Peers that have responded (even with an empty profile): at most once per 24 h.
 pub async fn request_missing_profiles(state: &SharedState) -> Result<(), String> {
-    const MISSING_INTERVAL_SECS: u64 = 3_600;   // 1 hour
+    const MISSING_INTERVAL_SECS: u64 = 3_600; // 1 hour
     const RESPONDED_INTERVAL_SECS: u64 = 86_400; // 24 hours
 
     let (keypair, relay_url, db_path) = {
@@ -681,6 +732,72 @@ fn relay_http_to_ws(relay_url: &str, peer_id: &str) -> String {
         relay_url.replacen("http://", "ws://", 1)
     };
     format!("{}/ws/{}", base.trim_end_matches('/'), peer_id)
+}
+
+/// Send `MessageRequest` to each known peer that hasn't been queried within
+/// `MESH_QUERY_INTERVAL_SECS`.  Rate-limits queries per-peer using
+/// `AppState::last_mesh_query_sent`.
+pub async fn send_mesh_queries(state: &SharedState) -> Result<(), String> {
+    let (keypair, relay_url, peers, now) = {
+        let st = state.lock().await;
+        let relay_url = st
+            .relay_url
+            .clone()
+            .ok_or_else(|| "no relay configured".to_string())?;
+        let peers = st.storage.list_peers().map_err(|e| e.to_string())?;
+        let now = now_secs();
+        (st.keypair.clone(), relay_url, peers, now)
+    };
+
+    let since = now.saturating_sub(DEFAULT_MESH_WINDOW_SECS);
+
+    for peer in &peers {
+        // Check and update the per-peer rate-limit.
+        {
+            let mut st = state.lock().await;
+            let last = st
+                .last_mesh_query_sent
+                .get(&peer.peer_id)
+                .copied()
+                .unwrap_or(0);
+            if now.saturating_sub(last) < MESH_QUERY_INTERVAL_SECS {
+                continue;
+            }
+            st.last_mesh_query_sent.insert(peer.peer_id.clone(), now);
+        }
+
+        let meta_msg = MetaMessage::MessageRequest {
+            peer_id: keypair.id.clone(),
+            since_timestamp: since,
+        };
+        let Ok(payload) = build_meta_payload(&meta_msg) else {
+            continue;
+        };
+        let Ok(envelope) = build_envelope_from_payload(
+            keypair.id.clone(),
+            peer.peer_id.clone(),
+            None,
+            None,
+            now,
+            DEFAULT_TTL_SECONDS,
+            MessageKind::Meta,
+            None,
+            None,
+            payload,
+            &keypair.signing_private_key_hex,
+        ) else {
+            continue;
+        };
+        if let Err(e) = post_envelope(&relay_url, &envelope) {
+            crate::tlog!(
+                "mesh query: failed to send to {}: {}",
+                crate::logging::peer_id(&peer.peer_id),
+                e
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Send online announcement to all known peers via relay.

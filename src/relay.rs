@@ -302,12 +302,20 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
                 queue_bytes,
                 last_seen_secs,
                 delivered_1m: deliveries.map(|d| count_in_window(d, now, 60)).unwrap_or(0),
-                delivered_1h: deliveries.map(|d| count_in_window(d, now, 3600)).unwrap_or(0),
-                delivered_24h: deliveries.map(|d| count_in_window(d, now, 86400)).unwrap_or(0),
+                delivered_1h: deliveries
+                    .map(|d| count_in_window(d, now, 3600))
+                    .unwrap_or(0),
+                delivered_24h: deliveries
+                    .map(|d| count_in_window(d, now, 86400))
+                    .unwrap_or(0),
             }
         })
         .collect();
-    inboxes.sort_by(|a, b| b.queue_depth.cmp(&a.queue_depth).then(a.peer_id.cmp(&b.peer_id)));
+    inboxes.sort_by(|a, b| {
+        b.queue_depth
+            .cmp(&a.queue_depth)
+            .then(a.peer_id.cmp(&b.peer_id))
+    });
 
     let total_queued_bytes: usize = inboxes.iter().map(|i| i.queue_bytes).sum();
 
@@ -984,10 +992,7 @@ fn store_envelope_locked(
         inner.total_stored += recipients.len() as u64;
 
         if let Some(ref sender_id) = sender_id {
-            push_timestamped(
-                inner.peer_sends.entry(sender_id.clone()).or_default(),
-                now,
-            );
+            push_timestamped(inner.peer_sends.entry(sender_id.clone()).or_default(), now);
             log_message(
                 config,
                 format!(
@@ -1042,10 +1047,7 @@ fn store_envelope_locked(
     }
 
     if let Some(sender_id) = sender_id {
-        push_timestamped(
-            inner.peer_sends.entry(sender_id.clone()).or_default(),
-            now,
-        );
+        push_timestamped(inner.peer_sends.entry(sender_id.clone()).or_default(), now);
         log_message(
             config,
             format!(

@@ -106,14 +106,14 @@ pub async fn run_event_based_scenario(
     let time_control_mode = TimeControlMode::FastForward;
     let clock = SimulationClock::new(time_control_mode);
 
-    let network_conditions = scenario
-        .network_conditions
-        .clone()
-        .unwrap_or_default();
+    let network_conditions = scenario.network_conditions.clone().unwrap_or_default();
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
-    let (active_links, pending_friendships, friend_accept_delay) =
-        split_friend_graph(inputs.direct_links, &scenario.simulation.friend_request_config, &mut rng);
+    let (active_links, pending_friendships, friend_accept_delay) = split_friend_graph(
+        inputs.direct_links,
+        &scenario.simulation.friend_request_config,
+        &mut rng,
+    );
 
     let mut harness = EventBasedHarness::new(
         clock,
@@ -151,7 +151,13 @@ pub async fn run_event_based_scenario(
 
     // Schedule friend request events for pending friendships
     if let Some(fr_config) = &scenario.simulation.friend_request_config {
-        let fr_events = build_friend_request_events(&pending_friendships, fr_config, 0.0, duration_seconds, &mut rng);
+        let fr_events = build_friend_request_events(
+            &pending_friendships,
+            fr_config,
+            0.0,
+            duration_seconds,
+            &mut rng,
+        );
         for event in fr_events {
             harness.schedule_event(event.time, event.event);
         }
@@ -191,16 +197,16 @@ where
     let time_control_mode = TimeControlMode::FastForward;
     let clock = SimulationClock::new(time_control_mode);
 
-    let network_conditions = scenario
-        .network_conditions
-        .clone()
-        .unwrap_or_default();
+    let network_conditions = scenario.network_conditions.clone().unwrap_or_default();
 
     let ttl_seconds = scenario.relay.ttl_seconds;
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(scenario.simulation.seed);
-    let (active_links, pending_friendships, friend_accept_delay) =
-        split_friend_graph(inputs.direct_links, &scenario.simulation.friend_request_config, &mut rng);
+    let (active_links, pending_friendships, friend_accept_delay) = split_friend_graph(
+        inputs.direct_links,
+        &scenario.simulation.friend_request_config,
+        &mut rng,
+    );
 
     let mut harness = EventBasedHarness::new(
         clock,
@@ -254,8 +260,17 @@ where
 
     // Schedule friend request events for pending friendships
     if let Some(fr_config) = &scenario.simulation.friend_request_config {
-        let fr_events = build_friend_request_events(&pending_friendships, fr_config, 0.0, duration_seconds, &mut rng);
-        harness.log_event(format!("Scheduling {} friend-request events", fr_events.len()));
+        let fr_events = build_friend_request_events(
+            &pending_friendships,
+            fr_config,
+            0.0,
+            duration_seconds,
+            &mut rng,
+        );
+        harness.log_event(format!(
+            "Scheduling {} friend-request events",
+            fr_events.len()
+        ));
         for event in fr_events {
             harness.schedule_event(event.time, event.event);
         }

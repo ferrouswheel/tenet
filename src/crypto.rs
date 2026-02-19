@@ -161,8 +161,8 @@ pub fn make_relay_auth_token(
     signing_private_key_hex: &str,
     peer_id: &str,
 ) -> Result<String, CryptoError> {
-    let signing_key_bytes =
-        hex::decode(signing_private_key_hex).map_err(|_| CryptoError::InvalidLength("invalid hex"))?;
+    let signing_key_bytes = hex::decode(signing_private_key_hex)
+        .map_err(|_| CryptoError::InvalidLength("invalid hex"))?;
     if signing_key_bytes.len() != 32 {
         return Err(CryptoError::InvalidLength("signing key must be 32 bytes"));
     }

@@ -342,6 +342,28 @@ pub enum MetaMessage {
         peer_id: String,
         for_peer_id: String,
     },
+    /// Response to `MessageRequest`: announces available public message IDs.
+    MeshAvailable {
+        peer_id: String,
+        message_ids: Vec<String>,
+        since_timestamp: u64,
+    },
+    /// Request specific public messages by ID after deduplication.
+    MeshRequest {
+        peer_id: String,
+        message_ids: Vec<String>,
+    },
+    /// Delivers batches of public envelopes plus sender signing keys for
+    /// signature verification of messages from previously-unknown peers.
+    MeshDelivery {
+        peer_id: String,
+        /// Serialised `Envelope` JSON values.
+        envelopes: Vec<serde_json::Value>,
+        /// Maps sender_id → signing_public_key_hex for each sender whose
+        /// messages are included.  The receiver MUST validate the key by
+        /// checking `SHA256(key_bytes) == sender_id` before trusting it.
+        sender_keys: std::collections::HashMap<String, String>,
+    },
 }
 
 #[derive(Debug)]

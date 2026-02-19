@@ -896,10 +896,7 @@ impl EventBasedHarness {
         sender_id: String,
         recipient_id: String,
     ) -> EventOutcome {
-        self.log_event(format!(
-            "FriendRequest: {} -> {}",
-            sender_id, recipient_id
-        ));
+        self.log_event(format!("FriendRequest: {} -> {}", sender_id, recipient_id));
 
         // Schedule the accept after the configured delay
         let delay = self
