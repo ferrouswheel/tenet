@@ -1778,21 +1778,27 @@ function renderPeerRow(p) {
     const blockedBadge = p.is_blocked ? '<span class="peer-badge blocked">Blocked</span>' : '';
     const mutedBadge = p.is_muted ? '<span class="peer-badge muted">Muted</span>' : '';
 
-    let lastMsg = '';
-    if (p.last_message_at) {
-        lastMsg = `<div class="peer-row-last-msg"><span class="peer-row-ts">${timeAgo(p.last_message_at)}</span> ${escapeHtml((p.last_message_preview || '').substring(0, 80))}</div>`;
+    let lastActivity = '';
+    const msgTs = p.last_message_at || 0;
+    const postTs = p.last_post_at || 0;
+    if (msgTs > 0 || postTs > 0) {
+        if (postTs > msgTs) {
+            lastActivity = `<div class="peer-row-last-msg"><span class="peer-row-ts">${timeAgo(p.last_post_at)}</span><em>Post:</em> ${escapeHtml((p.last_post_preview || '').substring(0, 60))}</div>`;
+        } else {
+            lastActivity = `<div class="peer-row-last-msg"><span class="peer-row-ts">${timeAgo(p.last_message_at)}</span>${escapeHtml((p.last_message_preview || '').substring(0, 80))}</div>`;
+        }
     }
-    let lastPost = '';
-    if (p.last_post_at) {
-        lastPost = `<div class="peer-row-last-post"><span class="peer-row-ts">${timeAgo(p.last_post_at)}</span> <em>Post:</em> ${escapeHtml((p.last_post_preview || '').substring(0, 60))}</div>`;
-    }
+
+    const shortId = p.peer_id.substring(0, 16) + '…';
 
     return `<div class="peer-row" onclick="navigateToPeer('${escapeHtml(p.peer_id)}')">
         <div class="peer-row-avatar">${avatarInner}</div>
         <div class="peer-row-info">
-            <div class="peer-row-name">${escapeHtml(name)} ${onlineDot}${blockedBadge}${mutedBadge}</div>
-            ${lastMsg}
-            ${lastPost}
+            <div class="peer-row-main">
+                <div class="peer-row-name">${escapeHtml(name)} ${onlineDot}${blockedBadge}${mutedBadge}</div>
+                <div class="peer-row-id"><code>${escapeHtml(shortId)}</code><button class="copy-btn-inline" title="Copy peer ID" onclick="event.stopPropagation();navigator.clipboard.writeText('${escapeHtml(p.peer_id)}').then(()=>showToast('Peer ID copied'))">⎘</button></div>
+            </div>
+            ${lastActivity}
         </div>
     </div>`;
 }

@@ -1841,9 +1841,20 @@ body {
     overflow: hidden;
 }
 .peer-row-avatar img { width: 100%; height: 100%; object-fit: cover; }
-.peer-row-info { flex: 1; min-width: 0; }
+.peer-row-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+.peer-row-main {
+    flex: 0 0 auto;
+    min-width: 0;
+    width: 160px;
+}
 .peer-row-name {
-    font-size: 0.9rem;
+    font-size: 1rem;
     font-weight: 600;
     color: #ddd;
     display: flex;
@@ -1867,10 +1878,32 @@ body {
 }
 .peer-badge.blocked { background: #4a1a1a; color: #e57373; }
 .peer-badge.muted   { background: #3a3a1a; color: #f0c040; }
-.peer-row-last-msg, .peer-row-last-post {
-    font-size: 0.75rem;
-    color: #777;
+.peer-row-id {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
     margin-top: 0.2rem;
+}
+.peer-row-id code {
+    font-size: 0.75rem;
+    color: #555;
+    font-family: monospace;
+}
+.copy-btn-inline {
+    background: none;
+    border: none;
+    color: #555;
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 0;
+    line-height: 1;
+}
+.copy-btn-inline:hover { color: #aaa; }
+.peer-row-last-msg, .peer-row-last-post {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.85rem;
+    color: #888;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1878,8 +1911,8 @@ body {
 .peer-row-last-post em { font-style: normal; color: #5a9a5a; }
 .peer-row-ts {
     color: #555;
-    font-size: 0.7rem;
-    margin-right: 0.3rem;
+    font-size: 0.75rem;
+    margin-right: 0.35rem;
 }
 
 /* ── Peer detail view ───────────────────────────────────────── */
