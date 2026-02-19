@@ -118,6 +118,14 @@ pub struct PeerRow {
     pub last_profile_requested_at: Option<u64>,
     /// Unix timestamp of the last profile message received from this peer (`None` = never).
     pub last_profile_responded_at: Option<u64>,
+    /// Whether all incoming messages from this peer are silently discarded.
+    pub is_blocked: bool,
+    /// Whether this peer's posts are hidden from the timeline (messages still stored).
+    pub is_muted: bool,
+    /// Unix timestamp when the peer was blocked (`None` = not blocked).
+    pub blocked_at: Option<u64>,
+    /// Unix timestamp when the peer was muted (`None` = not muted).
+    pub muted_at: Option<u64>,
 }
 
 /// Message row stored in the database.
@@ -527,6 +535,20 @@ impl Storage {
             )?;
         }
 
+        // Migration: add block/mute columns to peers if not present
+        if self
+            .conn
+            .prepare("SELECT is_blocked FROM peers LIMIT 0")
+            .is_err()
+        {
+            self.conn.execute_batch(
+                "ALTER TABLE peers ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE peers ADD COLUMN is_muted    INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE peers ADD COLUMN blocked_at  INTEGER;
+                 ALTER TABLE peers ADD COLUMN muted_at    INTEGER;",
+            )?;
+        }
+
 
         // Migration: move any existing attachment blobs from DB to filesystem,
         // then drop the legacy `data` column. Runs only if the column still exists.
@@ -736,8 +758,9 @@ impl Storage {
             "INSERT OR REPLACE INTO peers
              (peer_id, display_name, signing_public_key, encryption_public_key,
               added_at, is_friend, last_seen_online, online,
-              last_profile_requested_at, last_profile_responded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              last_profile_requested_at, last_profile_responded_at,
+              is_blocked, is_muted, blocked_at, muted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 row.peer_id,
                 row.display_name,
@@ -749,6 +772,10 @@ impl Storage {
                 row.online as i32,
                 row.last_profile_requested_at.map(|t| t as i64),
                 row.last_profile_responded_at.map(|t| t as i64),
+                row.is_blocked as i32,
+                row.is_muted as i32,
+                row.blocked_at.map(|t| t as i64),
+                row.muted_at.map(|t| t as i64),
             ],
         )?;
         Ok(())
@@ -758,7 +785,8 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT peer_id, display_name, signing_public_key, encryption_public_key,
                     added_at, is_friend, last_seen_online, online,
-                    last_profile_requested_at, last_profile_responded_at
+                    last_profile_requested_at, last_profile_responded_at,
+                    is_blocked, is_muted, blocked_at, muted_at
              FROM peers WHERE peer_id = ?1",
         )?;
         let row = stmt
@@ -774,6 +802,10 @@ impl Storage {
                     online: row.get::<_, i32>(7)? != 0,
                     last_profile_requested_at: row.get::<_, Option<i64>>(8)?.map(|t| t as u64),
                     last_profile_responded_at: row.get::<_, Option<i64>>(9)?.map(|t| t as u64),
+                    is_blocked: row.get::<_, i32>(10)? != 0,
+                    is_muted: row.get::<_, i32>(11)? != 0,
+                    blocked_at: row.get::<_, Option<i64>>(12)?.map(|t| t as u64),
+                    muted_at: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
                 })
             })
             .optional()?;
@@ -784,7 +816,8 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "SELECT peer_id, display_name, signing_public_key, encryption_public_key,
                     added_at, is_friend, last_seen_online, online,
-                    last_profile_requested_at, last_profile_responded_at
+                    last_profile_requested_at, last_profile_responded_at,
+                    is_blocked, is_muted, blocked_at, muted_at
              FROM peers ORDER BY added_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -799,6 +832,10 @@ impl Storage {
                 online: row.get::<_, i32>(7)? != 0,
                 last_profile_requested_at: row.get::<_, Option<i64>>(8)?.map(|t| t as u64),
                 last_profile_responded_at: row.get::<_, Option<i64>>(9)?.map(|t| t as u64),
+                is_blocked: row.get::<_, i32>(10)? != 0,
+                is_muted: row.get::<_, i32>(11)? != 0,
+                blocked_at: row.get::<_, Option<i64>>(12)?.map(|t| t as u64),
+                muted_at: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
             })
         })?;
         let mut result = Vec::new();
@@ -826,6 +863,175 @@ impl Storage {
             params![online as i32, last_seen as i64, peer_id],
         )?;
         Ok(affected > 0)
+    }
+
+    /// Set the `is_blocked` flag for a peer.
+    ///
+    /// When blocking, records the current timestamp in `blocked_at`.
+    /// When unblocking, clears `blocked_at`.
+    /// Returns `StorageError::NotFound` if the peer doesn't exist.
+    pub fn set_peer_blocked(&self, peer_id: &str, blocked: bool) -> Result<(), StorageError> {
+        let now: Option<i64> = if blocked {
+            Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            )
+        } else {
+            None
+        };
+        let affected = self.conn.execute(
+            "UPDATE peers SET is_blocked = ?1, blocked_at = ?2 WHERE peer_id = ?3",
+            params![blocked as i32, now, peer_id],
+        )?;
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!(
+                "peer not found: {peer_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return the set of peer IDs that are currently muted.
+    pub fn get_muted_peer_ids(&self) -> Result<Vec<String>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_id FROM peers WHERE is_muted = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Set the `is_muted` flag for a peer.
+    ///
+    /// When muting, records the current timestamp in `muted_at`.
+    /// When unmuting, clears `muted_at`.
+    /// Returns `StorageError::NotFound` if the peer doesn't exist.
+    pub fn set_peer_muted(&self, peer_id: &str, muted: bool) -> Result<(), StorageError> {
+        let now: Option<i64> = if muted {
+            Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            )
+        } else {
+            None
+        };
+        let affected = self.conn.execute(
+            "UPDATE peers SET is_muted = ?1, muted_at = ?2 WHERE peer_id = ?3",
+            params![muted as i32, now, peer_id],
+        )?;
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!(
+                "peer not found: {peer_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return `(timestamp, body_preview)` of the most recent message of any
+    /// non-meta kind where `sender_id = peer_id` OR `recipient_id = peer_id`.
+    pub fn peer_last_message(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<(u64, String)>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, body FROM messages
+             WHERE message_kind != 'meta'
+               AND (sender_id = ?1 OR recipient_id = ?1)
+             ORDER BY timestamp DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![peer_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, Option<String>>(1)?
+                        .unwrap_or_default(),
+                ))
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Return `(timestamp, body_preview)` of the most recent public or
+    /// friend_group message sent *by* `peer_id`.
+    pub fn peer_last_post(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<(u64, String)>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, body FROM messages
+             WHERE sender_id = ?1
+               AND message_kind IN ('public', 'friend_group')
+             ORDER BY timestamp DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![peer_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, Option<String>>(1)?
+                        .unwrap_or_default(),
+                ))
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Return messages sent *by* `peer_id` of kind public, friend_group, or
+    /// direct, in reverse-chronological order.  Used by the peer activity
+    /// endpoint.
+    pub fn list_peer_activity(
+        &self,
+        peer_id: &str,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MessageRow>, StorageError> {
+        let mut sql = String::from(
+            "SELECT message_id, sender_id, recipient_id, message_kind, group_id,
+                    body, timestamp, received_at, ttl_seconds, is_read, raw_envelope, reply_to
+             FROM messages
+             WHERE sender_id = ?1
+               AND message_kind IN ('public', 'friend_group', 'direct')",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(peer_id.to_string())];
+
+        if let Some(b) = before {
+            sql.push_str(" AND timestamp < ?");
+            bind_values.push(Box::new(b as i64));
+        }
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        bind_values.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            Ok(MessageRow {
+                message_id: row.get(0)?,
+                sender_id: row.get(1)?,
+                recipient_id: row.get(2)?,
+                message_kind: row.get(3)?,
+                group_id: row.get(4)?,
+                body: row.get(5)?,
+                timestamp: row.get::<_, i64>(6)? as u64,
+                received_at: row.get::<_, i64>(7)? as u64,
+                ttl_seconds: row.get::<_, i64>(8)? as u64,
+                is_read: row.get::<_, i32>(9)? != 0,
+                raw_envelope: row.get(10)?,
+                reply_to: row.get(11)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -2304,6 +2510,10 @@ impl Storage {
                     online: false,
                     last_profile_requested_at: None,
                     last_profile_responded_at: None,
+                    is_blocked: false,
+                    is_muted: false,
+                    blocked_at: None,
+                    muted_at: None,
                 };
                 self.insert_peer(&row)?;
             }
@@ -2592,6 +2802,10 @@ mod tests {
             online: false,
             last_profile_requested_at: None,
             last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
         };
         storage.insert_peer(&peer).unwrap();
 
@@ -3277,5 +3491,156 @@ mod tests {
         assert!(storage.upsert_profile_if_newer(&same_ts_richer).unwrap());
         let loaded = storage.get_profile("user-1").unwrap().unwrap();
         assert_eq!(loaded.friends_fields, r#"{"email":"alice@secret.com"}"#);
+    }
+
+    fn make_peer(id: &str, now: u64) -> PeerRow {
+        PeerRow {
+            peer_id: id.to_string(),
+            display_name: None,
+            signing_public_key: "sign-key".to_string(),
+            encryption_public_key: None,
+            added_at: now,
+            is_friend: true,
+            last_seen_online: None,
+            online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
+        }
+    }
+
+    fn make_message(id: &str, sender: &str, recipient: &str, kind: &str, ts: u64) -> MessageRow {
+        MessageRow {
+            message_id: id.to_string(),
+            sender_id: sender.to_string(),
+            recipient_id: recipient.to_string(),
+            message_kind: kind.to_string(),
+            group_id: None,
+            body: Some(format!("body of {id}")),
+            timestamp: ts,
+            received_at: ts,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: None,
+            reply_to: None,
+        }
+    }
+
+    #[test]
+    fn test_set_peer_blocked() {
+        let storage = test_storage();
+        let now = now_secs();
+        storage.insert_peer(&make_peer("peer-1", now)).unwrap();
+
+        // Initially not blocked
+        let p = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(!p.is_blocked);
+        assert!(p.blocked_at.is_none());
+
+        // Block
+        storage.set_peer_blocked("peer-1", true).unwrap();
+        let p = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(p.is_blocked);
+        assert!(p.blocked_at.is_some());
+
+        // Unblock
+        storage.set_peer_blocked("peer-1", false).unwrap();
+        let p = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(!p.is_blocked);
+        assert!(p.blocked_at.is_none());
+
+        // Not found
+        let err = storage.set_peer_blocked("nonexistent", true);
+        assert!(matches!(err, Err(StorageError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_set_peer_muted() {
+        let storage = test_storage();
+        let now = now_secs();
+        storage.insert_peer(&make_peer("peer-1", now)).unwrap();
+
+        // Initially not muted
+        let p = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(!p.is_muted);
+        assert!(p.muted_at.is_none());
+
+        // Mute
+        storage.set_peer_muted("peer-1", true).unwrap();
+        let p = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(p.is_muted);
+        assert!(p.muted_at.is_some());
+
+        // Unmute
+        storage.set_peer_muted("peer-1", false).unwrap();
+        let p = storage.get_peer("peer-1").unwrap().unwrap();
+        assert!(!p.is_muted);
+        assert!(p.muted_at.is_none());
+    }
+
+    #[test]
+    fn test_peer_last_message() {
+        let storage = test_storage();
+        let now = now_secs();
+        storage.insert_peer(&make_peer("alice", now)).unwrap();
+
+        // No messages yet
+        assert!(storage.peer_last_message("alice").unwrap().is_none());
+
+        // Insert a direct message from alice
+        storage
+            .insert_message(&make_message("m1", "alice", "me", "direct", now - 100))
+            .unwrap();
+        let (ts, preview) = storage.peer_last_message("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 100);
+        assert!(preview.contains("m1"));
+
+        // Insert a newer message to alice
+        storage
+            .insert_message(&make_message("m2", "me", "alice", "direct", now - 50))
+            .unwrap();
+        let (ts, _) = storage.peer_last_message("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 50);
+
+        // Meta messages should be excluded
+        storage
+            .insert_message(&make_message("m3", "alice", "me", "meta", now))
+            .unwrap();
+        let (ts, _) = storage.peer_last_message("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 50, "meta message should be excluded");
+    }
+
+    #[test]
+    fn test_peer_last_post() {
+        let storage = test_storage();
+        let now = now_secs();
+        storage.insert_peer(&make_peer("alice", now)).unwrap();
+
+        // No messages yet
+        assert!(storage.peer_last_post("alice").unwrap().is_none());
+
+        // Insert a public message from alice
+        storage
+            .insert_message(&make_message("m1", "alice", "*", "public", now - 200))
+            .unwrap();
+        let (ts, _) = storage.peer_last_post("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 200);
+
+        // Direct messages should NOT appear in last post
+        storage
+            .insert_message(&make_message("m2", "alice", "me", "direct", now - 10))
+            .unwrap();
+        let (ts, _) = storage.peer_last_post("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 200, "direct message should be excluded from last post");
+
+        // Friend group messages should appear
+        storage
+            .insert_message(&make_message("m3", "alice", "*", "friend_group", now - 50))
+            .unwrap();
+        let (ts, _) = storage.peer_last_post("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 50);
     }
 }

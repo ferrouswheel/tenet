@@ -1803,3 +1803,150 @@ body {
 }
 .member-status-badge.active { background: #1a3a2a; color: #4caf50; }
 .member-status-badge.pending { background: #3a3a1a; color: #f0c040; }
+
+/* ── Peer list view ─────────────────────────────────────────── */
+.peers-view { display: none; }
+.peers-view.visible { display: block; }
+.peers-view-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+}
+.peers-view-header h2 { margin: 0; font-size: 1.1rem; color: #eee; }
+
+.peer-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.65rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    border-bottom: 1px solid #2a2a2a;
+    transition: background 0.15s;
+}
+.peer-row:hover { background: #1e1e1e; }
+.peer-row-avatar {
+    width: 38px;
+    height: 38px;
+    min-width: 38px;
+    border-radius: 50%;
+    background: #333;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: #ccc;
+    overflow: hidden;
+}
+.peer-row-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.peer-row-info { flex: 1; min-width: 0; }
+.peer-row-name {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #ddd;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+}
+.online-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #4caf50;
+}
+.peer-badge {
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+}
+.peer-badge.blocked { background: #4a1a1a; color: #e57373; }
+.peer-badge.muted   { background: #3a3a1a; color: #f0c040; }
+.peer-row-last-msg, .peer-row-last-post {
+    font-size: 0.75rem;
+    color: #777;
+    margin-top: 0.2rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.peer-row-last-post em { font-style: normal; color: #5a9a5a; }
+.peer-row-ts {
+    color: #555;
+    font-size: 0.7rem;
+    margin-right: 0.3rem;
+}
+
+/* ── Peer detail view ───────────────────────────────────────── */
+.peer-detail-view { display: none; }
+.peer-detail-view.visible { display: block; }
+.peer-detail-back { margin-bottom: 1rem; }
+.peer-detail-back button {
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 0.85rem;
+    padding: 0.25rem 0;
+}
+.peer-detail-back button:hover { color: #ccc; }
+
+.peer-detail-header {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+    margin-bottom: 1.25rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid #2a2a2a;
+}
+.peer-detail-avatar {
+    width: 56px;
+    height: 56px;
+    min-width: 56px;
+    border-radius: 50%;
+    background: #333;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #ccc;
+    overflow: hidden;
+}
+.peer-detail-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.peer-detail-name { font-size: 1.1rem; font-weight: 700; color: #eee; margin-bottom: 0.25rem; }
+.peer-detail-online  { color: #4caf50; font-size: 0.8rem; }
+.peer-detail-offline { color: #666; font-size: 0.8rem; }
+.peer-detail-id-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+}
+.peer-detail-id {
+    font-size: 0.7rem;
+    color: #666;
+    word-break: break-all;
+}
+
+.peer-detail-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+.btn-danger  { border-color: #b03030 !important; color: #e57373 !important; }
+.btn-warning { border-color: #806020 !important; color: #f0c040 !important; }
+
+.peer-activity-section h3 {
+    font-size: 0.9rem;
+    color: #999;
+    margin: 0 0 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}

@@ -459,6 +459,10 @@ fn add_peer(
         online: false,
         last_profile_requested_at: None,
         last_profile_responded_at: None,
+        is_blocked: false,
+        is_muted: false,
+        blocked_at: None,
+        muted_at: None,
     };
     let _ = peer.storage.insert_peer(&row);
 
@@ -501,6 +505,10 @@ fn add_all_peers(peers: &mut [DebugPeer]) -> Result<(), Box<dyn Error>> {
                 online: false,
                 last_profile_requested_at: None,
                 last_profile_responded_at: None,
+                is_blocked: false,
+                is_muted: false,
+                blocked_at: None,
+                muted_at: None,
             };
             let _ = peer.storage.insert_peer(&row);
         }

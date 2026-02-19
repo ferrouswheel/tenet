@@ -49,6 +49,34 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/peers/:peer_id",
             get(handlers::peers::get_peer_handler).delete(handlers::peers::delete_peer_handler),
         )
+        .route(
+            "/api/peers/:peer_id/block",
+            post(handlers::peers::block_peer_handler),
+        )
+        .route(
+            "/api/peers/:peer_id/unblock",
+            post(handlers::peers::unblock_peer_handler),
+        )
+        .route(
+            "/api/peers/:peer_id/mute",
+            post(handlers::peers::mute_peer_handler),
+        )
+        .route(
+            "/api/peers/:peer_id/unmute",
+            post(handlers::peers::unmute_peer_handler),
+        )
+        .route(
+            "/api/peers/:peer_id/friend-request",
+            post(handlers::peers::peer_friend_request_handler),
+        )
+        .route(
+            "/api/peers/:peer_id/request-profile",
+            post(handlers::peers::peer_request_profile_handler),
+        )
+        .route(
+            "/api/peers/:peer_id/activity",
+            get(handlers::peers::peer_activity_handler),
+        )
         // Groups API
         .route(
             "/api/groups",

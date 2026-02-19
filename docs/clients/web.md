@@ -101,11 +101,18 @@ The sync loop is implemented in `src/web_client/sync.rs`.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/peers` | GET | List all peers |
-| `/api/peers/:id` | GET | Peer detail |
+| `/api/peers` | GET | List all peers (includes `last_message_*`, `last_post_*`, `is_blocked`, `is_muted`) |
+| `/api/peers/:id` | GET | Peer detail (same fields as list) |
 | `/api/peers` | POST | Add peer `{ peer_id, display_name, signing_public_key }` |
 | `/api/peers/:id` | DELETE | Remove peer |
 | `/api/peers/:id/profile` | GET | View peer's profile |
+| `/api/peers/:id/block` | POST | Block peer — future messages silently discarded client-side |
+| `/api/peers/:id/unblock` | POST | Unblock peer |
+| `/api/peers/:id/mute` | POST | Mute peer — posts hidden from timeline; messages still stored |
+| `/api/peers/:id/unmute` | POST | Unmute peer |
+| `/api/peers/:id/friend-request` | POST | Send a friend request to this peer |
+| `/api/peers/:id/request-profile` | POST | Send a `ProfileRequest` meta message to this peer |
+| `/api/peers/:id/activity` | GET | Recent activity by this peer `?limit=20&before=<ts>` |
 
 ### Conversations
 
@@ -204,6 +211,8 @@ The SPA uses hash-based routing:
 | `#/` or `#/timeline` | Public and group post feed |
 | `#/post/{messageId}` | Single post with replies |
 | `#/peer/{peerId}` | Direct message conversation |
+| `#/peers` | Peer list (sorted by last activity) |
+| `#/peers/{peerId}` | Peer detail — info, actions, recent activity |
 
 ## Database Schema
 
@@ -214,7 +223,7 @@ Key tables:
 | Table | Purpose |
 |-------|---------|
 | `identity` | Local keypair and peer ID |
-| `peers` | Known peers/friends with online status |
+| `peers` | Known peers/friends with online status, block/mute flags |
 | `messages` | All received and sent messages |
 | `outbox` | Sent envelopes |
 | `groups` | Group membership and symmetric keys |
@@ -249,4 +258,24 @@ Key tables:
 | Group invite flow | Implemented |
 | Real-time updates (WebSocket) | Implemented |
 | Hash-based URL routing | Implemented |
+| Peer list (`#/peers`) | Implemented |
+| Peer detail (`#/peers/{id}`) | Implemented |
+| Block / unblock peers | Implemented — client-side enforcement in message handler |
+| Mute / unmute peers | Implemented — muted posts filtered server-side by `GET /api/messages` |
 | Friend Groups UI | Partial — create group, send group message, accept/ignore invites work; no UI for add member, remove member, or leave group |
+
+## Peer Moderation
+
+### Blocking
+
+Blocking is enforced **client-side** in `StorageMessageHandler::on_message()`. When a sender's peer record has `is_blocked = true`, the incoming envelope is silently discarded before being stored. The relay is never informed of the block list — sending the list to the relay would be a privacy leak.
+
+Blocked peers cannot detect that they have been blocked; from their perspective messages simply receive no reply (consistent with the best-effort delivery model).
+
+Relay-level blocking (refusing to queue envelopes from a blocked sender) is deliberately **out of scope**: it would require either sharing the block list with the relay or introducing a new signed "do not forward" message type, neither of which aligns with the protocol threat model.
+
+### Muting
+
+Muting does **not** affect message storage. Messages from muted peers are stored normally. The `GET /api/messages` endpoint filters out public and friend_group messages from muted peers server-side before returning results to the browser. Direct messages to/from muted peers remain visible in conversation views.
+
+No new protocol messages are introduced for either block or mute.

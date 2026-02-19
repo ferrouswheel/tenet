@@ -24,6 +24,9 @@
             <button class="header-nav-btn" id="nav-friends" title="Friends" onclick="navToFriends()">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
             </button>
+            <button class="header-nav-btn" id="nav-peers" title="Peers" onclick="navToPeers()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><line x1="16" y1="11" x2="22" y2="11"/><line x1="19" y1="8" x2="19" y2="14"/></svg>
+            </button>
             <button class="header-nav-btn" id="nav-profile" title="My Profile" onclick="navToProfile()">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
             </button>
@@ -199,6 +202,29 @@
                     <div class="form-actions">
                         <button class="btn-secondary" onclick="backFromProfile()">Cancel</button>
                         <button class="btn-primary" onclick="saveProfile()">Save</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Peer list view (#/peers) -->
+            <div id="peers-view" class="peers-view">
+                <div class="peers-view-header">
+                    <h2>Peers</h2>
+                </div>
+                <div id="peers-list"></div>
+            </div>
+
+            <!-- Peer detail view (#/peers/{peerId}) -->
+            <div id="peer-detail-view" class="peer-detail-view">
+                <div class="peer-detail-back">
+                    <button onclick="navigateTo('peers')">&#8592; Back to Peers</button>
+                </div>
+                <div id="peer-detail-content"></div>
+                <div class="peer-activity-section" id="peer-activity-section" style="display:none;">
+                    <h3>Recent Activity</h3>
+                    <div id="peer-activity-list"></div>
+                    <div id="peer-activity-load-more" class="load-more" style="display:none;">
+                        <button onclick="loadMorePeerActivity()">Load more</button>
                     </div>
                 </div>
             </div>

@@ -35,6 +35,21 @@ pub async fn list_messages_handler(
     let st = state.lock().await;
     let limit = params.limit.unwrap_or(50).min(200);
 
+    // For timeline kinds (public / friend_group), filter out posts from muted peers.
+    let is_timeline_kind = matches!(
+        params.kind.as_deref(),
+        Some("public") | Some("friend_group") | None
+    );
+    let muted_ids: std::collections::HashSet<String> = if is_timeline_kind {
+        st.storage
+            .get_muted_peer_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     match st.storage.list_messages(
         params.kind.as_deref(),
         params.group.as_deref(),
@@ -44,6 +59,16 @@ pub async fn list_messages_handler(
         Ok(messages) => {
             let json: Vec<serde_json::Value> = messages
                 .iter()
+                .filter(|m| {
+                    // Never hide own messages; hide muted-peer posts from timeline.
+                    if muted_ids.is_empty() {
+                        return true;
+                    }
+                    if m.sender_id == st.keypair.id {
+                        return true;
+                    }
+                    matches!(m.message_kind.as_str(), "direct") || !muted_ids.contains(&m.sender_id)
+                })
                 .map(|m| message_to_json(m, &st.storage))
                 .collect();
             (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()

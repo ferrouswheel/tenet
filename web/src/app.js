@@ -5,7 +5,9 @@ let myPeerId = '';
 let currentFilter = 'public'; // 'public' or 'friend_group'
 let groups = [];
 let groupInvites = [];
-let currentView = 'timeline'; // 'timeline', 'friends', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit'
+let currentView = 'timeline'; // 'timeline', 'friends', 'conversation-detail', 'post-detail', 'profile-view', 'profile-edit', 'peers-view', 'peer-detail'
+let currentPeerDetailId = null; // peer ID shown in the peer detail view
+let peerActivityOldestTimestamp = null;
 let messages = [];
 let oldestTimestamp = null;
 let ws = null;
@@ -96,6 +98,13 @@ function handleRoute() {
         // DM conversation: #/peer/{peerId}
         const peerId = decodeURIComponent(parts.slice(1).join('/'));
         showConversationDetail(peerId, true);
+    } else if (route === 'peers' && parts[1]) {
+        // Peer detail: #/peers/{peerId}
+        const peerId = decodeURIComponent(parts.slice(1).join('/'));
+        showPeerDetail(peerId, true);
+    } else if (route === 'peers') {
+        // Peer list: #/peers
+        showPeerList(true);
     } else if (route === 'profile') {
         showMyProfile(true);
     } else if (route === 'friends') {
@@ -216,11 +225,11 @@ function renderMessage(m) {
         : avatarInitial;
 
     return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
-        <div class="msg-avatar" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${avatarInner}</div>
+        <div class="msg-avatar" onclick="event.stopPropagation();navigateToPeer('${m.sender_id}')">${avatarInner}</div>
         <div class="msg-content">
             <div class="msg-header">
                 <span class="msg-badge ${kindClass}">${kindClass}</span>
-                <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();showPeerProfile('${m.sender_id}')">${senderLabel}</span>
+                <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();navigateToPeer('${m.sender_id}')">${senderLabel}</span>
                 <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
             </div>
             <div class="msg-body">${escapeHtml(m.body || '')}</div>
@@ -414,6 +423,8 @@ function hideAllViews() {
     document.getElementById('profile-view').classList.remove('visible');
     document.getElementById('profile-edit').classList.remove('visible');
     document.getElementById('friends-view').classList.remove('visible');
+    document.getElementById('peers-view').classList.remove('visible');
+    document.getElementById('peer-detail-view').classList.remove('visible');
     document.getElementById('compose-box').style.display = '';
     // Hide filters on non-timeline views
     document.querySelector('.filters').style.display = '';
@@ -1639,7 +1650,7 @@ function renderMyProfileCard() {
 }
 
 function setActiveHeaderNav(activeId) {
-    ['nav-feed', 'nav-groups', 'nav-friends', 'nav-profile'].forEach(id => {
+    ['nav-feed', 'nav-groups', 'nav-friends', 'nav-peers', 'nav-profile'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('active', id === activeId);
     });
@@ -1669,6 +1680,15 @@ function navToGroups() {
 
 function navToFriends() {
     navigateTo('friends');
+}
+
+function navToPeers() {
+    navigateTo('peers');
+}
+
+/// Navigate to the peer detail page for a given peer ID.
+function navigateToPeer(peerId) {
+    window.location.hash = '#/peers/' + encodeURIComponent(peerId);
 }
 
 async function showFriendsView(fromRoute) {
@@ -1713,6 +1733,251 @@ function highlightReply(replyId) {
 
 function navToProfile() {
     showMyProfile();
+}
+
+// ---------------------------------------------------------------------------
+// Peer list view (#/peers)
+// ---------------------------------------------------------------------------
+
+async function showPeerList(fromRoute) {
+    currentView = 'peers-view';
+    hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
+    document.getElementById('compose-box').style.display = 'none';
+    document.getElementById('peers-view').classList.add('visible');
+    setActiveHeaderNav('nav-peers');
+
+    if (!fromRoute) {
+        window.location.hash = '#/peers';
+    }
+
+    const listEl = document.getElementById('peers-list');
+    listEl.innerHTML = '<div class="loading">Loading peers…</div>';
+
+    try {
+        const allPeers = await apiGet('/api/peers');
+        // Sort by last_message_at descending (most recently active first)
+        allPeers.sort((a, b) => (b.last_message_at || 0) - (a.last_message_at || 0));
+        if (allPeers.length === 0) {
+            listEl.innerHTML = '<div class="empty">No peers yet.</div>';
+            return;
+        }
+        listEl.innerHTML = allPeers.map(p => renderPeerRow(p)).join('');
+    } catch (e) {
+        listEl.innerHTML = `<div class="error">Failed to load peers: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderPeerRow(p) {
+    const name = p.display_name || (p.peer_id.substring(0, 12) + '…');
+    const initial = name[0].toUpperCase();
+    const avatarInner = p.avatar_hash
+        ? `<img src="/api/attachments/${encodeURIComponent(p.avatar_hash)}" alt="" />`
+        : initial;
+    const onlineDot = p.online ? '<span class="online-dot" title="Online"></span>' : '';
+    const blockedBadge = p.is_blocked ? '<span class="peer-badge blocked">Blocked</span>' : '';
+    const mutedBadge = p.is_muted ? '<span class="peer-badge muted">Muted</span>' : '';
+
+    let lastMsg = '';
+    if (p.last_message_at) {
+        lastMsg = `<div class="peer-row-last-msg"><span class="peer-row-ts">${timeAgo(p.last_message_at)}</span> ${escapeHtml((p.last_message_preview || '').substring(0, 80))}</div>`;
+    }
+    let lastPost = '';
+    if (p.last_post_at) {
+        lastPost = `<div class="peer-row-last-post"><span class="peer-row-ts">${timeAgo(p.last_post_at)}</span> <em>Post:</em> ${escapeHtml((p.last_post_preview || '').substring(0, 60))}</div>`;
+    }
+
+    return `<div class="peer-row" onclick="navigateToPeer('${escapeHtml(p.peer_id)}')">
+        <div class="peer-row-avatar">${avatarInner}</div>
+        <div class="peer-row-info">
+            <div class="peer-row-name">${escapeHtml(name)} ${onlineDot}${blockedBadge}${mutedBadge}</div>
+            ${lastMsg}
+            ${lastPost}
+        </div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Peer detail view (#/peers/{peerId})
+// ---------------------------------------------------------------------------
+
+async function showPeerDetail(peerId, fromRoute) {
+    currentView = 'peer-detail';
+    currentPeerDetailId = peerId;
+    peerActivityOldestTimestamp = null;
+    hideAllViews();
+    document.querySelector('.filters').style.display = 'none';
+    document.getElementById('compose-box').style.display = 'none';
+    document.getElementById('peer-detail-view').classList.add('visible');
+    setActiveHeaderNav('nav-peers');
+
+    if (!fromRoute) {
+        window.location.hash = '#/peers/' + encodeURIComponent(peerId);
+    }
+
+    const contentEl = document.getElementById('peer-detail-content');
+    contentEl.innerHTML = '<div class="loading">Loading…</div>';
+    document.getElementById('peer-activity-section').style.display = 'none';
+
+    try {
+        const peer = await apiGet(`/api/peers/${encodeURIComponent(peerId)}`);
+        renderPeerDetail(peer);
+        await loadPeerActivity(peerId, false);
+    } catch (e) {
+        contentEl.innerHTML = `<div class="error">Failed to load peer: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderPeerDetail(peer) {
+    const contentEl = document.getElementById('peer-detail-content');
+    const name = peer.display_name || (peer.peer_id.substring(0, 16) + '…');
+    const initial = name[0].toUpperCase();
+    const avatarInner = peer.avatar_hash
+        ? `<img src="/api/attachments/${encodeURIComponent(peer.avatar_hash)}" alt="" />`
+        : initial;
+    const onlineStatus = peer.online
+        ? '<span class="peer-detail-online">● Online</span>'
+        : (peer.last_seen_online
+            ? `<span class="peer-detail-offline">Last seen ${timeAgo(peer.last_seen_online)}</span>`
+            : '<span class="peer-detail-offline">Never seen online</span>');
+
+    const blockLabel = peer.is_blocked ? 'Unblock' : 'Block';
+    const blockAction = peer.is_blocked
+        ? `unblockPeer('${escapeHtml(peer.peer_id)}')`
+        : `blockPeer('${escapeHtml(peer.peer_id)}')`;
+    const muteLabel = peer.is_muted ? 'Unmute' : 'Mute';
+    const muteAction = peer.is_muted
+        ? `unmutePeer('${escapeHtml(peer.peer_id)}')`
+        : `mutePeer('${escapeHtml(peer.peer_id)}')`;
+
+    const friendBtn = peer.is_friend
+        ? `<button class="btn-secondary" disabled>Already friends</button>`
+        : `<button class="btn-secondary" onclick="sendFriendRequestToPeer('${escapeHtml(peer.peer_id)}')">Send Friend Request</button>`;
+
+    contentEl.innerHTML = `
+        <div class="peer-detail-header">
+            <div class="peer-detail-avatar">${avatarInner}</div>
+            <div class="peer-detail-info">
+                <div class="peer-detail-name">${escapeHtml(name)}</div>
+                <div class="peer-detail-status">${onlineStatus}</div>
+                <div class="peer-detail-id-row">
+                    <code class="peer-detail-id">${escapeHtml(peer.peer_id)}</code>
+                    <button class="copy-btn" onclick="navigator.clipboard.writeText('${escapeHtml(peer.peer_id)}').then(()=>showToast('Peer ID copied'))">Copy</button>
+                </div>
+            </div>
+        </div>
+        <div class="peer-detail-actions">
+            ${friendBtn}
+            <button class="btn-secondary" onclick="requestProfileFromPeer('${escapeHtml(peer.peer_id)}')">Request Profile</button>
+            <button class="btn-secondary${peer.is_blocked ? ' btn-danger' : ''}" onclick="${blockAction}">${blockLabel}</button>
+            <button class="btn-secondary${peer.is_muted ? ' btn-warning' : ''}" onclick="${muteAction}">${muteLabel}</button>
+            ${peer.is_friend ? `<button class="btn-primary" onclick="openConversationWithPeer('${escapeHtml(peer.peer_id)}')">Send Message</button>` : ''}
+        </div>
+    `;
+}
+
+async function loadPeerActivity(peerId, append) {
+    const activitySection = document.getElementById('peer-activity-section');
+    const listEl = document.getElementById('peer-activity-list');
+    const loadMoreBtn = document.getElementById('peer-activity-load-more');
+
+    if (!append) {
+        listEl.innerHTML = '';
+        peerActivityOldestTimestamp = null;
+    }
+
+    const params = new URLSearchParams({ limit: '20' });
+    if (peerActivityOldestTimestamp) params.set('before', peerActivityOldestTimestamp);
+
+    try {
+        const msgs = await apiGet(`/api/peers/${encodeURIComponent(peerId)}/activity?${params}`);
+        activitySection.style.display = '';
+        if (msgs.length === 0 && !append) {
+            listEl.innerHTML = '<div class="empty" style="font-size:0.85rem;color:#666;">No recent activity.</div>';
+            loadMoreBtn.style.display = 'none';
+            return;
+        }
+        msgs.forEach(m => {
+            const div = document.createElement('div');
+            div.innerHTML = renderMessage(m);
+            listEl.appendChild(div.firstElementChild);
+        });
+        if (msgs.length >= 20) {
+            peerActivityOldestTimestamp = msgs[msgs.length - 1].timestamp;
+            loadMoreBtn.style.display = '';
+        } else {
+            loadMoreBtn.style.display = 'none';
+        }
+    } catch (e) {
+        activitySection.style.display = '';
+        if (!append) listEl.innerHTML = `<div class="error">Failed to load activity.</div>`;
+    }
+}
+
+async function loadMorePeerActivity() {
+    if (currentPeerDetailId) {
+        await loadPeerActivity(currentPeerDetailId, true);
+    }
+}
+
+async function blockPeer(peerId) {
+    if (!confirm('Block this peer? Their future messages will be silently discarded.')) return;
+    try {
+        await apiPost(`/api/peers/${encodeURIComponent(peerId)}/block`, {});
+        showToast('Peer blocked');
+        await showPeerDetail(peerId, true);
+    } catch (e) {
+        showToast('Failed to block: ' + e.message);
+    }
+}
+
+async function unblockPeer(peerId) {
+    try {
+        await apiPost(`/api/peers/${encodeURIComponent(peerId)}/unblock`, {});
+        showToast('Peer unblocked');
+        await showPeerDetail(peerId, true);
+    } catch (e) {
+        showToast('Failed to unblock: ' + e.message);
+    }
+}
+
+async function mutePeer(peerId) {
+    try {
+        await apiPost(`/api/peers/${encodeURIComponent(peerId)}/mute`, {});
+        showToast('Peer muted');
+        await showPeerDetail(peerId, true);
+    } catch (e) {
+        showToast('Failed to mute: ' + e.message);
+    }
+}
+
+async function unmutePeer(peerId) {
+    try {
+        await apiPost(`/api/peers/${encodeURIComponent(peerId)}/unmute`, {});
+        showToast('Peer unmuted');
+        await showPeerDetail(peerId, true);
+    } catch (e) {
+        showToast('Failed to unmute: ' + e.message);
+    }
+}
+
+async function sendFriendRequestToPeer(peerId) {
+    try {
+        await apiPost(`/api/peers/${encodeURIComponent(peerId)}/friend-request`, {});
+        showToast('Friend request sent');
+        await showPeerDetail(peerId, true);
+    } catch (e) {
+        showToast('Failed: ' + e.message);
+    }
+}
+
+async function requestProfileFromPeer(peerId) {
+    try {
+        await apiPost(`/api/peers/${encodeURIComponent(peerId)}/request-profile`, {});
+        showToast('Profile request sent');
+    } catch (e) {
+        showToast('Failed: ' + e.message);
+    }
 }
 
 function renderAvatarUploadPreview() {

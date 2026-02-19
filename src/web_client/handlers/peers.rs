@@ -1,16 +1,19 @@
 //! Peer management handlers.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::crypto::validate_hex_key;
-use crate::storage::PeerRow;
+use crate::protocol::{build_envelope_from_payload, build_meta_payload, MessageKind, MetaMessage};
+use crate::relay_transport::post_envelope;
+use crate::storage::{FriendRequestRow, PeerRow};
+use crate::web_client::config::DEFAULT_TTL_SECONDS;
 use crate::web_client::state::SharedState;
-use crate::web_client::utils::{api_error, now_secs};
+use crate::web_client::utils::{api_error, message_to_json, now_secs};
 
-/// Build the JSON representation of a peer.
+/// Build the JSON representation of a peer (without activity aggregates).
 fn peer_to_json(p: &PeerRow) -> serde_json::Value {
     serde_json::json!({
         "peer_id": p.peer_id,
@@ -21,6 +24,10 @@ fn peer_to_json(p: &PeerRow) -> serde_json::Value {
         "is_friend": p.is_friend,
         "last_seen_online": p.last_seen_online,
         "online": p.online,
+        "is_blocked": p.is_blocked,
+        "is_muted": p.is_muted,
+        "blocked_at": p.blocked_at,
+        "muted_at": p.muted_at,
     })
 }
 
@@ -39,6 +46,22 @@ pub async fn list_peers_handler(State(state): State<SharedState>) -> Response {
                         .flatten()
                         .and_then(|prof| prof.avatar_hash);
                     j["avatar_hash"] = serde_json::json!(avatar_hash);
+
+                    // Last-message / last-post aggregates
+                    if let Ok(Some((ts, preview))) = st.storage.peer_last_message(&p.peer_id) {
+                        j["last_message_at"] = serde_json::json!(ts);
+                        j["last_message_preview"] = serde_json::json!(preview);
+                    } else {
+                        j["last_message_at"] = serde_json::Value::Null;
+                        j["last_message_preview"] = serde_json::Value::Null;
+                    }
+                    if let Ok(Some((ts, preview))) = st.storage.peer_last_post(&p.peer_id) {
+                        j["last_post_at"] = serde_json::json!(ts);
+                        j["last_post_preview"] = serde_json::json!(preview);
+                    } else {
+                        j["last_post_at"] = serde_json::Value::Null;
+                        j["last_post_preview"] = serde_json::Value::Null;
+                    }
                     j
                 })
                 .collect();
@@ -54,7 +77,32 @@ pub async fn get_peer_handler(
 ) -> Response {
     let st = state.lock().await;
     match st.storage.get_peer(&peer_id) {
-        Ok(Some(p)) => (StatusCode::OK, axum::Json(peer_to_json(&p))).into_response(),
+        Ok(Some(p)) => {
+            let mut j = peer_to_json(&p);
+            let avatar_hash = st
+                .storage
+                .get_profile(&p.peer_id)
+                .ok()
+                .flatten()
+                .and_then(|prof| prof.avatar_hash);
+            j["avatar_hash"] = serde_json::json!(avatar_hash);
+
+            if let Ok(Some((ts, preview))) = st.storage.peer_last_message(&p.peer_id) {
+                j["last_message_at"] = serde_json::json!(ts);
+                j["last_message_preview"] = serde_json::json!(preview);
+            } else {
+                j["last_message_at"] = serde_json::Value::Null;
+                j["last_message_preview"] = serde_json::Value::Null;
+            }
+            if let Ok(Some((ts, preview))) = st.storage.peer_last_post(&p.peer_id) {
+                j["last_post_at"] = serde_json::json!(ts);
+                j["last_post_preview"] = serde_json::json!(preview);
+            } else {
+                j["last_post_at"] = serde_json::Value::Null;
+                j["last_post_preview"] = serde_json::Value::Null;
+            }
+            (StatusCode::OK, axum::Json(j)).into_response()
+        }
         Ok(None) => api_error(StatusCode::NOT_FOUND, "peer not found"),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -110,6 +158,10 @@ pub async fn add_peer_handler(
         online: false,
         last_profile_requested_at: None,
         last_profile_responded_at: None,
+        is_blocked: false,
+        is_muted: false,
+        blocked_at: None,
+        muted_at: None,
     };
 
     match st.storage.insert_peer(&peer_row) {
@@ -130,6 +182,284 @@ pub async fn delete_peer_handler(
         )
             .into_response(),
         Ok(false) => api_error(StatusCode::NOT_FOUND, "peer not found"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block / Mute actions
+// ---------------------------------------------------------------------------
+
+pub async fn block_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.set_peer_blocked(&peer_id, true) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "ok"})),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            api_error(StatusCode::NOT_FOUND, "peer not found")
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+pub async fn unblock_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.set_peer_blocked(&peer_id, false) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "ok"})),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            api_error(StatusCode::NOT_FOUND, "peer not found")
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+pub async fn mute_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.set_peer_muted(&peer_id, true) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "ok"})),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            api_error(StatusCode::NOT_FOUND, "peer not found")
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+pub async fn unmute_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+    match st.storage.set_peer_muted(&peer_id, false) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "ok"})),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            api_error(StatusCode::NOT_FOUND, "peer not found")
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Friend-request convenience wrapper
+// ---------------------------------------------------------------------------
+
+pub async fn peer_friend_request_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let (keypair, relay_url, existing) = {
+        let st = state.lock().await;
+
+        if peer_id == st.keypair.id {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "cannot send friend request to yourself",
+            );
+        }
+
+        if let Ok(Some(peer)) = st.storage.get_peer(&peer_id) {
+            if peer.is_friend {
+                return api_error(StatusCode::CONFLICT, "already friends with this peer");
+            }
+        } else if st.storage.get_peer(&peer_id).unwrap_or(None).is_none() {
+            return api_error(StatusCode::NOT_FOUND, "peer not found");
+        }
+
+        let existing = st
+            .storage
+            .find_request_between(&st.keypair.id, &peer_id)
+            .unwrap_or(None);
+
+        if let Some(ref ex) = existing {
+            if ex.status == "pending" {
+                return api_error(StatusCode::CONFLICT, "friend request already pending");
+            }
+        }
+
+        (st.keypair.clone(), st.relay_url.clone(), existing)
+    };
+
+    let now = now_secs();
+
+    {
+        let st = state.lock().await;
+        if let Some(ref ex) = existing {
+            if let Err(e) = st.storage.refresh_friend_request(
+                ex.id,
+                None,
+                &keypair.signing_public_key_hex,
+                &keypair.public_key_hex,
+            ) {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+        } else {
+            let fr_row = FriendRequestRow {
+                id: 0,
+                from_peer_id: keypair.id.clone(),
+                to_peer_id: peer_id.clone(),
+                status: "pending".to_string(),
+                message: None,
+                from_signing_key: keypair.signing_public_key_hex.clone(),
+                from_encryption_key: keypair.public_key_hex.clone(),
+                direction: "outgoing".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            if let Err(e) = st.storage.insert_friend_request(&fr_row) {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+        }
+    }
+
+    if let Some(ref relay) = relay_url {
+        let meta_msg = MetaMessage::FriendRequest {
+            peer_id: keypair.id.clone(),
+            signing_public_key: keypair.signing_public_key_hex.clone(),
+            encryption_public_key: keypair.public_key_hex.clone(),
+            message: None,
+        };
+        if let Ok(payload) = build_meta_payload(&meta_msg) {
+            if let Ok(envelope) = build_envelope_from_payload(
+                keypair.id.clone(),
+                peer_id.clone(),
+                None,
+                None,
+                now,
+                DEFAULT_TTL_SECONDS,
+                MessageKind::Meta,
+                None,
+                None,
+                payload,
+                &keypair.signing_private_key_hex,
+            ) {
+                let _ = post_envelope(relay, &envelope);
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "ok"})),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Profile-request convenience wrapper
+// ---------------------------------------------------------------------------
+
+pub async fn peer_request_profile_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let (keypair, relay_url) = {
+        let st = state.lock().await;
+        if st.storage.get_peer(&peer_id).unwrap_or(None).is_none() {
+            return api_error(StatusCode::NOT_FOUND, "peer not found");
+        }
+        (st.keypair.clone(), st.relay_url.clone())
+    };
+
+    let relay = match relay_url {
+        Some(r) => r,
+        None => return api_error(StatusCode::BAD_REQUEST, "no relay configured"),
+    };
+
+    let now = now_secs();
+    let meta_msg = MetaMessage::ProfileRequest {
+        peer_id: keypair.id.clone(),
+        for_peer_id: peer_id.clone(),
+    };
+
+    let payload = match build_meta_payload(&meta_msg) {
+        Ok(p) => p,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let envelope = match build_envelope_from_payload(
+        keypair.id.clone(),
+        peer_id.clone(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Meta,
+        None,
+        None,
+        payload,
+        &keypair.signing_private_key_hex,
+    ) {
+        Ok(e) => e,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    if let Err(e) = post_envelope(&relay, &envelope) {
+        return api_error(StatusCode::BAD_GATEWAY, e.to_string());
+    }
+
+    let st = state.lock().await;
+    let _ = st.storage.record_profile_request_sent(&peer_id, now);
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "ok"})),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Peer activity (recent posts/messages by this peer)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct PeerActivityQuery {
+    limit: Option<u32>,
+    before: Option<u64>,
+}
+
+pub async fn peer_activity_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+    Query(q): Query<PeerActivityQuery>,
+) -> Response {
+    let st = state.lock().await;
+
+    if st.storage.get_peer(&peer_id).unwrap_or(None).is_none() {
+        return api_error(StatusCode::NOT_FOUND, "peer not found");
+    }
+
+    let limit = q.limit.unwrap_or(20).min(100);
+    match st.storage.list_peer_activity(&peer_id, q.before, limit) {
+        Ok(msgs) => {
+            let json: Vec<serde_json::Value> = msgs
+                .iter()
+                .map(|m| message_to_json(m, &st.storage))
+                .collect();
+            (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

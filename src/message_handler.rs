@@ -185,6 +185,10 @@ impl StorageMessageHandler {
                     online: false,
                     last_profile_requested_at: None,
                     last_profile_responded_at: None,
+                    is_blocked: false,
+                    is_muted: false,
+                    blocked_at: None,
+                    muted_at: None,
                 };
                 let _ = self.storage.insert_peer(&peer_row);
 
@@ -310,6 +314,10 @@ impl StorageMessageHandler {
                 online: false,
                 last_profile_requested_at: None,
                 last_profile_responded_at: None,
+                is_blocked: false,
+                is_muted: false,
+                blocked_at: None,
+                muted_at: None,
             };
             let _ = self.storage.insert_peer(&peer_row);
 
@@ -615,6 +623,18 @@ impl StorageMessageHandler {
 impl MessageHandler for StorageMessageHandler {
     fn on_message(&mut self, envelope: &Envelope, message: &ClientMessage) -> Vec<Envelope> {
         let now = now_secs();
+
+        // Drop all messages from blocked peers (client-side enforcement; relay is untrusted).
+        if self
+            .storage
+            .get_peer(&envelope.header.sender_id)
+            .ok()
+            .flatten()
+            .map(|p| p.is_blocked)
+            .unwrap_or(false)
+        {
+            return Vec::new();
+        }
 
         // Deduplication: skip if already stored.
         if self
@@ -1137,6 +1157,10 @@ mod tests {
             online: false,
             last_profile_requested_at: None,
             last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
@@ -1245,6 +1269,10 @@ mod tests {
             online: false,
             last_profile_requested_at: None,
             last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
@@ -1282,6 +1310,10 @@ mod tests {
             online: false,
             last_profile_requested_at: None,
             last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
         };
         storage.insert_peer(&peer_row).expect("insert peer");
 
@@ -1357,5 +1389,66 @@ mod tests {
         } else {
             panic!("expected Message variant");
         }
+    }
+
+    #[test]
+    fn blocked_peer_messages_are_discarded() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        let storage = open_memory_storage();
+        // Register Alice as a blocked peer in Bob's storage.
+        let peer_row = PeerRow {
+            peer_id: alice.id.clone(),
+            display_name: None,
+            signing_public_key: alice.signing_public_key_hex.clone(),
+            encryption_public_key: Some(alice.public_key_hex.clone()),
+            added_at: 0,
+            is_friend: true,
+            last_seen_online: None,
+            online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
+            is_blocked: true,
+            is_muted: false,
+            blocked_at: Some(1_700_000_000),
+            muted_at: None,
+        };
+        storage.insert_peer(&peer_row).expect("insert peer");
+
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
+
+        let salt = [0u8; 16];
+        let envelope = build_plaintext_envelope(
+            &alice.id,
+            &bob.id,
+            None,
+            None,
+            1_700_000_100,
+            3600,
+            MessageKind::Direct,
+            None,
+            None,
+            "blocked message",
+            salt,
+            &alice.signing_private_key_hex,
+        )
+        .expect("build envelope");
+
+        let message = ClientMessage {
+            message_id: envelope.header.message_id.0.clone(),
+            sender_id: alice.id.clone(),
+            timestamp: envelope.header.timestamp,
+            body: "blocked message".to_string(),
+        };
+
+        handler.on_message(&envelope, &message);
+
+        // Message must NOT be stored.
+        let stored = handler
+            .storage()
+            .get_message(&message.message_id)
+            .expect("query ok");
+        assert!(stored.is_none(), "blocked peer's message should be discarded");
     }
 }
