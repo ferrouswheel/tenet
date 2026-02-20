@@ -281,7 +281,13 @@ impl MessageHandler for WebClientHandler {
 
         if was_stored {
             let kind_str = message_kind_str(&envelope.header.message_kind);
-            let is_known_peer = self.inner.storage().get_peer(&envelope.header.sender_id).ok().flatten().is_some();
+            let is_known_peer = self
+                .inner
+                .storage()
+                .get_peer(&envelope.header.sender_id)
+                .ok()
+                .flatten()
+                .is_some();
             let verified_str = if !is_known_peer && kind_str == "public" {
                 " (unverified - unknown sender)"
             } else {
@@ -467,7 +473,10 @@ impl MessageHandler for WebClientHandler {
 
             MetaMessage::MessageRequest { .. } => self.inner.on_meta(meta),
 
-            MetaMessage::ProfileRequest { peer_id, for_peer_id } => {
+            MetaMessage::ProfileRequest {
+                peer_id,
+                for_peer_id,
+            } => {
                 crate::tlog!(
                     "sync: received ProfileRequest from {} for {}",
                     crate::logging::peer_id(peer_id),
@@ -525,12 +534,7 @@ impl MessageHandler for WebClientHandler {
                         }
 
                         // Check if this sender is already in our peer list.
-                        let existing_peer = self
-                            .inner
-                            .storage()
-                            .get_peer(sender_id)
-                            .ok()
-                            .flatten();
+                        let existing_peer = self.inner.storage().get_peer(sender_id).ok().flatten();
 
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

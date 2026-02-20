@@ -76,25 +76,38 @@ pub async fn get_peer_handler(
     State(state): State<SharedState>,
     Path(peer_id): Path<String>,
 ) -> Response {
-    // Check if we should request the profile for this peer immediately.
-    let should_request_profile = {
+    // Check if peer exists; if not, create a placeholder.
+    let (peer_exists, should_request_profile) = {
         let st = state.lock().await;
         match st.storage.get_peer(&peer_id) {
             Ok(Some(ref p)) => {
-                let now = now_secs();
                 let has_profile = st.storage.get_profile(&p.peer_id).ok().flatten().is_some();
                 let never_requested = p.last_profile_requested_at.is_none();
                 let is_placeholder = p.signing_public_key.is_empty();
 
                 // Request if: placeholder, or never requested, or no profile exists
-                is_placeholder || never_requested || !has_profile
+                (true, is_placeholder || never_requested || !has_profile)
             }
-            _ => false,
+            Ok(None) => {
+                // Peer doesn't exist - create a placeholder
+                let now = now_secs();
+                let placeholder = create_placeholder_peer(&peer_id, now);
+                if let Ok(()) = st.storage.insert_peer(&placeholder) {
+                    crate::tlog!(
+                        "created placeholder peer {} for profile view",
+                        crate::logging::peer_id(&peer_id)
+                    );
+                }
+                (true, true) // Created placeholder, need to request profile
+            }
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
         }
     };
 
     // Send profile request if needed (do this outside the lock to avoid deadlock).
-    if should_request_profile {
+    if peer_exists && should_request_profile {
         let _ = request_profile_for_peer(&state, &peer_id).await;
     }
 
@@ -413,11 +426,23 @@ pub async fn peer_request_profile_handler(
     State(state): State<SharedState>,
     Path(peer_id): Path<String>,
 ) -> Response {
-    let (keypair, relay_url) = {
+    // Ensure peer exists; create placeholder if needed.
+    {
         let st = state.lock().await;
         if st.storage.get_peer(&peer_id).unwrap_or(None).is_none() {
-            return api_error(StatusCode::NOT_FOUND, "peer not found");
+            let now = now_secs();
+            let placeholder = create_placeholder_peer(&peer_id, now);
+            if let Ok(()) = st.storage.insert_peer(&placeholder) {
+                crate::tlog!(
+                    "created placeholder peer {} for profile request",
+                    crate::logging::peer_id(&peer_id)
+                );
+            }
         }
+    }
+
+    let (keypair, relay_url) = {
+        let st = state.lock().await;
         (st.keypair.clone(), st.relay_url.clone())
     };
 
@@ -483,12 +508,23 @@ pub async fn peer_activity_handler(
     Path(peer_id): Path<String>,
     Query(q): Query<PeerActivityQuery>,
 ) -> Response {
-    let st = state.lock().await;
-
-    if st.storage.get_peer(&peer_id).unwrap_or(None).is_none() {
-        return api_error(StatusCode::NOT_FOUND, "peer not found");
+    // Check if peer exists; if not, create a placeholder.
+    {
+        let st = state.lock().await;
+        if st.storage.get_peer(&peer_id).unwrap_or(None).is_none() {
+            // Create a placeholder peer so activity can be fetched
+            let now = now_secs();
+            let placeholder = create_placeholder_peer(&peer_id, now);
+            if let Ok(()) = st.storage.insert_peer(&placeholder) {
+                crate::tlog!(
+                    "created placeholder peer {} for activity view",
+                    crate::logging::peer_id(&peer_id)
+                );
+            }
+        }
     }
 
+    let st = state.lock().await;
     let limit = q.limit.unwrap_or(20).min(100);
     match st.storage.list_peer_activity(&peer_id, q.before, limit) {
         Ok(msgs) => {
@@ -499,6 +535,31 @@ pub async fn peer_activity_handler(
             (StatusCode::OK, axum::Json(serde_json::json!(json))).into_response()
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Create placeholder peer
+// ---------------------------------------------------------------------------
+
+/// Create a placeholder peer record for a peer we don't have locally yet.
+/// The `added_at` timestamp represents when we created this placeholder.
+fn create_placeholder_peer(peer_id: &str, now: u64) -> PeerRow {
+    PeerRow {
+        peer_id: peer_id.to_string(),
+        display_name: None,
+        signing_public_key: String::new(), // Empty until we learn it
+        encryption_public_key: None,
+        added_at: now,
+        is_friend: false,
+        last_seen_online: None,
+        online: false,
+        last_profile_requested_at: None,
+        last_profile_responded_at: None,
+        is_blocked: false,
+        is_muted: false,
+        blocked_at: None,
+        muted_at: None,
     }
 }
 

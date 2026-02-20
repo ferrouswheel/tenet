@@ -1101,9 +1101,7 @@ impl RelayClient {
                 );
                 eprintln!(
                     "DISCARDED: {} (kind={:?}, msg_id={})",
-                    reason,
-                    envelope.header.message_kind,
-                    &envelope.header.message_id.0
+                    reason, envelope.header.message_kind, &envelope.header.message_id.0
                 );
                 if let Some(ref mut h) = handler {
                     h.on_rejected(&envelope, &reason);

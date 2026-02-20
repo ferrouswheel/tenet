@@ -994,7 +994,11 @@ fn store_envelope_locked(
         if let Some(ref sender_id) = sender_id {
             push_timestamped(inner.peer_sends.entry(sender_id.clone()).or_default(), now);
             let recipient_list = if recipients.len() <= 5 {
-                recipients.iter().map(|r| format_peer_id(r)).collect::<Vec<_>>().join(", ")
+                recipients
+                    .iter()
+                    .map(|r| format_peer_id(r))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             } else {
                 format!("{} recipients", recipients.len())
             };

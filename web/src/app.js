@@ -1117,8 +1117,7 @@ function renderFriendsList() {
     el.innerHTML = peers.map(p => {
         const displayName = p.display_name || p.peer_id.substring(0, 12) + '...';
         const initial = displayName[0].toUpperCase();
-        const lastSeenTs = p.last_seen_online || p.added_at;
-        const lastSeen = lastSeenTs ? timeAgo(lastSeenTs) : 'never';
+        const lastSeen = p.last_seen_online ? timeAgo(p.last_seen_online) : 'never';
         const avatarInner = p.avatar_hash
             ? `<img src="/api/attachments/${encodeURIComponent(p.avatar_hash)}" alt="" />`
             : escapeHtml(initial);

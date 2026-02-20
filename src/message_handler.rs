@@ -973,7 +973,12 @@ impl MessageHandler for StorageMessageHandler {
         // For public messages from unknown senders, we can't verify the signature.
         // The client accepts them but marks them as unverified. Backfill will verify later
         // if we learn the sender's key (e.g., via friend request or mesh delivery).
-        let is_known_sender = self.storage.get_peer(&envelope.header.sender_id).ok().flatten().is_some();
+        let is_known_sender = self
+            .storage
+            .get_peer(&envelope.header.sender_id)
+            .ok()
+            .flatten()
+            .is_some();
         let signature_verified = if envelope.header.message_kind == MessageKind::Public {
             is_known_sender
         } else {
@@ -1272,9 +1277,17 @@ impl MessageHandler for StorageMessageHandler {
                 let mut stored_count = 0;
                 for env_val in envelopes {
                     if let Ok(envelope) = serde_json::from_value::<Envelope>(env_val.clone()) {
-                        let was_new = !self.storage.has_message(&envelope.header.message_id.0).unwrap_or(true);
+                        let was_new = !self
+                            .storage
+                            .has_message(&envelope.header.message_id.0)
+                            .unwrap_or(true);
                         self.handle_mesh_delivered_envelope(&envelope, sender_keys, now);
-                        if was_new && self.storage.has_message(&envelope.header.message_id.0).unwrap_or(false) {
+                        if was_new
+                            && self
+                                .storage
+                                .has_message(&envelope.header.message_id.0)
+                                .unwrap_or(false)
+                        {
                             stored_count += 1;
                         }
                     }
