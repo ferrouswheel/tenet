@@ -86,26 +86,37 @@ pub async fn run() {
         last_mesh_query_sent: std::collections::HashMap::new(),
     }));
 
+    // Build Axum router
+    let app = router::build_router(Arc::clone(&state));
+
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
+        .await
+        .expect("failed to bind");
+    crate::tlog!("tenet-web listening on http://{}", config.bind_addr);
+
     // Start background relay sync task
     if relay_url.is_some() {
-        // Attempt an initial connectivity check before starting the server
-        let check_state = Arc::clone(&state);
-        match sync::sync_once(&check_state).await {
-            Ok(()) => {
-                relay_connected.store(true, Ordering::Relaxed);
-                crate::tlog!("  relay status: connected");
-            }
-            Err(e) => {
-                crate::tlog!("  WARNING: relay is unreachable: {}", e);
-                crate::tlog!("  The web UI will show the relay as unavailable.");
-                crate::tlog!("  Background sync will retry with exponential backoff.");
-            }
-        }
-
         // Shared signal: the WS listener notifies this when an envelope arrives
         // so the sync loop wakes up immediately instead of waiting the full poll
         // interval.
         let notify = Arc::new(Notify::new());
+
+        // Attempt an initial connectivity check in the background
+        let check_state = Arc::clone(&state);
+        let check_relay_connected = Arc::clone(&relay_connected);
+        tokio::spawn(async move {
+            match sync::sync_once(&check_state).await {
+                Ok(()) => {
+                    check_relay_connected.store(true, Ordering::Relaxed);
+                    crate::tlog!("relay status: connected");
+                }
+                Err(e) => {
+                    crate::tlog!("WARNING: relay is unreachable: {}", e);
+                    crate::tlog!("The web UI will show the relay as unavailable.");
+                    crate::tlog!("Background sync will retry with exponential backoff.");
+                }
+            }
+        });
 
         let sync_state = Arc::clone(&state);
         let sync_notify = Arc::clone(&notify);
@@ -135,14 +146,6 @@ pub async fn run() {
             }
         });
     }
-
-    // Build Axum router
-    let app = router::build_router(state);
-
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
-        .await
-        .expect("failed to bind");
-    crate::tlog!("tenet-web listening on http://{}", config.bind_addr);
 
     axum::serve(listener, app).await.expect("server error");
 }
