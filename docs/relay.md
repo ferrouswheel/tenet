@@ -65,6 +65,9 @@ connected client in real time as they arrive, eliminating the need to poll. The 
 connects to this endpoint via `relay_ws_listen_loop` and uses a `Notify` signal to wake the sync
 loop immediately when an envelope arrives, giving near-real-time message delivery.
 
+See [flows/13-relay-websocket.md](flows/13-relay-websocket.md) for a sequence diagram of the
+full push and reconnect flow.
+
 ## Dashboard
 
 The relay serves a built-in HTML dashboard at `/` showing:
@@ -86,6 +89,8 @@ The relay serves a built-in HTML dashboard at `/` showing:
   in duplicate deliveries.
 
 ## How Peers Connect
+
+See [flows/02-peer-reconnect.md](flows/02-peer-reconnect.md) for the full sequence diagram.
 
 Peers connect to the relay using the `RelayClient` (HTTP). The connection flow is:
 

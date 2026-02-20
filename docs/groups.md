@@ -39,6 +39,10 @@ the `group_invites` table with `status = "pending"` and `direction = "outgoing"`
 
 ## Invite Flow
 
+See [flows/10-group-create-invite.md](flows/10-group-create-invite.md) for the full Mermaid
+sequence diagram and [flows/11-group-message.md](flows/11-group-message.md) for group message
+sending and receiving.
+
 ```
 Creator                        Relay                       Recipient
   |                              |                              |
