@@ -156,6 +156,9 @@ At this point, both peers have each other's keys and can exchange fully encrypte
 
 ## Sequence Diagram
 
+See [flows/01-add-friend.md](flows/01-add-friend.md) for the full Mermaid sequence diagram,
+including the block/ignore variants and security notes.
+
 ```
 Initiator                     Relay                      Recipient
     |                           |                            |

@@ -76,6 +76,8 @@ inner envelope that only the storage peer can decrypt while it holds the message
 
 ## Protocol Flows
 
+> Mermaid sequence diagrams for all major flows are in [docs/flows/](flows/README.md).
+
 ### Send
 
 1. Sender composes payload and selects recipients.
@@ -108,6 +110,8 @@ inner envelope that only the storage peer can decrypt while it holds the message
 3. Keep latest-seen metadata (e.g., most recent relay source) for diagnostics.
 
 ### Peer Store-and-Forward
+
+See [flows/04-store-and-forward.md](flows/04-store-and-forward.md) for the full sequence diagram.
 
 1. Sender selects a mutual friend `C` when recipient `B` is offline.
 2. Sender builds a normal direct envelope for `B`.
