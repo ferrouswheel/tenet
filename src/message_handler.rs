@@ -969,6 +969,46 @@ impl MessageHandler for StorageMessageHandler {
         } else {
             None
         };
+
+        // For public messages from unknown senders, we can't verify the signature.
+        // The client accepts them but marks them as unverified. Backfill will verify later
+        // if we learn the sender's key (e.g., via friend request or mesh delivery).
+        let is_known_sender = self.storage.get_peer(&envelope.header.sender_id).ok().flatten().is_some();
+        let signature_verified = if envelope.header.message_kind == MessageKind::Public {
+            is_known_sender
+        } else {
+            // Non-public messages only reach the handler if signature was verified by the client.
+            true
+        };
+
+        // For public messages from unknown senders, create a placeholder peer so the UI
+        // can display them. The peer will have no signing key until we learn it via mesh.
+        if envelope.header.message_kind == MessageKind::Public && !is_known_sender {
+            let placeholder = PeerRow {
+                peer_id: envelope.header.sender_id.clone(),
+                display_name: None,
+                signing_public_key: String::new(), // Empty until we learn it
+                encryption_public_key: None,
+                added_at: now,
+                is_friend: false,
+                last_seen_online: None,
+                online: false,
+                last_profile_requested_at: None,
+                last_profile_responded_at: None,
+                is_blocked: false,
+                is_muted: false,
+                blocked_at: None,
+                muted_at: None,
+            };
+            // Ignore errors - peer might already exist or insert might fail.
+            if self.storage.insert_peer(&placeholder).is_ok() {
+                crate::tlog!(
+                    "handler: created placeholder peer {} (unverified public message sender)",
+                    crate::logging::peer_id(&envelope.header.sender_id)
+                );
+            }
+        }
+
         let row = MessageRow {
             message_id: message.message_id.clone(),
             sender_id: message.sender_id.clone(),
@@ -982,7 +1022,7 @@ impl MessageHandler for StorageMessageHandler {
             is_read: false,
             raw_envelope: raw_env,
             reply_to: envelope.header.reply_to.clone(),
-            signature_verified: true,
+            signature_verified,
         };
 
         if self.storage.insert_message(&row).is_ok() {
@@ -1104,10 +1144,16 @@ impl MessageHandler for StorageMessageHandler {
                     .storage
                     .list_public_message_ids_since(window_start, MAX_MESH_IDS)
                     .unwrap_or_default();
+                crate::tlog!(
+                    "mesh: received MessageRequest from {} (since {}s ago) — offering {} public message(s)",
+                    crate::logging::peer_id(requester_id),
+                    now.saturating_sub(window_start),
+                    ids.len()
+                );
                 if !ids.is_empty() {
                     let response = MetaMessage::MeshAvailable {
                         peer_id: self.my_peer_id.clone(),
-                        message_ids: ids,
+                        message_ids: ids.clone(),
                         since_timestamp: window_start,
                     };
                     if let Some(env) = self.build_meta_envelope(requester_id, now, &response) {
@@ -1127,10 +1173,17 @@ impl MessageHandler for StorageMessageHandler {
                     .take(MAX_MESH_REQUEST_IDS)
                     .cloned()
                     .collect();
+                crate::tlog!(
+                    "mesh: received MeshAvailable from {} — {} available, {} new — requesting {} message(s)",
+                    crate::logging::peer_id(sender_id),
+                    message_ids.len(),
+                    unknown.len(),
+                    unknown.len()
+                );
                 if !unknown.is_empty() {
                     let request = MetaMessage::MeshRequest {
                         peer_id: self.my_peer_id.clone(),
-                        message_ids: unknown,
+                        message_ids: unknown.clone(),
                     };
                     if let Some(env) = self.build_meta_envelope(sender_id, now, &request) {
                         outgoing.push(env);
@@ -1146,6 +1199,8 @@ impl MessageHandler for StorageMessageHandler {
                 let mut batch: Vec<serde_json::Value> = Vec::new();
                 // Collect signing keys for senders we know.
                 let mut sender_keys: HashMap<String, String> = HashMap::new();
+                let mut found_count = 0;
+                let mut missing_raw_envelope = 0;
 
                 for id in &ids {
                     if let Ok(Some(row)) = self.storage.get_message(id) {
@@ -1162,6 +1217,7 @@ impl MessageHandler for StorageMessageHandler {
                                     );
                                 }
                                 batch.push(val);
+                                found_count += 1;
                                 if batch.len() >= MAX_MESH_BATCH {
                                     // Flush this batch and start a new one.
                                     let delivery = MetaMessage::MeshDelivery {
@@ -1176,9 +1232,19 @@ impl MessageHandler for StorageMessageHandler {
                                     }
                                 }
                             }
+                        } else {
+                            missing_raw_envelope += 1;
                         }
                     }
                 }
+                crate::tlog!(
+                    "mesh: received MeshRequest from {} — {} requested, {} found{} — delivering {} message(s)",
+                    crate::logging::peer_id(requester_id),
+                    ids.len(),
+                    found_count,
+                    if missing_raw_envelope > 0 { format!(", {} missing raw_envelope", missing_raw_envelope) } else { String::new() },
+                    found_count
+                );
                 // Flush remaining batch.
                 if !batch.is_empty() {
                     let delivery = MetaMessage::MeshDelivery {
@@ -1192,22 +1258,62 @@ impl MessageHandler for StorageMessageHandler {
                 }
             }
             MetaMessage::MeshDelivery {
+                peer_id: sender_id,
                 envelopes,
                 sender_keys,
-                ..
             } => {
+                crate::tlog!(
+                    "mesh: received MeshDelivery from {} — {} envelope(s), {} sender key(s)",
+                    crate::logging::peer_id(sender_id),
+                    envelopes.len(),
+                    sender_keys.len()
+                );
                 // Validate and store delivered public envelopes.
+                let mut stored_count = 0;
                 for env_val in envelopes {
                     if let Ok(envelope) = serde_json::from_value::<Envelope>(env_val.clone()) {
+                        let was_new = !self.storage.has_message(&envelope.header.message_id.0).unwrap_or(true);
                         self.handle_mesh_delivered_envelope(&envelope, sender_keys, now);
+                        if was_new && self.storage.has_message(&envelope.header.message_id.0).unwrap_or(false) {
+                            stored_count += 1;
+                        }
                     }
                 }
+                if stored_count > 0 {
+                    crate::tlog!(
+                        "mesh: stored {} new public message(s) from {}",
+                        stored_count,
+                        crate::logging::peer_id(sender_id)
+                    );
+                }
             }
-            MetaMessage::ProfileRequest { for_peer_id, .. } => {
+            MetaMessage::ProfileRequest {
+                peer_id: requester_id,
+                for_peer_id,
+            } => {
                 if for_peer_id == &self.my_peer_id {
-                    if let Some(env) = self.build_own_profile_envelope(now) {
-                        outgoing.push(env);
+                    match self.build_own_profile_envelope(now) {
+                        Some(env) => {
+                            outgoing.push(env);
+                            crate::tlog!(
+                                "profile: sending profile to {} in response to ProfileRequest",
+                                crate::logging::peer_id(requester_id)
+                            );
+                        }
+                        None => {
+                            crate::tlog!(
+                                "profile: received ProfileRequest from {} but no profile configured",
+                                crate::logging::peer_id(requester_id)
+                            );
+                        }
                     }
+                } else {
+                    crate::tlog!(
+                        "profile: ignoring ProfileRequest from {} (requested {} but I am {})",
+                        crate::logging::peer_id(requester_id),
+                        crate::logging::peer_id(for_peer_id),
+                        crate::logging::peer_id(&self.my_peer_id)
+                    );
                 }
             }
             MetaMessage::GroupInvite {
@@ -2189,5 +2295,105 @@ mod tests {
             stored.raw_envelope.is_some(),
             "public messages must store raw_envelope for forwarding"
         );
+    }
+
+    #[test]
+    fn profile_request_response_flow() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+
+        // Bob's storage with a profile configured
+        let bob_storage = open_memory_storage();
+        bob_storage
+            .upsert_profile(&crate::storage::ProfileRow {
+                user_id: bob.id.clone(),
+                display_name: Some("Bob Smith".to_string()),
+                bio: Some("I am Bob".to_string()),
+                avatar_hash: None,
+                public_fields: "{}".to_string(),
+                friends_fields: "{}".to_string(),
+                updated_at: 1_700_000_000,
+            })
+            .unwrap();
+
+        let mut bob_handler = StorageMessageHandler::new(bob_storage, bob.clone());
+
+        // Alice sends ProfileRequest to Bob
+        let now = 1_700_000_000u64;
+        let profile_request = MetaMessage::ProfileRequest {
+            peer_id: alice.id.clone(),
+            for_peer_id: bob.id.clone(),
+        };
+
+        // Bob receives the ProfileRequest and should respond with his profile
+        let outgoing = bob_handler.on_meta(&profile_request);
+
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "Bob should return 1 profile response envelope"
+        );
+
+        let response_env = &outgoing[0];
+        assert_eq!(
+            response_env.header.message_kind,
+            MessageKind::Public,
+            "Profile response should be a Public message"
+        );
+        assert_eq!(
+            response_env.header.recipient_id, "*",
+            "Profile response should be broadcast to *"
+        );
+
+        // Verify the response contains Bob's profile
+        let body = &response_env.payload.body;
+        let profile_json: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(profile_json["type"], "tenet.profile");
+        assert_eq!(profile_json["user_id"], bob.id);
+        assert_eq!(profile_json["display_name"], "Bob Smith");
+        assert_eq!(profile_json["bio"], "I am Bob");
+
+        // Alice receives Bob's profile response
+        let alice_storage = open_memory_storage();
+        alice_storage
+            .insert_peer(&PeerRow {
+                peer_id: bob.id.clone(),
+                display_name: None,
+                signing_public_key: bob.signing_public_key_hex.clone(),
+                encryption_public_key: Some(bob.public_key_hex.clone()),
+                added_at: 0,
+                is_friend: false,
+                last_seen_online: None,
+                online: false,
+                last_profile_requested_at: None,
+                last_profile_responded_at: None,
+                is_blocked: false,
+                is_muted: false,
+                blocked_at: None,
+                muted_at: None,
+            })
+            .unwrap();
+
+        let mut alice_handler = StorageMessageHandler::new(alice_storage, alice.clone());
+
+        let client_msg = ClientMessage {
+            message_id: response_env.header.message_id.0.clone(),
+            sender_id: bob.id.clone(),
+            timestamp: now,
+            body: body.clone(),
+        };
+
+        alice_handler.on_message(response_env, &client_msg);
+
+        // Verify Alice now has Bob's profile stored
+        let stored_profile = alice_handler
+            .storage()
+            .get_profile(&bob.id)
+            .unwrap()
+            .expect("Bob's profile should be stored");
+
+        assert_eq!(stored_profile.display_name, Some("Bob Smith".to_string()));
+        assert_eq!(stored_profile.bio, Some("I am Bob".to_string()));
     }
 }

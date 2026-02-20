@@ -341,7 +341,7 @@ pub async fn send_public_handler(
             received_at: now,
             ttl_seconds: DEFAULT_TTL_SECONDS,
             is_read: true,
-            raw_envelope: None,
+            raw_envelope: Some(serde_json::to_string(&envelope).unwrap_or_default()),
             reply_to: None,
             signature_verified: true,
         });

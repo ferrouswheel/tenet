@@ -958,6 +958,17 @@ impl RelayClient {
             });
         }
 
+        // Log what message kinds we fetched
+        for env in &envelopes {
+            crate::tlog!(
+                "DEBUG sync_inbox: fetched envelope kind={:?} sender={} recipient={} msg_id={}",
+                env.header.message_kind,
+                &env.header.sender_id[..8.min(env.header.sender_id.len())],
+                &env.header.recipient_id[..8.min(env.header.recipient_id.len())],
+                &env.header.message_id.0[..8.min(env.header.message_id.0.len())]
+            );
+        }
+
         // Take the handler out temporarily so we can mutate self (seen, feed)
         // while also calling handler methods, then put it back afterwards.
         let mut handler = self.handler.take();
@@ -973,6 +984,12 @@ impl RelayClient {
         for envelope in envelopes {
             // --- Deduplication ---
             if self.seen.contains(&envelope.header.message_id.0) {
+                eprintln!(
+                    "DISCARDED: duplicate message (kind={:?}, sender={}, msg_id={})",
+                    envelope.header.message_kind,
+                    &envelope.header.sender_id,
+                    &envelope.header.message_id.0
+                );
                 events.push(SyncEvent {
                     envelope,
                     outcome: SyncEventOutcome::Duplicate,
@@ -986,6 +1003,13 @@ impl RelayClient {
                 .timestamp
                 .saturating_add(envelope.header.ttl_seconds);
             if now > expires_at {
+                eprintln!(
+                    "DISCARDED: TTL expired (kind={:?}, sender={}, msg_id={}, expired {} seconds ago)",
+                    envelope.header.message_kind,
+                    &envelope.header.sender_id,
+                    &envelope.header.message_id.0,
+                    now.saturating_sub(expires_at)
+                );
                 events.push(SyncEvent {
                     envelope,
                     outcome: SyncEventOutcome::TtlExpired,
@@ -999,7 +1023,14 @@ impl RelayClient {
                     Ok(meta) => {
                         if let Some(ref mut h) = handler {
                             for env in h.on_meta(&meta) {
-                                let _ = self.post_envelope(&env);
+                                if let Err(e) = self.post_envelope(&env) {
+                                    eprintln!(
+                                        "ERROR: failed to post meta response envelope (kind: {:?}, recipient: {}): {}",
+                                        env.header.message_kind,
+                                        env.header.recipient_id,
+                                        e
+                                    );
+                                }
                             }
                         }
                         SyncEventOutcome::Meta(meta)
@@ -1024,46 +1055,80 @@ impl RelayClient {
                 .get_signing_key(&envelope.header.sender_id)
                 .map(|s| s.to_string());
 
-            let signing_key = match signing_key {
-                Some(k) => k,
-                None => {
-                    let reason = format!(
-                        "unknown sender: {} (cannot verify signature)",
-                        envelope.header.sender_id
-                    );
-                    if let Some(ref mut h) = handler {
-                        h.on_rejected(&envelope, &reason);
-                    }
-                    errors.push(reason.clone());
-                    events.push(SyncEvent {
-                        envelope,
-                        outcome: SyncEventOutcome::UnknownSender,
-                    });
-                    continue;
-                }
-            };
+            // Public messages can come from unknown senders (relay broadcast).
+            // For known senders, verify signature. For unknown senders, accept
+            // but mark as unverified (handler can decide what to do).
+            let is_public = envelope.header.message_kind == MessageKind::Public;
 
-            if let Err(e) = envelope
-                .header
-                .verify_signature(envelope.version, &signing_key)
-            {
-                let reason = format!("invalid header signature: {e:?}");
+            if let Some(ref signing_key) = signing_key {
+                // Known sender: verify signature (skip if key is empty - placeholder peer)
+                if !signing_key.is_empty() {
+                    if let Err(e) = envelope
+                        .header
+                        .verify_signature(envelope.version, signing_key)
+                    {
+                        let reason = format!("invalid header signature: {e:?}");
+                        eprintln!(
+                            "DISCARDED: {} (kind={:?}, sender={}, msg_id={})",
+                            reason,
+                            envelope.header.message_kind,
+                            &envelope.header.sender_id,
+                            &envelope.header.message_id.0
+                        );
+                        if let Some(ref mut h) = handler {
+                            h.on_rejected(&envelope, &reason);
+                        }
+                        errors.push(reason.clone());
+                        events.push(SyncEvent {
+                            envelope,
+                            outcome: SyncEventOutcome::InvalidSignature { reason },
+                        });
+                        continue;
+                    }
+                } else {
+                    eprintln!(
+                        "INFO: skipping signature verification for placeholder peer {} (kind={:?}, msg_id={})",
+                        &envelope.header.sender_id,
+                        envelope.header.message_kind,
+                        &envelope.header.message_id.0
+                    );
+                }
+            } else if !is_public {
+                // Unknown sender and NOT a public message: reject
+                let reason = format!(
+                    "unknown sender: {} (cannot verify signature)",
+                    envelope.header.sender_id
+                );
+                eprintln!(
+                    "DISCARDED: {} (kind={:?}, msg_id={})",
+                    reason,
+                    envelope.header.message_kind,
+                    &envelope.header.message_id.0
+                );
                 if let Some(ref mut h) = handler {
                     h.on_rejected(&envelope, &reason);
                 }
                 errors.push(reason.clone());
                 events.push(SyncEvent {
                     envelope,
-                    outcome: SyncEventOutcome::InvalidSignature { reason },
+                    outcome: SyncEventOutcome::UnknownSender,
                 });
                 continue;
             }
+            // If unknown sender but IS public: accept it (will be marked unverified in storage)
 
             // --- Decrypt / extract body based on message kind ---
             let body_result = self.extract_body(&envelope);
 
             match body_result {
                 Err(reason) => {
+                    eprintln!(
+                        "DISCARDED: decryption failed: {} (kind={:?}, sender={}, msg_id={})",
+                        reason,
+                        envelope.header.message_kind,
+                        &envelope.header.sender_id,
+                        &envelope.header.message_id.0
+                    );
                     if let Some(ref mut h) = handler {
                         h.on_rejected(&envelope, &reason);
                     }

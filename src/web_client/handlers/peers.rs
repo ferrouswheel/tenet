@@ -76,6 +76,29 @@ pub async fn get_peer_handler(
     State(state): State<SharedState>,
     Path(peer_id): Path<String>,
 ) -> Response {
+    // Check if we should request the profile for this peer immediately.
+    let should_request_profile = {
+        let st = state.lock().await;
+        match st.storage.get_peer(&peer_id) {
+            Ok(Some(ref p)) => {
+                let now = now_secs();
+                let has_profile = st.storage.get_profile(&p.peer_id).ok().flatten().is_some();
+                let never_requested = p.last_profile_requested_at.is_none();
+                let is_placeholder = p.signing_public_key.is_empty();
+
+                // Request if: placeholder, or never requested, or no profile exists
+                is_placeholder || never_requested || !has_profile
+            }
+            _ => false,
+        }
+    };
+
+    // Send profile request if needed (do this outside the lock to avoid deadlock).
+    if should_request_profile {
+        let _ = request_profile_for_peer(&state, &peer_id).await;
+    }
+
+    // Return peer data.
     let st = state.lock().await;
     match st.storage.get_peer(&peer_id) {
         Ok(Some(p)) => {
@@ -477,4 +500,76 @@ pub async fn peer_activity_handler(
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Request profile for a specific peer
+// ---------------------------------------------------------------------------
+
+/// Send a ProfileRequest to the specified peer immediately.
+/// Called when the user views a peer's profile page.
+async fn request_profile_for_peer(state: &SharedState, peer_id: &str) -> Result<(), String> {
+    let (keypair, relay_url, db_path) = {
+        let st = state.lock().await;
+        let relay_url = st
+            .relay_url
+            .clone()
+            .ok_or_else(|| "no relay configured".to_string())?;
+        (st.keypair.clone(), relay_url, st.db_path.clone())
+    };
+
+    let storage = crate::storage::Storage::open(&db_path)
+        .map_err(|e| format!("profile request storage: {e}"))?;
+    let now = now_secs();
+
+    let meta_msg = MetaMessage::ProfileRequest {
+        peer_id: keypair.id.clone(),
+        for_peer_id: peer_id.to_string(),
+    };
+
+    let payload = build_meta_payload(&meta_msg).map_err(|e| e.to_string())?;
+
+    let envelope = build_envelope_from_payload(
+        keypair.id.clone(),
+        peer_id.to_string(),
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Meta,
+        None,
+        None,
+        payload,
+        &keypair.signing_private_key_hex,
+    )
+    .map_err(|e| e.to_string())?;
+
+    match post_envelope(&relay_url, &envelope) {
+        Ok(()) => {
+            crate::tlog!(
+                "profile request (on-demand): POST successful to relay {} for peer {} (message_id: {})",
+                relay_url,
+                crate::logging::peer_id(peer_id),
+                crate::logging::msg_id(&envelope.header.message_id.0)
+            );
+        }
+        Err(e) => {
+            crate::tlog!(
+                "profile request (on-demand): POST failed to relay {} for peer {}: {}",
+                relay_url,
+                crate::logging::peer_id(peer_id),
+                e
+            );
+            return Err(e.to_string());
+        }
+    }
+
+    if let Err(e) = storage.record_profile_request_sent(peer_id, now) {
+        crate::tlog!(
+            "profile request (on-demand): failed to record request: {}",
+            e
+        );
+    }
+
+    Ok(())
 }

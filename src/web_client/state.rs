@@ -24,6 +24,10 @@ pub enum WsEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
     },
+    PeerAdded {
+        peer_id: String,
+        signing_public_key: String,
+    },
     PeerOnline {
         peer_id: String,
     },

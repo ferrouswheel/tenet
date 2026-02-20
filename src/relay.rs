@@ -993,13 +993,19 @@ fn store_envelope_locked(
 
         if let Some(ref sender_id) = sender_id {
             push_timestamped(inner.peer_sends.entry(sender_id.clone()).or_default(), now);
+            let recipient_list = if recipients.len() <= 5 {
+                recipients.iter().map(|r| format_peer_id(r)).collect::<Vec<_>>().join(", ")
+            } else {
+                format!("{} recipients", recipients.len())
+            };
             log_message(
                 config,
                 format!(
-                    "relay: broadcast {} -> {} peers (message_id: {})",
+                    "relay: broadcast {} -> [{}] (message_id: {}, total known peers: {})",
                     format_peer_id(sender_id),
-                    recipients.len(),
-                    format_message_id(&message_id)
+                    recipient_list,
+                    format_message_id(&message_id),
+                    inner.peer_last_seen.len()
                 ),
             );
         }

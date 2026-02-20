@@ -221,6 +221,12 @@ impl MessageHandler for WebClientHandler {
         let outgoing = self.inner.on_message(envelope, message);
 
         if !was_new {
+            crate::tlog!(
+                "DISCARDED: duplicate message already stored (kind={}, sender={}, msg_id={})",
+                message_kind_str(&envelope.header.message_kind),
+                crate::logging::peer_id(&envelope.header.sender_id),
+                crate::logging::msg_id(&message.message_id)
+            );
             return outgoing; // Already stored — nothing to broadcast.
         }
 
@@ -236,6 +242,11 @@ impl MessageHandler for WebClientHandler {
                         .unwrap_or(&envelope.header.sender_id)
                         .to_string();
                     if let Ok(Some(profile)) = self.inner.storage().get_profile(&user_id) {
+                        crate::tlog!(
+                            "profile: received profile update from {} (display_name: {:?})",
+                            crate::logging::peer_id(&user_id),
+                            profile.display_name
+                        );
                         let _ = self.ws_tx.send(WsEvent::ProfileUpdated {
                             peer_id: profile.user_id.clone(),
                             display_name: profile.display_name.clone(),
@@ -253,18 +264,35 @@ impl MessageHandler for WebClientHandler {
         }
 
         // Regular message — check if it was actually stored (not a dedup at handler level).
-        if self
+        let was_stored = self
             .inner
             .storage()
             .has_message(&message.message_id)
-            .unwrap_or(false)
-        {
-            let kind_str = message_kind_str(&envelope.header.message_kind);
-            crate::tlog!(
-                "sync: received {} message from {} (id={})",
-                kind_str,
+            .unwrap_or(false);
+
+        if !was_stored {
+            eprintln!(
+                "INFO: message not stored by handler (kind={}, sender={}, msg_id={}) - may be special type or handler dedup",
+                message_kind_str(&envelope.header.message_kind),
                 crate::logging::peer_id(&envelope.header.sender_id),
                 crate::logging::msg_id(&message.message_id)
+            );
+        }
+
+        if was_stored {
+            let kind_str = message_kind_str(&envelope.header.message_kind);
+            let is_known_peer = self.inner.storage().get_peer(&envelope.header.sender_id).ok().flatten().is_some();
+            let verified_str = if !is_known_peer && kind_str == "public" {
+                " (unverified - unknown sender)"
+            } else {
+                ""
+            };
+            crate::tlog!(
+                "sync: received {} message from {} (id={}){}",
+                kind_str,
+                crate::logging::peer_id(&envelope.header.sender_id),
+                crate::logging::msg_id(&message.message_id),
+                verified_str
             );
 
             let body = self
@@ -439,7 +467,14 @@ impl MessageHandler for WebClientHandler {
 
             MetaMessage::MessageRequest { .. } => self.inner.on_meta(meta),
 
-            MetaMessage::ProfileRequest { .. } => self.inner.on_meta(meta),
+            MetaMessage::ProfileRequest { peer_id, for_peer_id } => {
+                crate::tlog!(
+                    "sync: received ProfileRequest from {} for {}",
+                    crate::logging::peer_id(peer_id),
+                    crate::logging::peer_id(for_peer_id)
+                );
+                self.inner.on_meta(meta)
+            }
 
             // Mesh protocol: delegate storage + response-building to the inner
             // handler.  No additional WebSocket events needed.
@@ -478,16 +513,80 @@ impl MessageHandler for WebClientHandler {
                             });
                         }
                     }
-                    // Trigger backfill for any sender keys provided.
+                    // Add unknown senders to peer list and trigger backfill.
                     for (sender_id, key_hex) in sender_keys {
                         let key_bytes = match hex::decode(key_hex) {
                             Ok(b) => b,
                             Err(_) => continue,
                         };
                         let derived = crate::crypto::derive_user_id_from_public_key(&key_bytes);
-                        if derived == *sender_id {
-                            self.inner.try_backfill_signatures(sender_id, key_hex);
+                        if derived != *sender_id {
+                            continue; // Invalid key - skip
                         }
+
+                        // Check if this sender is already in our peer list.
+                        let existing_peer = self
+                            .inner
+                            .storage()
+                            .get_peer(sender_id)
+                            .ok()
+                            .flatten();
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        if let Some(mut peer) = existing_peer {
+                            // Peer exists - update their signing key if it's empty (placeholder).
+                            if peer.signing_public_key.is_empty() {
+                                peer.signing_public_key = key_hex.clone();
+                                peer.encryption_public_key = Some(key_hex.clone());
+                                // Delete and re-insert to update (no update_peer function exists).
+                                let _ = self.inner.storage().delete_peer(sender_id);
+                                if self.inner.storage().insert_peer(&peer).is_ok() {
+                                    crate::tlog!(
+                                        "mesh: updated placeholder peer {} with signing key from MeshDelivery",
+                                        crate::logging::peer_id(sender_id)
+                                    );
+                                    let _ = self.ws_tx.send(WsEvent::PeerAdded {
+                                        peer_id: sender_id.clone(),
+                                        signing_public_key: key_hex.clone(),
+                                    });
+                                }
+                            }
+                        } else {
+                            // Peer doesn't exist - add them.
+                            let peer_row = crate::storage::PeerRow {
+                                peer_id: sender_id.clone(),
+                                display_name: None,
+                                signing_public_key: key_hex.clone(),
+                                encryption_public_key: Some(key_hex.clone()),
+                                added_at: now,
+                                is_friend: false,
+                                last_seen_online: None,
+                                online: false,
+                                last_profile_requested_at: None,
+                                last_profile_responded_at: None,
+                                is_blocked: false,
+                                is_muted: false,
+                                blocked_at: None,
+                                muted_at: None,
+                            };
+                            if self.inner.storage().insert_peer(&peer_row).is_ok() {
+                                crate::tlog!(
+                                    "mesh: auto-added peer {} from MeshDelivery sender_keys",
+                                    crate::logging::peer_id(sender_id)
+                                );
+                                let _ = self.ws_tx.send(WsEvent::PeerAdded {
+                                    peer_id: sender_id.clone(),
+                                    signing_public_key: key_hex.clone(),
+                                });
+                            }
+                        }
+
+                        // Backfill signatures for any previously unverified messages.
+                        self.inner.try_backfill_signatures(sender_id, key_hex);
                     }
                     return outgoing;
                 }
@@ -750,6 +849,7 @@ pub async fn send_mesh_queries(state: &SharedState) -> Result<(), String> {
     };
 
     let since = now.saturating_sub(DEFAULT_MESH_WINDOW_SECS);
+    let mut sent_count = 0;
 
     for peer in &peers {
         // Check and update the per-peer rate-limit.
@@ -794,7 +894,17 @@ pub async fn send_mesh_queries(state: &SharedState) -> Result<(), String> {
                 crate::logging::peer_id(&peer.peer_id),
                 e
             );
+        } else {
+            sent_count += 1;
         }
+    }
+
+    if sent_count > 0 {
+        crate::tlog!(
+            "mesh: sent MessageRequest to {} peer(s) (since {}s ago)",
+            sent_count,
+            now.saturating_sub(since)
+        );
     }
 
     Ok(())
