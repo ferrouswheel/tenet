@@ -229,6 +229,16 @@ pub fn resolve_identity(
 
             let stored_relay = first_enabled_relay(&storage);
 
+            // Warn if directory name doesn't match peer ID
+            let current_short = short_id(&row.id);
+            if entry.short_id != current_short {
+                crate::tlog!(
+                    "  warning: identity directory '{}' doesn't match current peer ID prefix '{}'",
+                    entry.short_id,
+                    current_short
+                );
+            }
+
             Ok(ResolvedIdentity {
                 keypair: row.to_stored_keypair(),
                 storage,
@@ -276,6 +286,16 @@ pub fn resolve_identity(
                         .ok_or_else(|| IdentityError::NotFound(entry.short_id.clone()))?;
 
                     let stored_relay = first_enabled_relay(&storage);
+
+                    // Warn if directory name doesn't match peer ID
+                    let current_short = short_id(&row.id);
+                    if entry.short_id != current_short {
+                        crate::tlog!(
+                            "  warning: identity directory '{}' doesn't match current peer ID prefix '{}'",
+                            entry.short_id,
+                            current_short
+                        );
+                    }
 
                     Ok(ResolvedIdentity {
                         keypair: row.to_stored_keypair(),
