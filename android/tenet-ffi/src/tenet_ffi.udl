@@ -1,0 +1,120 @@
+// UniFFI Interface Definition for Tenet Android FFI
+// Phase 1: Identity init, sync, list/send messages, peer management
+
+namespace tenet_ffi {};
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+[Error]
+enum TenetError {
+    "Init",
+    "Sync",
+    "Send",
+    "Storage",
+    "NotFound",
+    "InvalidKey",
+};
+
+// ---------------------------------------------------------------------------
+// Data transfer types
+// ---------------------------------------------------------------------------
+
+dictionary FfiMessage {
+    string message_id;
+    string sender_id;
+    string? recipient_id;
+    string kind;
+    string? group_id;
+    string body;
+    i64 timestamp;
+    boolean is_read;
+    string? reply_to;
+};
+
+dictionary FfiPeer {
+    string peer_id;
+    string? display_name;
+    boolean is_online;
+    boolean is_blocked;
+    boolean is_muted;
+    boolean is_friend;
+    i64? last_seen;
+};
+
+dictionary FfiSyncResult {
+    u32 fetched;
+    u32 new_messages;
+    sequence<string> errors;
+};
+
+// ---------------------------------------------------------------------------
+// TenetClient interface
+//
+// Wraps RelayClient + Storage behind a Mutex.  All calls are synchronous —
+// Kotlin callers dispatch to Dispatchers.IO so the FFI blocking never touches
+// the main thread.
+// ---------------------------------------------------------------------------
+
+interface TenetClient {
+    // Initialize (or load) an identity in data_dir and set the relay URL.
+    // Creates a new identity if none exists; loads the existing one otherwise.
+    [Throws=TenetError]
+    constructor(string data_dir, string relay_url);
+
+    // Return the local peer ID (derived from the Ed25519 signing public key).
+    string my_peer_id();
+
+    // Return the configured relay URL.
+    string relay_url();
+
+    // ---------------------------------------------------------------------------
+    // Messages
+    // ---------------------------------------------------------------------------
+
+    // List messages from the local database.
+    // kind: optional filter — "public" | "direct" | "friend_group"
+    // limit: max rows to return (use 50 as a sensible default)
+    // before_ts: optional upper-bound timestamp for pagination (pass null for latest)
+    [Throws=TenetError]
+    sequence<FfiMessage> list_messages(string? kind, u32 limit, i64? before_ts);
+
+    // Mark a message as read.
+    [Throws=TenetError]
+    void mark_read(string message_id);
+
+    // Send an end-to-end encrypted direct message to a known peer.
+    [Throws=TenetError]
+    void send_direct(string recipient_id, string body);
+
+    // Send a public (broadcast) message.
+    [Throws=TenetError]
+    void send_public(string body);
+
+    // ---------------------------------------------------------------------------
+    // Sync
+    // ---------------------------------------------------------------------------
+
+    // Fetch envelopes from the relay, decrypt and persist them.
+    // Returns a summary of what was fetched and how many were new.
+    [Throws=TenetError]
+    FfiSyncResult sync();
+
+    // ---------------------------------------------------------------------------
+    // Peers
+    // ---------------------------------------------------------------------------
+
+    // List all known peers.
+    [Throws=TenetError]
+    sequence<FfiPeer> list_peers();
+
+    // Add a peer by peer ID and their Ed25519 signing public key (hex).
+    // display_name is stored locally for UI purposes only.
+    [Throws=TenetError]
+    void add_peer(string peer_id, string? display_name, string signing_public_key_hex);
+
+    // Remove a peer and all associated data.
+    [Throws=TenetError]
+    void remove_peer(string peer_id);
+};
