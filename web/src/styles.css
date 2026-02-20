@@ -1814,6 +1814,28 @@ body {
     margin-bottom: 1rem;
 }
 .peers-view-header h2 { margin: 0; font-size: 1.1rem; color: #eee; }
+.peers-tabs {
+    display: flex;
+    gap: 0.25rem;
+    padding: 0.75rem 1.5rem;
+    background: #0f1117;
+    border-bottom: 1px solid #2a2d37;
+}
+.peer-tab {
+    background: #0f1117;
+    border: 1px solid #2a2d37;
+    color: #aaa;
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+}
+.peer-tab:hover { border-color: #555; color: #ddd; }
+.peer-tab.active {
+    background: #2a2d47;
+    border-color: #5566cc;
+    color: #fff;
+}
 
 .peer-row {
     display: flex;
@@ -1973,8 +1995,57 @@ body {
     gap: 0.5rem;
     margin-bottom: 1.5rem;
 }
-.btn-danger  { border-color: #b03030 !important; color: #e57373 !important; }
-.btn-warning { border-color: #806020 !important; color: #f0c040 !important; }
+.peer-detail-actions button {
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    border: 1px solid #2a2d37;
+    transition: background 0.2s, border-color 0.2s;
+}
+.peer-detail-actions .btn-primary {
+    background: #5566cc;
+    color: #fff;
+    border-color: #5566cc;
+}
+.peer-detail-actions .btn-primary:hover {
+    background: #6677dd;
+    border-color: #6677dd;
+}
+.peer-detail-actions .btn-secondary {
+    background: #2a2d37;
+    color: #aaa;
+}
+.peer-detail-actions .btn-secondary:hover {
+    background: #3a3d47;
+    color: #ddd;
+}
+.peer-detail-actions .btn-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.peer-detail-actions .btn-secondary:disabled:hover {
+    background: #2a2d37;
+    color: #aaa;
+}
+.peer-detail-actions .btn-danger {
+    background: #3a1a1a;
+    color: #e57373;
+    border-color: #b03030;
+}
+.peer-detail-actions .btn-danger:hover {
+    background: #4a2a2a;
+    color: #ff8a8a;
+}
+.peer-detail-actions .btn-warning {
+    background: #3a3a1a;
+    color: #f0c040;
+    border-color: #806020;
+}
+.peer-detail-actions .btn-warning:hover {
+    background: #4a4a2a;
+    color: #ffd060;
+}
 
 .peer-activity-section h3 {
     font-size: 0.9rem;

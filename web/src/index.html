@@ -211,6 +211,12 @@
                 <div class="peers-view-header">
                     <h2>Peers</h2>
                 </div>
+                <div class="peers-tabs">
+                    <button class="peer-tab active" data-peer-tab="all" onclick="switchPeerTab('all')">All</button>
+                    <button class="peer-tab" data-peer-tab="friends" onclick="switchPeerTab('friends')">Friends</button>
+                    <button class="peer-tab" data-peer-tab="verified" onclick="switchPeerTab('verified')">Verified</button>
+                    <button class="peer-tab" data-peer-tab="placeholder" onclick="switchPeerTab('placeholder')">Placeholder</button>
+                </div>
                 <div id="peers-list"></div>
             </div>
 

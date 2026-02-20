@@ -872,6 +872,36 @@ impl Storage {
         Ok(affected > 0)
     }
 
+    /// Delete a peer and all associated data (messages, reactions, replies, profile).
+    /// Returns the number of messages deleted along with whether the peer was deleted.
+    pub fn forget_peer(&self, peer_id: &str) -> Result<(bool, usize), StorageError> {
+        // Delete all messages sent by or to this peer
+        let messages_deleted = self.conn.execute(
+            "DELETE FROM messages WHERE sender_id = ?1 OR recipient_id = ?1",
+            params![peer_id],
+        )?;
+
+        // Delete all reactions from this peer
+        self.conn
+            .execute("DELETE FROM reactions WHERE user_id = ?1", params![peer_id])?;
+
+        // Delete all replies from this peer
+        self.conn
+            .execute("DELETE FROM replies WHERE user_id = ?1", params![peer_id])?;
+
+        // Delete profile
+        self.conn
+            .execute("DELETE FROM profiles WHERE user_id = ?1", params![peer_id])?;
+
+        // Delete the peer record
+        let peer_deleted = self
+            .conn
+            .execute("DELETE FROM peers WHERE peer_id = ?1", params![peer_id])?
+            > 0;
+
+        Ok((peer_deleted, messages_deleted))
+    }
+
     pub fn update_peer_online(
         &self,
         peer_id: &str,
@@ -951,12 +981,14 @@ impl Storage {
     }
 
     /// Return `(timestamp, body_preview)` of the most recent message of any
-    /// non-meta kind where `sender_id = peer_id` OR `recipient_id = peer_id`.
+    /// non-meta kind sent by `peer_id` (excluding public/friend_group which are
+    /// covered by `peer_last_post`).
     pub fn peer_last_message(&self, peer_id: &str) -> Result<Option<(u64, String)>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp, body FROM messages
              WHERE message_kind != 'meta'
-               AND (sender_id = ?1 OR recipient_id = ?1)
+               AND message_kind NOT IN ('public', 'friend_group')
+               AND sender_id = ?1
              ORDER BY timestamp DESC LIMIT 1",
         )?;
         let row = stmt
@@ -3706,19 +3738,33 @@ mod tests {
         assert_eq!(ts, now - 100);
         assert!(preview.contains("m1"));
 
-        // Insert a newer message to alice
+        // Insert a newer message to alice (should NOT appear in peer_last_message)
         storage
             .insert_message(&make_message("m2", "me", "alice", "direct", now - 50))
             .unwrap();
         let (ts, _) = storage.peer_last_message("alice").unwrap().unwrap();
-        assert_eq!(ts, now - 50);
+        assert_eq!(ts, now - 100, "messages TO alice should not appear");
+
+        // Insert a newer message from alice
+        storage
+            .insert_message(&make_message("m3", "alice", "me", "direct", now - 25))
+            .unwrap();
+        let (ts, _) = storage.peer_last_message("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 25);
 
         // Meta messages should be excluded
         storage
-            .insert_message(&make_message("m3", "alice", "me", "meta", now))
+            .insert_message(&make_message("m4", "alice", "me", "meta", now))
             .unwrap();
         let (ts, _) = storage.peer_last_message("alice").unwrap().unwrap();
-        assert_eq!(ts, now - 50, "meta message should be excluded");
+        assert_eq!(ts, now - 25, "meta message should be excluded");
+
+        // Public messages should be excluded (covered by peer_last_post)
+        storage
+            .insert_message(&make_message("m5", "alice", "*", "public", now))
+            .unwrap();
+        let (ts, _) = storage.peer_last_message("alice").unwrap().unwrap();
+        assert_eq!(ts, now - 25, "public message should be excluded");
     }
 
     #[test]

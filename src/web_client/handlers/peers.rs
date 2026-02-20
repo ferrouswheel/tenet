@@ -539,6 +539,55 @@ pub async fn peer_activity_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Forget peer (delete peer and all messages)
+// ---------------------------------------------------------------------------
+
+pub async fn forget_peer_handler(
+    State(state): State<SharedState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let st = state.lock().await;
+
+    // Check if peer exists and is not a friend
+    match st.storage.get_peer(&peer_id) {
+        Ok(Some(peer)) => {
+            if peer.is_friend {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "cannot forget a friend; remove friendship first",
+                );
+            }
+        }
+        Ok(None) => {
+            return api_error(StatusCode::NOT_FOUND, "peer not found");
+        }
+        Err(e) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+
+    // Delete peer and all their data
+    match st.storage.forget_peer(&peer_id) {
+        Ok((peer_deleted, messages_deleted)) => {
+            crate::tlog!(
+                "forgot peer {} (messages deleted: {})",
+                crate::logging::peer_id(&peer_id),
+                messages_deleted
+            );
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "peer_deleted": peer_deleted,
+                    "messages_deleted": messages_deleted,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper: Create placeholder peer
 // ---------------------------------------------------------------------------
 

@@ -77,6 +77,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/peers/:peer_id/activity",
             get(handlers::peers::peer_activity_handler),
         )
+        .route(
+            "/api/peers/:peer_id/forget",
+            post(handlers::peers::forget_peer_handler),
+        )
         // Groups API
         .route(
             "/api/groups",

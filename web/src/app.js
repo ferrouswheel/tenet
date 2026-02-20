@@ -94,10 +94,14 @@ function handleRoute() {
         // Post detail: #/post/{messageId}
         const messageId = decodeURIComponent(parts.slice(1).join('/'));
         showPostDetail(messageId, true);
-    } else if (route === 'peer' && parts[1]) {
-        // DM conversation: #/peer/{peerId}
+    } else if (route === 'friends' && parts[1]) {
+        // Friend DM conversation: #/friends/{peerId}
         const peerId = decodeURIComponent(parts.slice(1).join('/'));
-        showConversationDetail(peerId, true);
+        showConversationDetail(peerId, true, true);
+    } else if (route === 'peer' && parts[1]) {
+        // Legacy DM conversation route (redirect to friends)
+        const peerId = decodeURIComponent(parts.slice(1).join('/'));
+        window.location.hash = '#/friends/' + encodeURIComponent(peerId);
     } else if (route === 'peers' && parts[1]) {
         // Peer detail: #/peers/{peerId}
         const peerId = decodeURIComponent(parts.slice(1).join('/'));
@@ -494,7 +498,7 @@ function updateComposeForTimeline() {
 // ---------------------------------------------------------------------------
 // Conversation detail (DMs with a friend)
 // ---------------------------------------------------------------------------
-function showConversationDetail(peerId, fromRoute) {
+async function showConversationDetail(peerId, fromRoute, requireFriend = true) {
     currentView = 'conversation-detail';
     currentConversationPeerId = peerId;
     conversationOldestTimestamp = null;
@@ -505,17 +509,45 @@ function showConversationDetail(peerId, fromRoute) {
     document.getElementById('compose-box').style.display = 'none';
     document.getElementById('conversation-detail').classList.add('visible');
 
+    // Update URL if not already navigating from route
+    if (!fromRoute) {
+        window.location.hash = '#/friends/' + encodeURIComponent(peerId);
+    }
+
+    // Fetch peer info from API to check friendship status
+    let peerInfo = null;
+    if (requireFriend) {
+        try {
+            peerInfo = await apiGet(`/api/peers/${encodeURIComponent(peerId)}`);
+        } catch (e) {
+            // Peer doesn't exist
+        }
+
+        if (!peerInfo || !peerInfo.is_friend) {
+            const contentEl = document.getElementById('conversation-messages');
+            const peerName = peerInfo?.display_name || peerId.substring(0, 12) + '...';
+            contentEl.innerHTML = `
+                <div class="error" style="text-align:center;padding:2rem;">
+                    <div style="font-size:1.2rem;margin-bottom:1rem;">Not Friends</div>
+                    <div style="margin-bottom:1rem;">You can only send direct messages to friends.</div>
+                    <div style="margin-bottom:1rem;">${escapeHtml(peerName)} is not in your friends list.</div>
+                    ${peerInfo ? `<button class="btn-primary" onclick="navigateTo('peers/${encodeURIComponent(peerId)}')" style="background:#5566cc;border:none;color:#fff;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-size:0.85rem;">View Peer Profile</button>` : ''}
+                </div>
+            `;
+            document.getElementById('conversation-peer-name').textContent = peerName;
+            document.getElementById('dm-peer-info').innerHTML = '';
+            document.getElementById('dm-compose').style.display = 'none';
+            return;
+        }
+    }
+
     const peer = peers.find(p => p.peer_id === peerId);
-    const peerName = peer?.display_name || peerId.substring(0, 12) + '...';
+    const peerName = peer?.display_name || peerInfo?.display_name || peerId.substring(0, 12) + '...';
     document.getElementById('conversation-peer-name').textContent = peerName;
+    document.getElementById('dm-compose').style.display = 'block';
 
     renderDmPeerInfo(peerId);
     loadConversationMessages(peerId, false);
-
-    // Update URL if not already navigating from route
-    if (!fromRoute) {
-        window.location.hash = '#/peer/' + encodeURIComponent(peerId);
-    }
 }
 
 async function renderDmPeerInfo(peerId) {
@@ -552,7 +584,7 @@ async function renderDmPeerInfo(peerId) {
 }
 
 function openConversationWithPeer(peerId) {
-    navigateTo('peer/' + encodeURIComponent(peerId));
+    navigateTo('friends/' + encodeURIComponent(peerId));
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,6 +1770,8 @@ function navToProfile() {
 // Peer list view (#/peers)
 // ---------------------------------------------------------------------------
 
+let currentPeerTab = 'all';
+
 async function showPeerList(fromRoute) {
     currentView = 'peers-view';
     hideAllViews();
@@ -1750,21 +1784,48 @@ async function showPeerList(fromRoute) {
         window.location.hash = '#/peers';
     }
 
+    await loadPeerList();
+}
+
+async function loadPeerList() {
     const listEl = document.getElementById('peers-list');
     listEl.innerHTML = '<div class="loading">Loading peers…</div>';
 
     try {
         const allPeers = await apiGet('/api/peers');
-        // Sort by last_message_at descending (most recently active first)
-        allPeers.sort((a, b) => (b.last_message_at || 0) - (a.last_message_at || 0));
-        if (allPeers.length === 0) {
+
+        // Sort by most recent activity (considering both messages and posts)
+        allPeers.sort((a, b) => {
+            const aTime = Math.max(a.last_message_at || 0, a.last_post_at || 0);
+            const bTime = Math.max(b.last_message_at || 0, b.last_post_at || 0);
+            return bTime - aTime;
+        });
+
+        // Filter based on current tab
+        let filteredPeers = allPeers;
+        if (currentPeerTab === 'friends') {
+            filteredPeers = allPeers.filter(p => p.is_friend);
+        } else if (currentPeerTab === 'verified') {
+            filteredPeers = allPeers.filter(p => p.signing_public_key && p.signing_public_key.length > 0);
+        } else if (currentPeerTab === 'placeholder') {
+            filteredPeers = allPeers.filter(p => !p.signing_public_key || p.signing_public_key.length === 0);
+        }
+
+        if (filteredPeers.length === 0) {
             listEl.innerHTML = '<div class="empty">No peers yet.</div>';
             return;
         }
-        listEl.innerHTML = allPeers.map(p => renderPeerRow(p)).join('');
+        listEl.innerHTML = filteredPeers.map(p => renderPeerRow(p)).join('');
     } catch (e) {
         listEl.innerHTML = `<div class="error">Failed to load peers: ${escapeHtml(e.message)}</div>`;
     }
+}
+
+function switchPeerTab(tab) {
+    currentPeerTab = tab;
+    document.querySelectorAll('.peer-tab').forEach(t => t.classList.remove('active'));
+    document.querySelector(`.peer-tab[data-peer-tab="${tab}"]`).classList.add('active');
+    loadPeerList();
 }
 
 function renderPeerRow(p) {
@@ -1847,10 +1908,13 @@ function renderPeerDetail(peer) {
             : '<span class="peer-detail-offline">Never seen online</span>');
 
     const blockLabel = peer.is_blocked ? 'Unblock' : 'Block';
+    const blockClass = peer.is_blocked ? 'btn-danger' : 'btn-secondary';
     const blockAction = peer.is_blocked
         ? `unblockPeer('${escapeHtml(peer.peer_id)}')`
         : `blockPeer('${escapeHtml(peer.peer_id)}')`;
+
     const muteLabel = peer.is_muted ? 'Unmute' : 'Mute';
+    const muteClass = peer.is_muted ? 'btn-warning' : 'btn-secondary';
     const muteAction = peer.is_muted
         ? `unmutePeer('${escapeHtml(peer.peer_id)}')`
         : `mutePeer('${escapeHtml(peer.peer_id)}')`;
@@ -1858,6 +1922,10 @@ function renderPeerDetail(peer) {
     const friendBtn = peer.is_friend
         ? `<button class="btn-secondary" disabled>Already friends</button>`
         : `<button class="btn-secondary" onclick="sendFriendRequestToPeer('${escapeHtml(peer.peer_id)}')">Send Friend Request</button>`;
+
+    const forgetBtn = !peer.is_friend
+        ? `<button class="btn-danger" onclick="forgetPeer('${escapeHtml(peer.peer_id)}')">Forget Peer</button>`
+        : '';
 
     contentEl.innerHTML = `
         <div class="peer-detail-header">
@@ -1874,9 +1942,10 @@ function renderPeerDetail(peer) {
         <div class="peer-detail-actions">
             ${friendBtn}
             <button class="btn-secondary" onclick="requestProfileFromPeer('${escapeHtml(peer.peer_id)}')">Request Profile</button>
-            <button class="btn-secondary${peer.is_blocked ? ' btn-danger' : ''}" onclick="${blockAction}">${blockLabel}</button>
-            <button class="btn-secondary${peer.is_muted ? ' btn-warning' : ''}" onclick="${muteAction}">${muteLabel}</button>
+            <button class="${blockClass}" onclick="${blockAction}">${blockLabel}</button>
+            <button class="${muteClass}" onclick="${muteAction}">${muteLabel}</button>
             ${peer.is_friend ? `<button class="btn-primary" onclick="openConversationWithPeer('${escapeHtml(peer.peer_id)}')">Send Message</button>` : ''}
+            ${forgetBtn}
         </div>
     `;
 }
@@ -1980,6 +2049,26 @@ async function requestProfileFromPeer(peerId) {
     try {
         await apiPost(`/api/peers/${encodeURIComponent(peerId)}/request-profile`, {});
         showToast('Profile request sent');
+    } catch (e) {
+        showToast('Failed: ' + e.message);
+    }
+}
+
+async function forgetPeer(peerId) {
+    const confirmed = confirm(
+        'Warning: This will permanently delete this peer and all messages from them.\n\n' +
+        'Note: They can still send you messages in the future. If you receive a message from them again, ' +
+        'they will be re-added to your peer list.\n\n' +
+        'If you want to prevent future messages, use "Block" instead of "Forget Peer".\n\n' +
+        'Are you sure you want to forget this peer?'
+    );
+
+    if (!confirmed) return;
+
+    try {
+        const result = await apiPost(`/api/peers/${encodeURIComponent(peerId)}/forget`, {});
+        showToast(`Peer forgotten (${result.messages_deleted} messages deleted)`);
+        navigateTo('peers');
     } catch (e) {
         showToast('Failed: ' + e.message);
     }
@@ -2170,8 +2259,11 @@ function backFromProfile() {
     const parts = hash.replace('#/', '').split('/');
     const route = parts[0] || '';
 
-    if (route === 'peer' && parts[1]) {
-        showConversationDetail(decodeURIComponent(parts.slice(1).join('/')), true);
+    if (route === 'friends' && parts[1]) {
+        showConversationDetail(decodeURIComponent(parts.slice(1).join('/')), true, true);
+    } else if (route === 'peer' && parts[1]) {
+        // Legacy route - redirect to friends
+        window.location.hash = '#/friends/' + encodeURIComponent(parts[1]);
     } else if (route === 'post' && parts[1]) {
         showPostDetail(decodeURIComponent(parts.slice(1).join('/')), true);
     } else if (route === 'friends') {
@@ -2313,7 +2405,7 @@ async function handleNotificationClick(id, type, messageId, senderId) {
     // Navigate based on type
     toggleNotificationPanel();
     if (type === 'direct_message') {
-        navigateTo('peer/' + encodeURIComponent(senderId));
+        navigateTo('friends/' + encodeURIComponent(senderId));
     } else if (type === 'reply') {
         if (messageId) {
             try {
