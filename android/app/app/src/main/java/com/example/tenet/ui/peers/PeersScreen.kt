@@ -1,5 +1,6 @@
 package com.example.tenet.ui.peers
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,12 +19,14 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Circle
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -46,7 +49,17 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.tenet.uniffi.FfiPeer
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 
+/**
+ * Peers screen — lists all known peers and provides a floating action button to
+ * add a new peer by ID / signing key or by scanning a QR code.
+ *
+ * Phase 4 addition: the "Add Peer" dialog now includes a QR scan icon button
+ * (using ZXing Android Embedded's [ScanContract]) that pre-fills the peer ID
+ * field when a valid QR code is scanned.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PeersScreen(
@@ -155,6 +168,14 @@ private fun BadgeLabel(label: String, error: Boolean = false) {
     )
 }
 
+/**
+ * "Add Peer" dialog with manual entry fields and a QR-scan shortcut.
+ *
+ * Tapping the QR icon button launches the ZXing scanner activity.  On a
+ * successful scan the peer ID field is pre-filled with the scanned string.
+ * The signing key must still be entered manually (the Tenet QR code encodes
+ * only the peer ID string for now).
+ */
 @Composable
 private fun AddPeerDialog(
     onDismiss: () -> Unit,
@@ -164,18 +185,48 @@ private fun AddPeerDialog(
     var displayName by remember { mutableStateOf("") }
     var signingKey by remember { mutableStateOf("") }
 
+    // ZXing Android Embedded scanner launcher — fills the peer ID field on scan.
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.let { scanned -> peerId = scanned.trim() }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add Peer") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = peerId,
-                    onValueChange = { peerId = it },
-                    label = { Text("Peer ID") },
-                    singleLine = true,
+                // Peer ID field with QR scan icon on the right.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth(),
-                )
+                ) {
+                    OutlinedTextField(
+                        value = peerId,
+                        onValueChange = { peerId = it },
+                        label = { Text("Peer ID") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(
+                        onClick = {
+                            scanLauncher.launch(
+                                ScanOptions().apply {
+                                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    setPrompt("Scan peer QR code")
+                                    setBeepEnabled(true)
+                                    setOrientationLocked(false)
+                                }
+                            )
+                        },
+                    ) {
+                        Icon(
+                            Icons.Default.QrCodeScanner,
+                            contentDescription = "Scan QR code",
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
                 OutlinedTextField(
                     value = displayName,
                     onValueChange = { displayName = it },

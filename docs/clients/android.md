@@ -900,13 +900,123 @@ echo "==> Done. Run 'cd android/app && ./gradlew assembleDebug' to build the APK
   - `GroupsScreen` is reachable via the Groups icon in `FriendsScreen`'s TopAppBar (not a
     bottom-nav root, consistent with the architecture diagram).
 
-### Phase 4 — Android-native features
+### Phase 4 — Android-native features ✓ Complete
 
-- [ ] WorkManager background sync with system notifications
-- [ ] Notification deep-link navigation
-- [ ] Android Keystore identity key wrapping
-- [ ] QR code show/scan for peer ID sharing
-- [ ] Share-to intent handler
+- [x] WorkManager background sync with system notifications
+- [x] Notification deep-link navigation
+- [x] Android Keystore identity key wrapping
+- [x] QR code show/scan for peer ID sharing
+- [x] Share-to intent handler
+
+#### Phase 4 implementation notes
+
+**WorkManager background sync improvements (`android/app/.../data/SyncWorker.kt`)**
+
+- `SyncWorker.doWork()` now calls `repository.listNotifications(unreadOnly = true)` after
+  each sync and categorises unread notifications by type using the extracted
+  `categorizeNotifications()` helper (unit-tested in `SyncWorkerNotificationTest`).
+
+- Three notification channels are now all exercised:
+  - `CHANNEL_MESSAGES` — direct messages, replies, reactions
+  - `CHANNEL_FRIENDS`  — incoming friend requests
+  - `CHANNEL_GROUPS`   — group invites
+
+- Each notification uses a `tenet://` deep-link `PendingIntent` so that tapping
+  it navigates to the relevant screen (conversations, friends, or groups).
+
+- Fixed notification IDs (`1001`, `1002`, `1003`) per channel mean repeated sync
+  cycles update the existing notification in place rather than stacking duplicates.
+  Resolved items cause their notification to be cancelled (`manager.cancel()`).
+
+- `TenetApplication.onCreate()` now calls `SyncWorker.schedule(this)` so the
+  periodic worker is enqueued on every app start (idempotent — WorkManager
+  `ExistingPeriodicWorkPolicy.KEEP` is a no-op if already scheduled).
+
+**Notification deep-link navigation (`MainActivity.kt`)**
+
+- `MainActivity` is now `android:launchMode="singleTop"` so that notification
+  taps while the app is foreground call `onNewIntent()` rather than creating a
+  second instance.
+
+- `parseIntent()` handles both `ACTION_VIEW` (deep links) and `ACTION_SEND` (share
+  intents).  Deep-link URIs are mapped to internal nav routes via
+  `deepLinkUriToRoute(uri)` (unit-tested in `DeepLinkParserTest`):
+  - `tenet://conversations` → `conversations`
+  - `tenet://conversation/<peerId>` → `conversation/<peerId>`
+  - `tenet://friends` → `friends`
+  - `tenet://groups` → `groups`
+  - `tenet://post/<messageId>` → `post/<messageId>`
+  - `tenet://timeline` → `timeline`
+
+- `initialRoute` and `sharedText` are Compose `mutableStateOf` properties on the
+  activity, so changes from `onNewIntent()` automatically trigger recomposition in
+  `TenetNavHost`.
+
+- `TenetNavHost` receives `initialRoute`, `sharedText`, and `onSharedTextConsumed`
+  parameters.  `LaunchedEffect` blocks observe changes and navigate accordingly.
+
+**Android Keystore identity key wrapping (`data/KeystoreManager.kt`)**
+
+- New `KeystoreManager` singleton generates a random 256-bit DEK on first launch,
+  wraps it with an AES-256-GCM `SecretKey` stored in the Android Keystore under
+  alias `tenet_master_key`, and stores the wrapped blob (IV + ciphertext) as
+  Base64 in `TenetPreferences.wrappedDek`.
+
+- `getOrCreateDek()` returns the plaintext DEK on every call, creating it on the
+  first call.  `clearDek()` supports identity reset / wipe.
+
+- Production deployments should uncomment `.setUserAuthenticationRequired(true)` in
+  the `KeyGenParameterSpec` to require biometric or screen-lock authentication
+  before the Keystore key can be used.
+
+- `TenetPreferences` gains the `wrappedDek: ByteArray?` property (Base64-encoded
+  in `SharedPreferences`).
+
+- The Rust `TenetClient` is unmodified.  Full end-to-end integration (passing the
+  decrypted DEK to the Rust layer) is deferred to a future phase that may add a
+  `TenetClient(dataDir, relayUrl, dek)` constructor.
+
+**QR code show/scan (`ui/qr/QrCodeScreen.kt`, `ui/peers/PeersScreen.kt`, `ui/profile/ProfileScreen.kt`)**
+
+- `ZXing Android Embedded 4.3.0` added to `libs.versions.toml` and
+  `build.gradle.kts` (includes ZXing core for both generation and scanning).
+  `CAMERA` permission added to `AndroidManifest.xml`.
+
+- New `QrCodeScreen` composable renders any string as a QR code using ZXing's
+  `QRCodeWriter` + a manual `Bitmap.setPixel()` loop.  The `generateQrBitmap()`
+  helper is `internal` and unit-tested in `QrCodeTest`.
+
+- Route `qrcode/{content}` added to `TenetNavHost` (`Routes.QR_BASE` / `Routes.QR_CODE`).
+
+- `ProfileScreen` gains a QR icon button (top-right) that calls `onShowQr(peerId)`
+  to navigate to `QrCodeScreen` with the local peer ID.
+
+- `PeersScreen` add-peer dialog gets a `QrCodeScanner` icon button next to the
+  peer-ID field.  Tapping it launches ZXing's `ScanContract`, and the scanned
+  string is pre-filled into the peer ID field.  The signing key still requires
+  manual entry (peer QR codes encode only the peer ID string).
+
+**Share-to intent (`ComposeViewModel.kt`, `ComposeScreen.kt`)**
+
+- `AndroidManifest.xml` already declared `ACTION_SEND` intent filters for
+  `text/plain` and `image/*`.
+
+- `MainActivity` now extracts `EXTRA_TEXT` from share intents and stores it in
+  `sharedText`.  `TenetNavHost` observes `sharedText` and navigates to the compose
+  route, URL-encoding the text into the `sharedText` navigation argument.
+
+- `Routes.COMPOSE_PATTERN = "compose?sharedText={sharedText}"` replaces the
+  previous bare `"compose"` route so the compose screen can receive the shared text
+  as a nullable nav argument.  Plain `navController.navigate(Routes.COMPOSE_BASE)`
+  still works (arg defaults to `null`).
+
+- `ComposeViewModel` injects `SavedStateHandle` and seeds `ComposeUiState.initialBody`
+  from the `sharedText` argument.  `ComposeScreen` initialises its `body` field
+  from `state.initialBody`.
+
+- Image shares (`image/*`) are structurally supported by the manifest and intent
+  parser; uploading the image via `uploadAttachment()` and passing the hash to the
+  compose form is deferred to Phase 5 / a future iteration.
 
 ### Phase 5 — Polish
 

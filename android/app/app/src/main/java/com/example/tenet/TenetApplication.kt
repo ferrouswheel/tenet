@@ -4,11 +4,13 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import com.example.tenet.data.SyncWorker
 import dagger.hilt.android.HiltAndroidApp
 
 /**
  * Application class.  Hilt uses this as the component root.
- * Also creates the Android notification channels on first launch.
+ * Also creates the Android notification channels and schedules the background
+ * sync worker on first launch.
  */
 @HiltAndroidApp
 class TenetApplication : Application() {
@@ -16,6 +18,9 @@ class TenetApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
+        // Enqueue the background sync worker.  Safe to call on every launch
+        // (ExistingPeriodicWorkPolicy.KEEP is a no-op if already scheduled).
+        SyncWorker.schedule(this)
     }
 
     private fun createNotificationChannels() {

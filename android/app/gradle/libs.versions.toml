@@ -13,6 +13,7 @@ workManager = "2.9.0"
 coil = "2.7.0"
 jna = "5.14.0"
 coroutines = "1.8.1"
+zxingAndroid = "4.3.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -35,6 +36,7 @@ hilt-compiler-androidx = { group = "androidx.hilt", name = "hilt-compiler", vers
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
 jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+zxing-android-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxingAndroid" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

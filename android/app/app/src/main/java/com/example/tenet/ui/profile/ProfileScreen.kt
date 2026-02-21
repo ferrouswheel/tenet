@@ -12,6 +12,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -41,9 +42,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 
+/**
+ * Own-profile view and edit screen.
+ *
+ * Phase 4 addition: [onShowQr] callback that navigates to [QrCodeScreen] to
+ * display the local peer ID as a scannable QR code for in-person peer addition.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(
+    onShowQr: (peerId: String) -> Unit = {},
     viewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -68,6 +76,12 @@ fun ProfileScreen(
             TopAppBar(
                 title = { Text("Profile") },
                 actions = {
+                    if (!state.isLoading && state.myPeerId.isNotEmpty()) {
+                        // Show QR code for own peer ID (in-person peer adding).
+                        IconButton(onClick = { onShowQr(state.myPeerId) }) {
+                            Icon(Icons.Default.QrCode, contentDescription = "Show QR code")
+                        }
+                    }
                     if (!state.isEditing && !state.isLoading) {
                         IconButton(onClick = {
                             editDisplayName = state.profile?.displayName ?: ""

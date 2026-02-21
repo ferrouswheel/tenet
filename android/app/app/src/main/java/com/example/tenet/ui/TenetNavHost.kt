@@ -1,5 +1,6 @@
 package com.example.tenet.ui
 
+import android.net.Uri
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Home
@@ -12,6 +13,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -27,10 +29,11 @@ import com.example.tenet.ui.conversations.ConversationsScreen
 import com.example.tenet.ui.friends.FriendsScreen
 import com.example.tenet.ui.groups.GroupDetailScreen
 import com.example.tenet.ui.groups.GroupsScreen
-import com.example.tenet.ui.peers.PeerDetailScreen
 import com.example.tenet.ui.peers.PeersScreen
+import com.example.tenet.ui.peers.PeerDetailScreen
 import com.example.tenet.ui.postdetail.PostDetailScreen
 import com.example.tenet.ui.profile.ProfileScreen
+import com.example.tenet.ui.qr.QrCodeScreen
 import com.example.tenet.ui.setup.SetupScreen
 import com.example.tenet.ui.timeline.TimelineScreen
 import com.example.tenet.ui.timeline.TimelineViewModel
@@ -49,13 +52,48 @@ private val BOTTOM_NAV_ROUTES = setOf(
  * The outer [Scaffold] owns the [NavigationBar] that is shared between the five
  * top-level destinations.  Detail screens are full-screen and hide the bottom nav.
  *
- * Phase 3 additions: Peers, Friends, Groups, Profile destinations + detail routes.
+ * ### Phase 4 additions
+ * - [initialRoute]: when the activity is started by a `tenet://` notification deep
+ *   link, [TenetNavHost] navigates directly to the target screen (after verifying
+ *   setup is complete).
+ * - [sharedText] / [onSharedTextConsumed]: when another app shares text to Tenet,
+ *   the Compose screen is opened with the text pre-populated.
+ * - [Routes.QR_CODE]: new route that renders a peer ID as a QR code.
+ * - [Routes.COMPOSE_PATTERN]: compose route now accepts an optional `sharedText`
+ *   argument so the share-to flow can seed the text field.
  */
 @Composable
-fun TenetNavHost(navController: NavHostController) {
+fun TenetNavHost(
+    navController: NavHostController,
+    initialRoute: String? = null,
+    sharedText: String? = null,
+    onSharedTextConsumed: () -> Unit = {},
+) {
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showBottomNav = currentRoute in BOTTOM_NAV_ROUTES
+
+    // Navigate to the deep-linked route once setup is complete.
+    // LaunchedEffect key is [initialRoute] so it re-fires if the user taps another
+    // notification while the app is running (onNewIntent → new initialRoute value).
+    LaunchedEffect(initialRoute) {
+        if (initialRoute != null) {
+            navController.navigate(initialRoute) {
+                launchSingleTop = true
+            }
+        }
+    }
+
+    // Navigate to Compose when a share-to intent arrives.
+    LaunchedEffect(sharedText) {
+        if (sharedText != null) {
+            val encoded = Uri.encode(sharedText)
+            navController.navigate("${Routes.COMPOSE_BASE}?sharedText=$encoded") {
+                launchSingleTop = true
+            }
+            onSharedTextConsumed()
+        }
+    }
 
     Scaffold(
         bottomBar = {
@@ -148,7 +186,7 @@ fun TenetNavHost(navController: NavHostController) {
                 val viewModel: TimelineViewModel = hiltViewModel()
                 TimelineScreen(
                     viewModel = viewModel,
-                    onComposeClick = { navController.navigate(Routes.COMPOSE) },
+                    onComposeClick = { navController.navigate(Routes.COMPOSE_BASE) },
                     onMessageClick = { messageId ->
                         navController.navigate("${Routes.POST_BASE}/$messageId")
                     },
@@ -189,12 +227,26 @@ fun TenetNavHost(navController: NavHostController) {
             }
 
             composable(Routes.PROFILE) {
-                ProfileScreen()
+                ProfileScreen(
+                    onShowQr = { peerId ->
+                        navController.navigate("${Routes.QR_BASE}/${Uri.encode(peerId)}")
+                    },
+                )
             }
 
             // --- Detail screens (full-screen, no bottom nav) ---
 
-            composable(Routes.COMPOSE) {
+            // Compose screen: optional sharedText argument from share-to intent.
+            composable(
+                route = Routes.COMPOSE_PATTERN,
+                arguments = listOf(
+                    navArgument("sharedText") {
+                        type = NavType.StringType
+                        nullable = true
+                        defaultValue = null
+                    },
+                ),
+            ) {
                 ComposeScreen(onDone = { navController.popBackStack() })
             }
 
@@ -230,6 +282,19 @@ fun TenetNavHost(navController: NavHostController) {
             ) {
                 GroupDetailScreen(onBack = { navController.popBackStack() })
             }
+
+            // Phase 4: QR code screen — displays [content] as a scannable QR code.
+            composable(
+                route = Routes.QR_CODE,
+                arguments = listOf(navArgument("content") { type = NavType.StringType }),
+            ) { backStack ->
+                val content = backStack.arguments?.getString("content") ?: ""
+                QrCodeScreen(
+                    content = content,
+                    title = "My Peer ID",
+                    onBack = { navController.popBackStack() },
+                )
+            }
         }
     }
 }
@@ -242,7 +307,11 @@ object Routes {
     const val FRIENDS = "friends"
     const val GROUPS = "groups"
     const val PROFILE = "profile"
-    const val COMPOSE = "compose"
+
+    // Compose route: base for navigation, COMPOSE_PATTERN for route definition.
+    // The optional sharedText arg pre-populates the body from a share-to intent.
+    const val COMPOSE_BASE = "compose"
+    const val COMPOSE_PATTERN = "compose?sharedText={sharedText}"
 
     // Detail routes — use base + id for navigation, full pattern for composable()
     const val CONVERSATION_BASE = "conversation"
@@ -253,4 +322,8 @@ object Routes {
     const val PEER_DETAIL = "peer/{peerId}"
     const val GROUP_BASE = "group"
     const val GROUP_DETAIL = "group/{groupId}"
+
+    // Phase 4: QR code display
+    const val QR_BASE = "qrcode"
+    const val QR_CODE = "qrcode/{content}"
 }
