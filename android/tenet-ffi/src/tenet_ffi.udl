@@ -1,6 +1,7 @@
 // UniFFI Interface Definition for Tenet Android FFI
 // Phase 1: Identity init, sync, list/send messages, peer management
 // Phase 2: Conversations, replies, reactions, attachments, group messages
+// Phase 3: Peers detail, friends, groups, profiles, notifications
 
 namespace tenet_ffi {};
 
@@ -65,6 +66,76 @@ dictionary FfiReactionSummary {
     u32 downvotes;
     /// "upvote" | "downvote" | null
     string? my_reaction;
+};
+
+// Phase 3 types ----------------------------------------------------------------
+
+/// An incoming or outgoing friend request.
+dictionary FfiFriendRequest {
+    i64 id;
+    string from_peer_id;
+    string to_peer_id;
+    /// "pending" | "accepted" | "ignored" | "blocked"
+    string status;
+    string? message;
+    /// "incoming" | "outgoing"
+    string direction;
+    i64 created_at;
+};
+
+/// A group the local user is a member of.
+dictionary FfiGroup {
+    string group_id;
+    string creator_id;
+    u32 member_count;
+    i64 created_at;
+};
+
+/// A single group member with display name enrichment.
+dictionary FfiGroupMember {
+    string group_id;
+    string peer_id;
+    string? display_name;
+    i64 joined_at;
+};
+
+/// An incoming or outgoing group invite.
+dictionary FfiGroupInvite {
+    i64 id;
+    string group_id;
+    string from_peer_id;
+    string to_peer_id;
+    /// "pending" | "accepted" | "ignored"
+    string status;
+    string? message;
+    /// "incoming" | "outgoing"
+    string direction;
+    i64 created_at;
+};
+
+/// A user profile.
+dictionary FfiProfile {
+    string user_id;
+    string? display_name;
+    string? bio;
+    /// Content hash — fetch bytes via download_attachment().
+    string? avatar_hash;
+    /// JSON object of public fields (empty object "{}" if none).
+    string public_fields;
+    /// JSON object of friends-only fields (empty object "{}" if none).
+    string friends_fields;
+    i64 updated_at;
+};
+
+/// A single notification entry.
+dictionary FfiNotification {
+    i64 id;
+    /// "direct_message" | "reply" | "reaction" | "friend_request" | "group_invite"
+    string notification_type;
+    string message_id;
+    string sender_id;
+    i64 created_at;
+    boolean is_read;
 };
 
 // ---------------------------------------------------------------------------
@@ -179,9 +250,117 @@ interface TenetClient {
     [Throws=TenetError]
     sequence<FfiPeer> list_peers();
 
+    /// Fetch a single peer by ID, or null if not known.
+    [Throws=TenetError]
+    FfiPeer? get_peer(string peer_id);
+
     [Throws=TenetError]
     void add_peer(string peer_id, string? display_name, string signing_public_key_hex);
 
     [Throws=TenetError]
     void remove_peer(string peer_id);
+
+    [Throws=TenetError]
+    void block_peer(string peer_id);
+
+    [Throws=TenetError]
+    void unblock_peer(string peer_id);
+
+    [Throws=TenetError]
+    void mute_peer(string peer_id);
+
+    [Throws=TenetError]
+    void unmute_peer(string peer_id);
+
+    // ---------------------------------------------------------------------------
+    // Friends
+    // ---------------------------------------------------------------------------
+
+    /// Send a friend request to a known peer.  message is an optional greeting.
+    [Throws=TenetError]
+    void send_friend_request(string peer_id, string? message);
+
+    /// List all friend requests (all directions / statuses).
+    [Throws=TenetError]
+    sequence<FfiFriendRequest> list_friend_requests();
+
+    /// Accept an incoming friend request by its database ID.
+    [Throws=TenetError]
+    void accept_friend_request(i64 request_id);
+
+    /// Ignore (soft-decline) an incoming friend request.
+    [Throws=TenetError]
+    void ignore_friend_request(i64 request_id);
+
+    /// Block the sender of a friend request.
+    [Throws=TenetError]
+    void block_friend_request(i64 request_id);
+
+    // ---------------------------------------------------------------------------
+    // Groups
+    // ---------------------------------------------------------------------------
+
+    [Throws=TenetError]
+    sequence<FfiGroup> list_groups();
+
+    [Throws=TenetError]
+    FfiGroup? get_group(string group_id);
+
+    [Throws=TenetError]
+    sequence<FfiGroupMember> list_group_members(string group_id);
+
+    /// Create a new group.  member_ids must all be known peers.
+    [Throws=TenetError]
+    string create_group(sequence<string> member_ids);
+
+    [Throws=TenetError]
+    void add_group_member(string group_id, string peer_id);
+
+    [Throws=TenetError]
+    void remove_group_member(string group_id, string peer_id);
+
+    /// Leave a group (removes local record; notifies no peers in this implementation).
+    [Throws=TenetError]
+    void leave_group(string group_id);
+
+    [Throws=TenetError]
+    sequence<FfiGroupInvite> list_group_invites();
+
+    [Throws=TenetError]
+    void accept_group_invite(i64 invite_id);
+
+    [Throws=TenetError]
+    void ignore_group_invite(i64 invite_id);
+
+    // ---------------------------------------------------------------------------
+    // Profiles
+    // ---------------------------------------------------------------------------
+
+    /// Get the local user's own profile (null if not yet set).
+    [Throws=TenetError]
+    FfiProfile? get_own_profile();
+
+    /// Create or update the local user's profile.
+    [Throws=TenetError]
+    void update_own_profile(string? display_name, string? bio, string? avatar_hash);
+
+    /// Get a peer's cached profile (null if not yet fetched).
+    [Throws=TenetError]
+    FfiProfile? get_peer_profile(string peer_id);
+
+    // ---------------------------------------------------------------------------
+    // Notifications
+    // ---------------------------------------------------------------------------
+
+    [Throws=TenetError]
+    sequence<FfiNotification> list_notifications(boolean unread_only);
+
+    [Throws=TenetError]
+    u32 notification_count();
+
+    [Throws=TenetError]
+    void mark_notification_read(i64 notification_id);
+
+    [Throws=TenetError]
+    void mark_all_notifications_read();
 };
