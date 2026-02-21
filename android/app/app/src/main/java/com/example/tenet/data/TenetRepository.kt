@@ -2,8 +2,14 @@ package com.example.tenet.data
 
 import android.content.Context
 import com.example.tenet.uniffi.FfiConversation
+import com.example.tenet.uniffi.FfiFriendRequest
+import com.example.tenet.uniffi.FfiGroup
+import com.example.tenet.uniffi.FfiGroupInvite
+import com.example.tenet.uniffi.FfiGroupMember
 import com.example.tenet.uniffi.FfiMessage
+import com.example.tenet.uniffi.FfiNotification
 import com.example.tenet.uniffi.FfiPeer
+import com.example.tenet.uniffi.FfiProfile
 import com.example.tenet.uniffi.FfiReactionSummary
 import com.example.tenet.uniffi.FfiSyncResult
 import com.example.tenet.uniffi.TenetClient
@@ -187,6 +193,10 @@ class TenetRepository @Inject constructor(
         requireClient().listPeers()
     }
 
+    suspend fun getPeer(peerId: String): FfiPeer? = withContext(Dispatchers.IO) {
+        requireClient().getPeer(peerId)
+    }
+
     suspend fun addPeer(
         peerId: String,
         displayName: String?,
@@ -197,5 +207,131 @@ class TenetRepository @Inject constructor(
 
     suspend fun removePeer(peerId: String) = withContext(Dispatchers.IO) {
         requireClient().removePeer(peerId)
+    }
+
+    suspend fun blockPeer(peerId: String) = withContext(Dispatchers.IO) {
+        requireClient().blockPeer(peerId)
+    }
+
+    suspend fun unblockPeer(peerId: String) = withContext(Dispatchers.IO) {
+        requireClient().unblockPeer(peerId)
+    }
+
+    suspend fun mutePeer(peerId: String) = withContext(Dispatchers.IO) {
+        requireClient().mutePeer(peerId)
+    }
+
+    suspend fun unmutePeer(peerId: String) = withContext(Dispatchers.IO) {
+        requireClient().unmutePeer(peerId)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Friends
+    // ---------------------------------------------------------------------------
+
+    suspend fun sendFriendRequest(peerId: String, message: String?) = withContext(Dispatchers.IO) {
+        requireClient().sendFriendRequest(peerId, message)
+    }
+
+    suspend fun listFriendRequests(): List<FfiFriendRequest> = withContext(Dispatchers.IO) {
+        requireClient().listFriendRequests()
+    }
+
+    suspend fun acceptFriendRequest(requestId: Long) = withContext(Dispatchers.IO) {
+        requireClient().acceptFriendRequest(requestId)
+    }
+
+    suspend fun ignoreFriendRequest(requestId: Long) = withContext(Dispatchers.IO) {
+        requireClient().ignoreFriendRequest(requestId)
+    }
+
+    suspend fun blockFriendRequest(requestId: Long) = withContext(Dispatchers.IO) {
+        requireClient().blockFriendRequest(requestId)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Groups
+    // ---------------------------------------------------------------------------
+
+    suspend fun listGroups(): List<FfiGroup> = withContext(Dispatchers.IO) {
+        requireClient().listGroups()
+    }
+
+    suspend fun getGroup(groupId: String): FfiGroup? = withContext(Dispatchers.IO) {
+        requireClient().getGroup(groupId)
+    }
+
+    suspend fun listGroupMembers(groupId: String): List<FfiGroupMember> =
+        withContext(Dispatchers.IO) {
+            requireClient().listGroupMembers(groupId)
+        }
+
+    suspend fun createGroup(memberIds: List<String>): String = withContext(Dispatchers.IO) {
+        requireClient().createGroup(memberIds)
+    }
+
+    suspend fun addGroupMember(groupId: String, peerId: String) = withContext(Dispatchers.IO) {
+        requireClient().addGroupMember(groupId, peerId)
+    }
+
+    suspend fun removeGroupMember(groupId: String, peerId: String) = withContext(Dispatchers.IO) {
+        requireClient().removeGroupMember(groupId, peerId)
+    }
+
+    suspend fun leaveGroup(groupId: String) = withContext(Dispatchers.IO) {
+        requireClient().leaveGroup(groupId)
+    }
+
+    suspend fun listGroupInvites(): List<FfiGroupInvite> = withContext(Dispatchers.IO) {
+        requireClient().listGroupInvites()
+    }
+
+    suspend fun acceptGroupInvite(inviteId: Long) = withContext(Dispatchers.IO) {
+        requireClient().acceptGroupInvite(inviteId)
+    }
+
+    suspend fun ignoreGroupInvite(inviteId: Long) = withContext(Dispatchers.IO) {
+        requireClient().ignoreGroupInvite(inviteId)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Profiles
+    // ---------------------------------------------------------------------------
+
+    suspend fun getOwnProfile(): FfiProfile? = withContext(Dispatchers.IO) {
+        requireClient().getOwnProfile()
+    }
+
+    suspend fun updateOwnProfile(
+        displayName: String?,
+        bio: String?,
+        avatarHash: String?,
+    ) = withContext(Dispatchers.IO) {
+        requireClient().updateOwnProfile(displayName, bio, avatarHash)
+    }
+
+    suspend fun getPeerProfile(peerId: String): FfiProfile? = withContext(Dispatchers.IO) {
+        requireClient().getPeerProfile(peerId)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Notifications
+    // ---------------------------------------------------------------------------
+
+    suspend fun listNotifications(unreadOnly: Boolean = false): List<FfiNotification> =
+        withContext(Dispatchers.IO) {
+            requireClient().listNotifications(unreadOnly)
+        }
+
+    suspend fun notificationCount(): UInt = withContext(Dispatchers.IO) {
+        requireClient().notificationCount()
+    }
+
+    suspend fun markNotificationRead(notificationId: Long) = withContext(Dispatchers.IO) {
+        requireClient().markNotificationRead(notificationId)
+    }
+
+    suspend fun markAllNotificationsRead() = withContext(Dispatchers.IO) {
+        requireClient().markAllNotificationsRead()
     }
 }

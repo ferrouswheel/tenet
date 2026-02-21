@@ -825,13 +825,80 @@ echo "==> Done. Run 'cd android/app && ./gradlew assembleDebug' to build the APK
   (`POST_BASE = "post"`) and full pattern (`POST_DETAIL = "post/{messageId}"`) to allow safe
   `navController.navigate("post/$id")` without string template collision.
 
-### Phase 3 — Social features
+### Phase 3 — Social features ✓ Complete
 
-- [ ] Peer list and peer detail screens
-- [ ] Add peer by ID (manual entry)
-- [ ] Friend request send / accept / ignore / block
-- [ ] Group create, invite, accept invite, leave
-- [ ] Profile view and edit (with avatar)
+- [x] Peer list and peer detail screens
+- [x] Add peer by ID (manual entry)
+- [x] Friend request send / accept / ignore / block
+- [x] Group create, invite, accept invite, leave
+- [x] Profile view and edit (with avatar)
+
+#### Phase 3 implementation notes
+
+**Rust FFI additions (`android/tenet-ffi/src/`)**
+
+- **New FFI types** added to `types.rs` and the UDL:
+  `FfiFriendRequest`, `FfiGroup`, `FfiGroupMember`, `FfiGroupInvite`, `FfiProfile`,
+  `FfiNotification`.
+
+- **Peer detail** — `get_peer()` and `block_peer()` / `unblock_peer()` / `mute_peer()` /
+  `unmute_peer()` delegate directly to `storage.set_peer_blocked()` /
+  `storage.set_peer_muted()`, which are already idempotent.
+
+- **Friend request upsert** — `send_friend_request()` checks
+  `storage.find_request_between()` first; if a prior request exists it calls
+  `storage.refresh_friend_request()` (resets to `pending`) rather than inserting a
+  duplicate.  Acceptance uses `INSERT OR REPLACE` (`insert_peer`) with `is_friend: true` to
+  atomically update the peer row.  `block_friend_request()` additionally calls
+  `set_peer_blocked()` so the peer is silenced app-wide.
+
+- **Group creation** — `create_group()` generates a random URL-safe base64 group ID
+  (16 bytes) and a random 32-byte group key via `OsRng`, then calls
+  `storage.insert_group_with_members()`.  The creator is automatically added as a member if
+  not already present in the supplied list.
+
+- **`leave_group()`** — removes self from the member list; deletes the group record if
+  no members remain.  No protocol message is sent in this implementation (best-effort).
+
+- **Profile** — `update_own_profile()` merges with the existing profile row so that
+  unset fields (e.g. `bio: None`) do not overwrite previously stored values.  Avatar upload
+  is handled separately via `upload_attachment()` — pass the returned hash to
+  `update_own_profile(avatar_hash: Some(...))`.
+
+- **Notifications** — `list_notifications()` / `notification_count()` /
+  `mark_notification_read()` / `mark_all_notifications_read()` delegate directly to the
+  matching `Storage` methods.
+
+**Android Kotlin additions (`android/app/`)**
+
+- **New screens and view models** under `ui/`:
+  - `peers/` — `PeersScreen` + `PeersViewModel`: sorted peer list (online-first), add-peer
+    dialog accepting peer ID + optional display name + signing key hex.  Long-pressing a peer
+    navigates to `PeerDetailScreen`.
+  - `peers/` — `PeerDetailScreen` + `PeerDetailViewModel`: shows peer ID, profile bio,
+    online/friend/blocked/muted status chips; action buttons for DM, friend request (with
+    optional greeting message), block/unblock, mute/unmute, remove.  Friend request button is
+    disabled if an outgoing `pending` request already exists.
+  - `friends/` — `FriendsScreen` + `FriendsViewModel`: two lists — incoming pending requests
+    (accept / ignore / block row actions) and outgoing requests (status badge).  A Groups icon
+    in the TopAppBar navigates to `GroupsScreen`.
+  - `groups/` — `GroupsScreen` + `GroupsViewModel`: list of joined groups + pending incoming
+    invites (join / ignore); FAB opens a create-group dialog where member peer IDs are entered
+    as a comma-separated string.
+  - `groups/` — `GroupDetailScreen` + `GroupDetailViewModel`: member list with per-member
+    remove buttons; add-member dialog; leave-group confirmation dialog.  `leftGroup` state
+    triggers automatic back navigation on leave.
+  - `profile/` — `ProfileScreen` + `ProfileViewModel`: read-only view showing peer ID,
+    display name, bio; edit mode via TopAppBar icon shows OutlinedTextFields for display name
+    and bio.  Avatar upload left for Phase 4 (requires image picker integration).
+
+- **Navigation changes** (`TenetNavHost.kt`):
+  - Bottom nav expanded from 2 to 5 items: **Timeline**, **Messages**, **Peers**,
+    **Friends**, **Profile**.
+  - New routes: `peers`, `friends`, `groups`, `profile` (top-level); `peer/{peerId}`,
+    `group/{groupId}` (detail, full-screen, no bottom nav).
+  - `GroupsScreen` is reachable via the Groups icon in `FriendsScreen`'s TopAppBar (not a
+    bottom-nav root, consistent with the architecture diagram).
 
 ### Phase 4 — Android-native features
 

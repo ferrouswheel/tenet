@@ -3,6 +3,9 @@ package com.example.tenet.ui
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -21,19 +24,32 @@ import androidx.navigation.navArgument
 import com.example.tenet.ui.compose.ComposeScreen
 import com.example.tenet.ui.conversations.ConversationDetailScreen
 import com.example.tenet.ui.conversations.ConversationsScreen
+import com.example.tenet.ui.friends.FriendsScreen
+import com.example.tenet.ui.groups.GroupDetailScreen
+import com.example.tenet.ui.groups.GroupsScreen
+import com.example.tenet.ui.peers.PeerDetailScreen
+import com.example.tenet.ui.peers.PeersScreen
 import com.example.tenet.ui.postdetail.PostDetailScreen
+import com.example.tenet.ui.profile.ProfileScreen
 import com.example.tenet.ui.setup.SetupScreen
 import com.example.tenet.ui.timeline.TimelineScreen
 import com.example.tenet.ui.timeline.TimelineViewModel
 
-private val BOTTOM_NAV_ROUTES = setOf(Routes.TIMELINE, Routes.CONVERSATIONS)
+private val BOTTOM_NAV_ROUTES = setOf(
+    Routes.TIMELINE,
+    Routes.CONVERSATIONS,
+    Routes.PEERS,
+    Routes.FRIENDS,
+    Routes.PROFILE,
+)
 
 /**
  * Top-level navigation graph for the Tenet app.
  *
- * The outer [Scaffold] owns the [NavigationBar] that is shared between the
- * Timeline and Conversations destinations.  Detail screens (Compose,
- * ConversationDetail, PostDetail) are full-screen and hide the bottom nav.
+ * The outer [Scaffold] owns the [NavigationBar] that is shared between the five
+ * top-level destinations.  Detail screens are full-screen and hide the bottom nav.
+ *
+ * Phase 3 additions: Peers, Friends, Groups, Profile destinations + detail routes.
  */
 @Composable
 fun TenetNavHost(navController: NavHostController) {
@@ -58,10 +74,7 @@ fun TenetNavHost(navController: NavHostController) {
                     )
                     NavigationBarItem(
                         icon = {
-                            Icon(
-                                Icons.AutoMirrored.Filled.Chat,
-                                contentDescription = null,
-                            )
+                            Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null)
                         },
                         label = { Text("Messages") },
                         selected = currentRoute == Routes.CONVERSATIONS,
@@ -73,10 +86,46 @@ fun TenetNavHost(navController: NavHostController) {
                             }
                         },
                     )
+                    NavigationBarItem(
+                        icon = { Icon(Icons.Default.People, contentDescription = null) },
+                        label = { Text("Peers") },
+                        selected = currentRoute == Routes.PEERS,
+                        onClick = {
+                            navController.navigate(Routes.PEERS) {
+                                popUpTo(Routes.TIMELINE) { saveState = true }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        },
+                    )
+                    NavigationBarItem(
+                        icon = { Icon(Icons.Default.PersonAdd, contentDescription = null) },
+                        label = { Text("Friends") },
+                        selected = currentRoute == Routes.FRIENDS,
+                        onClick = {
+                            navController.navigate(Routes.FRIENDS) {
+                                popUpTo(Routes.TIMELINE) { saveState = true }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        },
+                    )
+                    NavigationBarItem(
+                        icon = { Icon(Icons.Default.Person, contentDescription = null) },
+                        label = { Text("Profile") },
+                        selected = currentRoute == Routes.PROFILE,
+                        onClick = {
+                            navController.navigate(Routes.PROFILE) {
+                                popUpTo(Routes.TIMELINE) { saveState = true }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        },
+                    )
                 }
             }
         },
-    ) { innerPadding ->
+    ) { _ ->
         // innerPadding provides bottom offset for the NavigationBar; each
         // inner screen's own TopAppBar handles the status-bar inset.
         NavHost(
@@ -92,6 +141,8 @@ fun TenetNavHost(navController: NavHostController) {
                     },
                 )
             }
+
+            // --- Top-level bottom-nav destinations ---
 
             composable(Routes.TIMELINE) {
                 val viewModel: TimelineViewModel = hiltViewModel()
@@ -112,6 +163,37 @@ fun TenetNavHost(navController: NavHostController) {
                 )
             }
 
+            composable(Routes.PEERS) {
+                PeersScreen(
+                    onPeerClick = { peerId ->
+                        navController.navigate("${Routes.PEER_BASE}/$peerId")
+                    },
+                )
+            }
+
+            composable(Routes.FRIENDS) {
+                FriendsScreen(
+                    onPeerClick = { peerId ->
+                        navController.navigate("${Routes.PEER_BASE}/$peerId")
+                    },
+                    onGroupsClick = { navController.navigate(Routes.GROUPS) },
+                )
+            }
+
+            composable(Routes.GROUPS) {
+                GroupsScreen(
+                    onGroupClick = { groupId ->
+                        navController.navigate("${Routes.GROUP_BASE}/$groupId")
+                    },
+                )
+            }
+
+            composable(Routes.PROFILE) {
+                ProfileScreen()
+            }
+
+            // --- Detail screens (full-screen, no bottom nav) ---
+
             composable(Routes.COMPOSE) {
                 ComposeScreen(onDone = { navController.popBackStack() })
             }
@@ -129,6 +211,25 @@ fun TenetNavHost(navController: NavHostController) {
             ) {
                 PostDetailScreen(onBack = { navController.popBackStack() })
             }
+
+            composable(
+                route = Routes.PEER_DETAIL,
+                arguments = listOf(navArgument("peerId") { type = NavType.StringType }),
+            ) {
+                PeerDetailScreen(
+                    onBack = { navController.popBackStack() },
+                    onSendMessage = { peerId ->
+                        navController.navigate("${Routes.CONVERSATION_BASE}/$peerId")
+                    },
+                )
+            }
+
+            composable(
+                route = Routes.GROUP_DETAIL,
+                arguments = listOf(navArgument("groupId") { type = NavType.StringType }),
+            ) {
+                GroupDetailScreen(onBack = { navController.popBackStack() })
+            }
         }
     }
 }
@@ -137,6 +238,10 @@ object Routes {
     const val SETUP = "setup"
     const val TIMELINE = "timeline"
     const val CONVERSATIONS = "conversations"
+    const val PEERS = "peers"
+    const val FRIENDS = "friends"
+    const val GROUPS = "groups"
+    const val PROFILE = "profile"
     const val COMPOSE = "compose"
 
     // Detail routes — use base + id for navigation, full pattern for composable()
@@ -144,4 +249,8 @@ object Routes {
     const val CONVERSATION_DETAIL = "conversation/{peerId}"
     const val POST_BASE = "post"
     const val POST_DETAIL = "post/{messageId}"
+    const val PEER_BASE = "peer"
+    const val PEER_DETAIL = "peer/{peerId}"
+    const val GROUP_BASE = "group"
+    const val GROUP_DETAIL = "group/{groupId}"
 }

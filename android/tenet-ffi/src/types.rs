@@ -52,3 +52,75 @@ pub struct FfiReactionSummary {
     /// "upvote" | "downvote" | None
     pub my_reaction: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Social features
+// ---------------------------------------------------------------------------
+
+/// A friend request (incoming or outgoing).
+pub struct FfiFriendRequest {
+    pub id: i64,
+    pub from_peer_id: String,
+    pub to_peer_id: String,
+    /// "pending" | "accepted" | "ignored" | "blocked"
+    pub status: String,
+    pub message: Option<String>,
+    /// "incoming" | "outgoing"
+    pub direction: String,
+    pub created_at: i64,
+}
+
+/// A group the local user belongs to.
+pub struct FfiGroup {
+    pub group_id: String,
+    pub creator_id: String,
+    pub member_count: u32,
+    pub created_at: i64,
+}
+
+/// A single group member.
+pub struct FfiGroupMember {
+    pub group_id: String,
+    pub peer_id: String,
+    pub display_name: Option<String>,
+    pub joined_at: i64,
+}
+
+/// A group invite (incoming or outgoing).
+pub struct FfiGroupInvite {
+    pub id: i64,
+    pub group_id: String,
+    pub from_peer_id: String,
+    pub to_peer_id: String,
+    /// "pending" | "accepted" | "ignored"
+    pub status: String,
+    pub message: Option<String>,
+    /// "incoming" | "outgoing"
+    pub direction: String,
+    pub created_at: i64,
+}
+
+/// A user profile as exposed across the FFI boundary.
+pub struct FfiProfile {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    /// Content hash for avatar image (fetch via download_attachment).
+    pub avatar_hash: Option<String>,
+    /// JSON string of public profile fields.
+    pub public_fields: String,
+    /// JSON string of friends-only profile fields.
+    pub friends_fields: String,
+    pub updated_at: i64,
+}
+
+/// A single notification.
+pub struct FfiNotification {
+    pub id: i64,
+    /// "direct_message" | "reply" | "reaction" | "friend_request" | "group_invite"
+    pub notification_type: String,
+    pub message_id: String,
+    pub sender_id: String,
+    pub created_at: i64,
+    pub is_read: bool,
+}
