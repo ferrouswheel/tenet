@@ -1,0 +1,18 @@
+[package]
+name = "tenet-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tenet = { path = "../../" }
+uniffi = "0.28"
+serde_json = "1.0"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
