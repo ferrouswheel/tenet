@@ -103,9 +103,9 @@ The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is or
 | `sync.rs` | Background relay sync loop, envelope processing, online announcements |
 | `static_files.rs` | Embedded SPA serving via `rust-embed` |
 | `utils.rs` | `api_error()`, `message_to_json()`, `link_attachments()`, `now_secs()`, `SendAttachmentRef` |
-| `handlers/health.rs` | `GET /api/health` |
+| `handlers/health.rs` | `GET /api/health`, `POST /api/sync` (manual sync trigger) |
 | `handlers/messages.rs` | Message CRUD + send direct/public/group, mark read |
-| `handlers/peers.rs` | Peer CRUD + key validation |
+| `handlers/peers.rs` | Peer CRUD + activity tracking, blocking, muting |
 | `handlers/friends.rs` | Friend request lifecycle (send, list, accept, ignore, block) |
 | `handlers/groups.rs` | Group CRUD + symmetric key distribution |
 | `handlers/attachments.rs` | Multipart upload + content-addressed download |
@@ -199,6 +199,47 @@ Test files:
 - **Networking**: `axum`, `tokio`, `ureq`
 - **Serialization**: `serde`, `serde_json`, `toml`
 - **TUI**: `ratatui`, `crossterm`, `rustyline`
+
+## Android Client
+
+The `android/` directory contains a separate Android client. It is **not** part of the main Cargo workspace — it has its own build system.
+
+### Structure
+
+```
+android/
+├── build.sh                    # Build script (compiles FFI + assembles APK)
+├── tenet-ffi/                  # Rust→Kotlin bridge (UniFFI)
+│   ├── Cargo.toml              # Separate Rust crate
+│   ├── build.rs                # UniFFI bindgen step
+│   ├── src/lib.rs              # TenetClient: synchronous Rust API, Mutex-protected
+│   ├── src/types.rs            # FFI-safe type definitions (FfiMessage, FfiPeer, etc.)
+│   └── src/tenet_ffi.udl       # UniFFI interface definition
+└── app/                        # Android Jetpack Compose application
+    └── app/src/main/java/com/example/tenet/
+        ├── data/
+        │   ├── TenetRepository.kt      # Singleton wrapping TenetClient FFI
+        │   ├── KeystoreManager.kt      # Android Keystore integration
+        │   ├── SyncWorker.kt           # Background WorkManager sync
+        │   └── TenetPreferences.kt     # DataStore preferences
+        └── ui/                         # Compose screens + ViewModels
+            ├── conversations/          # Direct message conversations
+            ├── compose/                # Message composition
+            ├── friends/                # Friend request management
+            ├── groups/                 # Group messaging
+            ├── peers/                  # Peer management
+            ├── timeline/               # Public message feed
+            ├── profile/                # User profile
+            ├── qr/                     # QR code peer discovery
+            └── setup/                  # First-run setup
+```
+
+### Key Design Points
+
+- The Android app uses the **UniFFI FFI bridge** (not the web REST API) for all protocol operations.
+- `TenetClient` (Rust) wraps all mutable state behind a `Mutex`; Kotlin dispatches calls to `Dispatchers.IO`.
+- Sync opens a second SQLite connection (WAL mode) to avoid holding the main lock during network I/O.
+- The FFI crate depends on the main `tenet` library crate.
 
 ## Pre-Commit Checklist
 
