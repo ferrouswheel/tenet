@@ -31,8 +31,17 @@ class TenetPreferences @Inject constructor(
             prefs.edit().putString(KEY_WRAPPED_DEK, encoded).apply()
         }
 
+    /**
+     * Short ID of the currently active identity.  Null means use the Rust-layer
+     * default (whichever identity is recorded in config.toml).
+     */
+    var activeIdentityShortId: String?
+        get() = prefs.getString(KEY_ACTIVE_IDENTITY, null)
+        set(value) = prefs.edit().putString(KEY_ACTIVE_IDENTITY, value).apply()
+
     companion object {
         private const val KEY_RELAY_URL = "relay_url"
         private const val KEY_WRAPPED_DEK = "wrapped_dek"
+        private const val KEY_ACTIVE_IDENTITY = "active_identity_short_id"
     }
 }

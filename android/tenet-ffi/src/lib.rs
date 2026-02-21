@@ -20,11 +20,13 @@ use sha2::{Digest, Sha256};
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient};
 use tenet::crypto::StoredKeypair;
-use tenet::identity::{resolve_identity, store_relay_for_identity};
+use tenet::identity::{
+    create_identity as identity_create, list_identities as identity_list, load_config,
+    resolve_identity, save_config, store_relay_for_identity, TenetConfig,
+};
 use tenet::message_handler::StorageMessageHandler;
 use tenet::protocol::{
-    build_envelope_from_payload, build_group_message_payload, build_plaintext_envelope,
-    MessageKind,
+    build_envelope_from_payload, build_group_message_payload, build_plaintext_envelope, MessageKind,
 };
 use tenet::relay_transport::post_envelope;
 use tenet::storage::{
@@ -33,8 +35,8 @@ use tenet::storage::{
 };
 
 pub use types::{
-    FfiConversation, FfiFriendRequest, FfiGroup, FfiGroupInvite, FfiGroupMember, FfiMessage,
-    FfiNotification, FfiPeer, FfiProfile, FfiReactionSummary, FfiSyncResult,
+    FfiConversation, FfiFriendRequest, FfiGroup, FfiGroupInvite, FfiGroupMember, FfiIdentity,
+    FfiMessage, FfiNotification, FfiPeer, FfiProfile, FfiReactionSummary, FfiSyncResult,
 };
 
 // HPKE binding strings — must match the web client constants so messages
@@ -94,10 +96,17 @@ pub struct TenetClient {
 
 impl TenetClient {
     /// Initialize (or load) an identity in `data_dir` and configure the relay.
-    pub fn new(data_dir: String, relay_url: String) -> Result<Self, TenetError> {
+    ///
+    /// `identity_id` selects a specific identity by its short ID.  Pass `None`
+    /// to use the default identity (or create one on first launch).
+    pub fn new(
+        data_dir: String,
+        relay_url: String,
+        identity_id: Option<String>,
+    ) -> Result<Self, TenetError> {
         let path = Path::new(&data_dir);
-        let resolved =
-            resolve_identity(path, None).map_err(|e| TenetError::Init(e.to_string()))?;
+        let resolved = resolve_identity(path, identity_id.as_deref())
+            .map_err(|e| TenetError::Init(e.to_string()))?;
         store_relay_for_identity(&resolved.storage, &relay_url)
             .map_err(|e| TenetError::Init(e.to_string()))?;
         let db_path = tenet::storage::db_path(&resolved.identity_dir);
@@ -364,11 +373,7 @@ impl TenetClient {
                 )
                 .map_err(|e| TenetError::Send(e.to_string()))?
             }
-            other => {
-                return Err(TenetError::Send(format!(
-                    "cannot reply to kind: {other}"
-                )))
-            }
+            other => return Err(TenetError::Send(format!("cannot reply to kind: {other}"))),
         };
 
         post_envelope(&inner.relay_url, &envelope).map_err(|e| TenetError::Send(e.to_string()))?;
@@ -998,11 +1003,7 @@ impl TenetClient {
             .map_err(|e| TenetError::Storage(e.to_string()))
     }
 
-    pub fn remove_group_member(
-        &self,
-        group_id: String,
-        peer_id: String,
-    ) -> Result<(), TenetError> {
+    pub fn remove_group_member(&self, group_id: String, peer_id: String) -> Result<(), TenetError> {
         self.inner
             .lock()
             .unwrap()
@@ -1148,7 +1149,10 @@ impl TenetClient {
     // Notifications
     // -------------------------------------------------------------------------
 
-    pub fn list_notifications(&self, unread_only: bool) -> Result<Vec<FfiNotification>, TenetError> {
+    pub fn list_notifications(
+        &self,
+        unread_only: bool,
+    ) -> Result<Vec<FfiNotification>, TenetError> {
         let inner = self.inner.lock().unwrap();
         let rows = inner
             .storage
@@ -1328,6 +1332,82 @@ fn reaction_summary(
         downvotes,
         my_reaction,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Identity management — namespace-level free functions
+// ---------------------------------------------------------------------------
+
+/// List all identities available in `data_dir`.
+pub fn list_identities(data_dir: String) -> Result<Vec<FfiIdentity>, TenetError> {
+    let path = Path::new(&data_dir);
+    let entries = identity_list(path).map_err(|e| TenetError::Init(e.to_string()))?;
+    let config = load_config(path).map_err(|e| TenetError::Init(e.to_string()))?;
+    let default_short_id = config.default_identity;
+
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let db = tenet::storage::db_path(&entry.path);
+        let storage =
+            tenet::storage::Storage::open(&db).map_err(|e| TenetError::Storage(e.to_string()))?;
+        let peer_id = storage
+            .get_identity()
+            .map_err(|e| TenetError::Storage(e.to_string()))?
+            .map(|r| r.id)
+            .unwrap_or_default();
+        let relay_url = storage
+            .list_enabled_relays()
+            .ok()
+            .and_then(|relays| relays.into_iter().next().map(|r| r.url));
+        let is_default = default_short_id.as_deref() == Some(entry.short_id.as_str());
+        result.push(FfiIdentity {
+            short_id: entry.short_id,
+            peer_id,
+            relay_url,
+            is_default,
+        });
+    }
+    Ok(result)
+}
+
+/// Create a new identity in `data_dir` with `relay_url` as its configured relay.
+///
+/// The new identity is NOT automatically set as the default; call
+/// `set_default_identity` explicitly if needed.
+pub fn create_identity(data_dir: String, relay_url: String) -> Result<FfiIdentity, TenetError> {
+    let path = Path::new(&data_dir);
+    let resolved = identity_create(path).map_err(|e| TenetError::Init(e.to_string()))?;
+    store_relay_for_identity(&resolved.storage, &relay_url)
+        .map_err(|e| TenetError::Init(e.to_string()))?;
+
+    let short_id = resolved
+        .identity_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let config = load_config(path).map_err(|e| TenetError::Init(e.to_string()))?;
+    let is_default = config.default_identity.as_deref() == Some(short_id.as_str());
+
+    Ok(FfiIdentity {
+        short_id,
+        peer_id: resolved.keypair.id,
+        relay_url: Some(relay_url),
+        is_default,
+    })
+}
+
+/// Set the default identity for `data_dir` by its `short_id`.
+///
+/// Subsequent calls to `TenetClient::new` with `identity_id = None` will
+/// resolve this identity.
+pub fn set_default_identity(data_dir: String, short_id: String) -> Result<(), TenetError> {
+    let path = Path::new(&data_dir);
+    let config = TenetConfig {
+        default_identity: Some(short_id),
+    };
+    save_config(path, &config).map_err(|e| TenetError::Init(e.to_string()))
 }
 
 // Pull in the UniFFI scaffolding generated from tenet_ffi.udl.

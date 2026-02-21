@@ -29,6 +29,7 @@ import com.example.tenet.ui.conversations.ConversationsScreen
 import com.example.tenet.ui.friends.FriendsScreen
 import com.example.tenet.ui.groups.GroupDetailScreen
 import com.example.tenet.ui.groups.GroupsScreen
+import com.example.tenet.ui.identities.IdentitiesScreen
 import com.example.tenet.ui.peers.PeersScreen
 import com.example.tenet.ui.peers.PeerDetailScreen
 import com.example.tenet.ui.postdetail.PostDetailScreen
@@ -231,6 +232,22 @@ fun TenetNavHost(
                     onShowQr = { peerId ->
                         navController.navigate("${Routes.QR_BASE}/${Uri.encode(peerId)}")
                     },
+                    onManageIdentities = {
+                        navController.navigate(Routes.IDENTITIES)
+                    },
+                )
+            }
+
+            // Identities management (full-screen, no bottom nav).
+            composable(Routes.IDENTITIES) {
+                IdentitiesScreen(
+                    onBack = { navController.popBackStack() },
+                    onSwitched = {
+                        navController.navigate(Routes.TIMELINE) {
+                            popUpTo(0) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
                 )
             }
 
@@ -326,4 +343,7 @@ object Routes {
     // Phase 4: QR code display
     const val QR_BASE = "qrcode"
     const val QR_CODE = "qrcode/{content}"
+
+    // Multiple identities management
+    const val IDENTITIES = "identities"
 }

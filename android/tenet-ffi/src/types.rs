@@ -124,3 +124,19 @@ pub struct FfiNotification {
     pub created_at: i64,
     pub is_read: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Multiple identities
+// ---------------------------------------------------------------------------
+
+/// A local identity entry as exposed across the FFI boundary.
+pub struct FfiIdentity {
+    /// Short ID used as the identity's directory name (first 12 chars of peer ID).
+    pub short_id: String,
+    /// Full peer ID (hex-encoded public key).
+    pub peer_id: String,
+    /// The relay URL stored for this identity, if any.
+    pub relay_url: Option<String>,
+    /// Whether this identity is the current default.
+    pub is_default: bool,
+}
