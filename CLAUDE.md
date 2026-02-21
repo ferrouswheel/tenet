@@ -37,6 +37,7 @@ The web application UI is automatically built during `cargo build` via the `buil
    - `index.html` - HTML template with `{{STYLES}}` and `{{SCRIPTS}}` placeholders
    - `styles.css` - CSS styles
    - `app.js` - JavaScript application code
+   - `relay_dashboard.html` - Standalone relay status dashboard (not inlined; served separately)
 
 2. The build script inlines CSS and JS into the HTML template and outputs `web/dist/index.html`
 
@@ -63,6 +64,9 @@ cargo run --bin tenet-debugger -- --peers 4 --relay http://127.0.0.1:8080
 # Simulation scenario runner
 cargo run --bin tenet-sim -- scenarios/small_dense_6.toml
 cargo run --bin tenet-sim -- --tui scenarios/small_dense_6.toml
+
+# Web client server (REST API + WebSocket + embedded SPA)
+cargo run --bin tenet-web
 ```
 
 ## Architecture
@@ -81,6 +85,8 @@ See `docs/architecture.md` for detailed design and threat model documentation.
 | `src/identity.rs` | Multi-identity management, config, legacy migration |
 | `src/storage.rs` | SQLite persistence layer (messages, peers, groups, profiles, etc.) |
 | `src/groups.rs` | Group messaging: `GroupInfo`, `GroupManager`, membership |
+| `src/logging.rs` | Structured logging: `tlog!` macro, colour-coded peer/message IDs, configurable writer |
+| `src/message_handler.rs` | `StorageMessageHandler` implementing `MessageHandler` trait for protocol-level persistence |
 | `src/web_client/` | Web server module (REST API + WebSocket + embedded SPA) |
 | `src/simulation/` | Simulation harness, scenario configuration, metrics tracking |
 
@@ -107,6 +113,8 @@ The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is or
 | `handlers/replies.rs` | Threaded replies to public/group messages |
 | `handlers/profiles.rs` | Profile management + broadcasting to friends |
 | `handlers/conversations.rs` | Direct message conversation listing |
+| `handlers/group_invites.rs` | Group invite lifecycle (list, send, accept, reject) |
+| `handlers/notifications.rs` | Notification listing and mark-read |
 | `handlers/websocket.rs` | WebSocket upgrade + broadcast connection |
 
 ### Simulation Submodules
@@ -116,6 +124,7 @@ The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is or
 | `simulation/mod.rs` | `SimulationHarness` orchestration and message routing |
 | `simulation/config.rs` | TOML-serializable scenario configuration types |
 | `simulation/scenario.rs` | Graph building, schedule generation, scenario execution |
+| `simulation/event.rs` | `Event` types, `EventQueue`, `EventLog`, `SimulationClock`, `TimeControlMode` |
 | `simulation/metrics.rs` | Latency tracking, delivery statistics, aggregation |
 | `simulation/random.rs` | Distribution sampling (Poisson, Zipf, etc.) |
 
@@ -176,6 +185,7 @@ Test files:
 - `tests/relay_tests.rs` - HTTP relay endpoints
 - `tests/simulation_client_tests.rs` - Client behavior
 - `tests/simulation_harness_tests.rs` - Multi-peer scenarios
+- `tests/client_sync_tests.rs` - `SyncEvent`/`MessageHandler` trait, `sync_inbox()` integration
 
 ## Async/Threading Model
 
