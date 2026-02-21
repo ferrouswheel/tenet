@@ -12,6 +12,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ManageAccounts
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -52,6 +53,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 @Composable
 fun ProfileScreen(
     onShowQr: (peerId: String) -> Unit = {},
+    onManageIdentities: () -> Unit = {},
     viewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -81,6 +83,10 @@ fun ProfileScreen(
                         IconButton(onClick = { onShowQr(state.myPeerId) }) {
                             Icon(Icons.Default.QrCode, contentDescription = "Show QR code")
                         }
+                    }
+                    // Identity switcher
+                    IconButton(onClick = onManageIdentities) {
+                        Icon(Icons.Default.ManageAccounts, contentDescription = "Manage identities")
                     }
                     if (!state.isEditing && !state.isLoading) {
                         IconButton(onClick = {

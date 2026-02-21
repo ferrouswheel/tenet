@@ -6,6 +6,7 @@ import com.example.tenet.uniffi.FfiFriendRequest
 import com.example.tenet.uniffi.FfiGroup
 import com.example.tenet.uniffi.FfiGroupInvite
 import com.example.tenet.uniffi.FfiGroupMember
+import com.example.tenet.uniffi.FfiIdentity
 import com.example.tenet.uniffi.FfiMessage
 import com.example.tenet.uniffi.FfiNotification
 import com.example.tenet.uniffi.FfiPeer
@@ -13,6 +14,9 @@ import com.example.tenet.uniffi.FfiProfile
 import com.example.tenet.uniffi.FfiReactionSummary
 import com.example.tenet.uniffi.FfiSyncResult
 import com.example.tenet.uniffi.TenetClient
+import com.example.tenet.uniffi.createIdentity as ffiCreateIdentity
+import com.example.tenet.uniffi.listIdentities as ffiListIdentities
+import com.example.tenet.uniffi.setDefaultIdentity as ffiSetDefaultIdentity
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -46,7 +50,7 @@ class TenetRepository @Inject constructor(
                 val dataDir = context.filesDir.absolutePath
                 val relayUrl = prefs.relayUrl
                     ?: error("Relay URL not configured — run setup first")
-                TenetClient(dataDir, relayUrl).also { client = it }
+                TenetClient(dataDir, relayUrl, prefs.activeIdentityShortId).also { client = it }
             }
         }
     }
@@ -61,7 +65,7 @@ class TenetRepository @Inject constructor(
      */
     suspend fun initialize(relayUrl: String) = withContext(Dispatchers.IO) {
         val dataDir = context.filesDir.absolutePath
-        val newClient = TenetClient(dataDir, relayUrl)
+        val newClient = TenetClient(dataDir, relayUrl, prefs.activeIdentityShortId)
         synchronized(this@TenetRepository) { client = newClient }
         prefs.relayUrl = relayUrl
     }
@@ -71,6 +75,47 @@ class TenetRepository @Inject constructor(
     fun myPeerId(): String = requireClient().myPeerId()
 
     fun relayUrl(): String = requireClient().relayUrl()
+
+    // ---------------------------------------------------------------------------
+    // Identity management
+    // ---------------------------------------------------------------------------
+
+    /**
+     * List all identities stored in the app's data directory.
+     */
+    suspend fun listIdentities(): List<FfiIdentity> = withContext(Dispatchers.IO) {
+        ffiListIdentities(context.filesDir.absolutePath)
+    }
+
+    /**
+     * Create a new identity with [relayUrl] as its relay and return it.
+     *
+     * The new identity is not automatically switched to; call [switchIdentity]
+     * afterwards if the user wants to activate it immediately.
+     */
+    suspend fun createIdentity(relayUrl: String): FfiIdentity = withContext(Dispatchers.IO) {
+        ffiCreateIdentity(context.filesDir.absolutePath, relayUrl)
+    }
+
+    /**
+     * Switch the active identity to [identity].
+     *
+     * This updates the default identity in the Rust config, saves it to
+     * [TenetPreferences], stores [relayUrl] as a fallback, and recreates
+     * [TenetClient] so subsequent calls use the new identity.
+     */
+    suspend fun switchIdentity(identity: FfiIdentity) = withContext(Dispatchers.IO) {
+        val dataDir = context.filesDir.absolutePath
+        val relayUrl = identity.relayUrl ?: prefs.relayUrl
+            ?: error("No relay URL available for identity ${identity.shortId}")
+
+        ffiSetDefaultIdentity(dataDir, identity.shortId)
+        prefs.activeIdentityShortId = identity.shortId
+        prefs.relayUrl = relayUrl
+
+        val newClient = TenetClient(dataDir, relayUrl, identity.shortId)
+        synchronized(this@TenetRepository) { client = newClient }
+    }
 
     // ---------------------------------------------------------------------------
     // Messages

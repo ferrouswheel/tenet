@@ -3,7 +3,23 @@
 // Phase 2: Conversations, replies, reactions, attachments, group messages
 // Phase 3: Peers detail, friends, groups, profiles, notifications
 
-namespace tenet_ffi {};
+namespace tenet_ffi {
+    // ---------------------------------------------------------------------------
+    // Identity management — namespace-level functions
+    // ---------------------------------------------------------------------------
+
+    /// List all identities available in data_dir.
+    [Throws=TenetError]
+    sequence<FfiIdentity> list_identities(string data_dir);
+
+    /// Create a new identity in data_dir and store relay_url as its relay.
+    [Throws=TenetError]
+    FfiIdentity create_identity(string data_dir, string relay_url);
+
+    /// Set the default identity for data_dir by its short_id.
+    [Throws=TenetError]
+    void set_default_identity(string data_dir, string short_id);
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -138,14 +154,27 @@ dictionary FfiNotification {
     boolean is_read;
 };
 
+/// A local identity (one per directory under {data_dir}/identities/).
+dictionary FfiIdentity {
+    /// Short ID — first 12 chars of the peer ID, used as directory name.
+    string short_id;
+    /// Full peer ID (base64 public key).
+    string peer_id;
+    /// The relay URL stored for this identity, if any.
+    string? relay_url;
+    /// Whether this is the current default identity.
+    boolean is_default;
+};
+
 // ---------------------------------------------------------------------------
 // TenetClient interface
 // ---------------------------------------------------------------------------
 
 interface TenetClient {
     // Initialize (or load) an identity in data_dir and set the relay URL.
+    // identity_id selects a specific identity by short_id; null uses the default.
     [Throws=TenetError]
-    constructor(string data_dir, string relay_url);
+    constructor(string data_dir, string relay_url, string? identity_id);
 
     string my_peer_id();
     string relay_url();
