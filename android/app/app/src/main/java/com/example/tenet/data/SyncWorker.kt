@@ -48,24 +48,23 @@ class SyncWorker @AssistedInject constructor(
         if (!repository.isInitialized()) return Result.success()
 
         return try {
-            val syncResult = repository.sync()
+            // Sync every identity and tally new messages across all of them.
+            val syncResults = repository.syncAll()
+            val totalNewMessages = syncResults.values.sumOf { it.newMessages.toInt() }
 
-            // Inspect all currently unread notifications to determine which system
-            // notifications to show.  Using a fixed notification ID per channel means
-            // a repeated sync with the same pending items updates the existing
-            // notification in place rather than stacking duplicates.
-            val unread = repository.listNotifications(unreadOnly = true)
+            // Collect unread notifications from every identity's database.
+            val unread = repository.listAllUnreadNotifications()
             val counts = categorizeNotifications(unread)
 
             val manager = context.getSystemService(NotificationManager::class.java)
 
-            if (syncResult.newMessages > 0 || counts.messages > 0) {
+            if (totalNewMessages > 0 || counts.messages > 0) {
                 manager.notify(
                     NOTIFICATION_ID_MESSAGES,
                     buildNotification(
                         channel = TenetApplication.CHANNEL_MESSAGES,
                         title = "Tenet",
-                        text = pluralMessages(counts.messages.coerceAtLeast(syncResult.newMessages.toInt())),
+                        text = pluralMessages(counts.messages.coerceAtLeast(totalNewMessages)),
                         deepLinkUri = "tenet://conversations",
                     ),
                 )

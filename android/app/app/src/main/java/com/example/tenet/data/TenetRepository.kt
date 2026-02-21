@@ -24,34 +24,72 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Singleton repository wrapping the [TenetClient] FFI object.
+ * Singleton repository managing [TenetClient] instances — one per identity.
  *
- * All operations are suspend functions dispatched to [Dispatchers.IO] so the
- * JNI/SQLite blocking calls never touch the main thread.  ViewModels call
- * repository functions from their coroutine scopes.
+ * Each identity has its own [TenetClient] backed by an independent SQLite
+ * database and keypair.  Clients are opened lazily and kept in [clients] so
+ * they can all be synced in the background without reopening files on every
+ * [SyncWorker] run.
  *
- * The [TenetClient] is created lazily on the first call that needs it; the
- * relay URL is read from [TenetPreferences] (persisted in SharedPreferences).
+ * UI operations (send, list messages, …) always target the *active* identity
+ * returned by [requireClient].  Background sync targets all open identities
+ * via [syncAll].
  *
- * Thread safety: [TenetClient] is itself Mutex-protected on the Rust side, so
- * concurrent coroutine calls are safe.
+ * Thread safety: [clients] is accessed only under `synchronized(this)`.
+ * [TenetClient] itself is Mutex-protected on the Rust side, so concurrent
+ * calls to different clients — or concurrent calls to the same client from
+ * multiple coroutines — are safe.
  */
 @Singleton
 class TenetRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val prefs: TenetPreferences,
 ) {
-    @Volatile
-    private var client: TenetClient? = null
+    // All open TenetClient instances, keyed by short_id (first 12 chars of peer ID).
+    private val clients = mutableMapOf<String, TenetClient>()
 
-    private fun requireClient(): TenetClient {
-        return client ?: synchronized(this) {
-            client ?: run {
-                val dataDir = context.filesDir.absolutePath
-                val relayUrl = prefs.relayUrl
-                    ?: error("Relay URL not configured — run setup first")
-                TenetClient(dataDir, relayUrl, prefs.activeIdentityShortId).also { client = it }
-            }
+    // ---------------------------------------------------------------------------
+    // Internal helpers
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Returns the [TenetClient] for the currently active identity.
+     *
+     * Requires that [initialize] has already been called; throws otherwise.
+     * Does NOT perform any I/O — only looks up the in-memory map.
+     */
+    private fun requireClient(): TenetClient = synchronized(this) {
+        val shortId = prefs.activeIdentityShortId
+        if (shortId != null) {
+            clients[shortId]
+                ?: error("Client for identity '$shortId' not loaded — call initialize() first")
+        } else {
+            clients.values.firstOrNull()
+                ?: error("No identities loaded — call initialize() first")
+        }
+    }
+
+    /**
+     * Ensures a [TenetClient] is open for [identity], creating one if needed.
+     *
+     * Safe to call concurrently: uses double-checked locking so only one
+     * client is ever created per identity even under concurrent calls.
+     * Must be invoked on [Dispatchers.IO] (SQLite open is blocking).
+     *
+     * Returns the (possibly newly created) client.
+     */
+    private fun ensureClientOpen(identity: FfiIdentity): TenetClient {
+        // Fast path — already open.
+        synchronized(this) { clients[identity.shortId] }?.let { return it }
+
+        val relayUrl = identity.relayUrl ?: prefs.relayUrl
+            ?: error("No relay URL available for identity '${identity.shortId}'")
+        val newClient = TenetClient(context.filesDir.absolutePath, relayUrl, identity.shortId)
+
+        return synchronized(this) {
+            // Double-check: another thread may have opened the same client while
+            // we were doing the (blocking) TenetClient construction above.
+            clients.getOrPut(identity.shortId) { newClient }
         }
     }
 
@@ -60,14 +98,18 @@ class TenetRepository @Inject constructor(
     // ---------------------------------------------------------------------------
 
     /**
-     * Initialize the client with a relay URL.  Must be called once (e.g. from
-     * the Setup screen) before any other repository method.
+     * Initialize the repository with a relay URL on first launch.
+     *
+     * Creates (or loads) the default identity, opens its [TenetClient], and
+     * persists the relay URL and active short ID to [TenetPreferences].
      */
     suspend fun initialize(relayUrl: String) = withContext(Dispatchers.IO) {
         val dataDir = context.filesDir.absolutePath
         val newClient = TenetClient(dataDir, relayUrl, prefs.activeIdentityShortId)
-        synchronized(this@TenetRepository) { client = newClient }
+        val shortId = newClient.myPeerId().take(12)
+        synchronized(this@TenetRepository) { clients[shortId] = newClient }
         prefs.relayUrl = relayUrl
+        prefs.activeIdentityShortId = shortId
     }
 
     fun isInitialized(): Boolean = prefs.relayUrl != null
@@ -88,33 +130,87 @@ class TenetRepository @Inject constructor(
     }
 
     /**
-     * Create a new identity with [relayUrl] as its relay and return it.
+     * Create a new identity with [relayUrl] as its relay.
      *
-     * The new identity is not automatically switched to; call [switchIdentity]
-     * afterwards if the user wants to activate it immediately.
+     * Immediately opens a [TenetClient] for it so it participates in the next
+     * [syncAll] call without further setup.  The new identity is NOT set as
+     * active; call [switchIdentity] if desired.
      */
     suspend fun createIdentity(relayUrl: String): FfiIdentity = withContext(Dispatchers.IO) {
-        ffiCreateIdentity(context.filesDir.absolutePath, relayUrl)
+        val identity = ffiCreateIdentity(context.filesDir.absolutePath, relayUrl)
+        ensureClientOpen(identity)
+        identity
     }
 
     /**
      * Switch the active identity to [identity].
      *
-     * This updates the default identity in the Rust config, saves it to
-     * [TenetPreferences], stores [relayUrl] as a fallback, and recreates
-     * [TenetClient] so subsequent calls use the new identity.
+     * Ensures a client is open for the target identity (lazy-creating it if
+     * needed), updates the Rust-layer default in config.toml, and persists the
+     * new active short ID and relay URL to [TenetPreferences].
+     *
+     * Because all clients remain open in [clients], no data is lost on switch —
+     * background sync continues to cover every identity.
      */
     suspend fun switchIdentity(identity: FfiIdentity) = withContext(Dispatchers.IO) {
-        val dataDir = context.filesDir.absolutePath
-        val relayUrl = identity.relayUrl ?: prefs.relayUrl
-            ?: error("No relay URL available for identity ${identity.shortId}")
-
-        ffiSetDefaultIdentity(dataDir, identity.shortId)
+        ensureClientOpen(identity)
+        ffiSetDefaultIdentity(context.filesDir.absolutePath, identity.shortId)
         prefs.activeIdentityShortId = identity.shortId
-        prefs.relayUrl = relayUrl
+        prefs.relayUrl = identity.relayUrl ?: prefs.relayUrl ?: ""
+    }
 
-        val newClient = TenetClient(dataDir, relayUrl, identity.shortId)
-        synchronized(this@TenetRepository) { client = newClient }
+    // ---------------------------------------------------------------------------
+    // Sync
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Sync the active identity only.
+     *
+     * Used by foreground polling (e.g. a 30-second timer in a ViewModel) where
+     * only the currently visible identity's data needs refreshing.
+     */
+    suspend fun sync(): FfiSyncResult = withContext(Dispatchers.IO) {
+        requireClient().sync()
+    }
+
+    /**
+     * Sync every known identity and return the per-identity results.
+     *
+     * Opens a [TenetClient] for any identity that doesn't already have one,
+     * then calls [TenetClient.sync] on each.  The relay network call is made
+     * outside any lock so identities are synced concurrently-safe (each client
+     * holds its own internal Mutex).
+     *
+     * Used by [SyncWorker] so background sync covers all identities, not just
+     * the one currently shown in the UI.
+     */
+    suspend fun syncAll(): Map<String, FfiSyncResult> = withContext(Dispatchers.IO) {
+        val identities = ffiListIdentities(context.filesDir.absolutePath)
+
+        // Open clients for any identity not yet in the map.
+        val toOpen = synchronized(this@TenetRepository) {
+            identities.filter { !clients.containsKey(it.shortId) }
+        }
+        for (identity in toOpen) {
+            ensureClientOpen(identity)
+        }
+
+        // Take a snapshot (to avoid holding the lock during network I/O) and sync.
+        val snapshot = synchronized(this@TenetRepository) { clients.toMap() }
+        snapshot.mapValues { (_, client) -> client.sync() }
+    }
+
+    /**
+     * Return all unread [FfiNotification] records across every open identity.
+     *
+     * Errors from individual clients are swallowed so a single broken identity
+     * does not prevent notifications from the others from being reported.
+     */
+    suspend fun listAllUnreadNotifications(): List<FfiNotification> = withContext(Dispatchers.IO) {
+        val snapshot = synchronized(this@TenetRepository) { clients.toMap() }
+        snapshot.values.flatMap { client ->
+            try { client.listNotifications(true) } catch (_: Exception) { emptyList() }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -213,14 +309,6 @@ class TenetRepository @Inject constructor(
         withContext(Dispatchers.IO) {
             requireClient().downloadAttachment(contentHash)
         }
-
-    // ---------------------------------------------------------------------------
-    // Sync
-    // ---------------------------------------------------------------------------
-
-    suspend fun sync(): FfiSyncResult = withContext(Dispatchers.IO) {
-        requireClient().sync()
-    }
 
     // ---------------------------------------------------------------------------
     // Conversations
@@ -360,7 +448,7 @@ class TenetRepository @Inject constructor(
     }
 
     // ---------------------------------------------------------------------------
-    // Notifications
+    // Notifications — active identity
     // ---------------------------------------------------------------------------
 
     suspend fun listNotifications(unreadOnly: Boolean = false): List<FfiNotification> =
