@@ -90,32 +90,9 @@ See `docs/architecture.md` for detailed design and threat model documentation.
 | `src/web_client/` | Web server module (REST API + WebSocket + embedded SPA) |
 | `src/simulation/` | Simulation harness, scenario configuration, metrics tracking |
 
-### Web Client Submodules (`src/web_client/`)
+### Web Client (`src/web_client/`)
 
-The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is organized as:
-
-| File | Purpose |
-|------|---------|
-| `mod.rs` | Entry point `run()`: CLI parsing, identity resolution, server startup |
-| `config.rs` | `Cli` (clap), `Config`, constants (`DEFAULT_TTL_SECONDS`, etc.) |
-| `state.rs` | `AppState`, `SharedState` (`Arc<Mutex<AppState>>`), `WsEvent` enum |
-| `router.rs` | `build_router()` — all Axum route definitions |
-| `sync.rs` | Background relay sync loop, envelope processing, online announcements |
-| `static_files.rs` | Embedded SPA serving via `rust-embed` |
-| `utils.rs` | `api_error()`, `message_to_json()`, `link_attachments()`, `now_secs()`, `SendAttachmentRef` |
-| `handlers/health.rs` | `GET /api/health`, `POST /api/sync` (manual sync trigger) |
-| `handlers/messages.rs` | Message CRUD + send direct/public/group, mark read |
-| `handlers/peers.rs` | Peer CRUD + activity tracking, blocking, muting |
-| `handlers/friends.rs` | Friend request lifecycle (send, list, accept, ignore, block) |
-| `handlers/groups.rs` | Group CRUD + symmetric key distribution |
-| `handlers/attachments.rs` | Multipart upload + content-addressed download |
-| `handlers/reactions.rs` | Upvote/downvote reactions |
-| `handlers/replies.rs` | Threaded replies to public/group messages |
-| `handlers/profiles.rs` | Profile management + broadcasting to friends |
-| `handlers/conversations.rs` | Direct message conversation listing |
-| `handlers/group_invites.rs` | Group invite lifecycle (list, send, accept, reject) |
-| `handlers/notifications.rs` | Notification listing and mark-read |
-| `handlers/websocket.rs` | WebSocket upgrade + broadcast connection |
+The `tenet-web` binary delegates to `tenet::web_client::run()`. REST API + WebSocket + embedded SPA. See `src/web_client/CLAUDE.md` for the full module and handler breakdown.
 
 ### Simulation Submodules
 
