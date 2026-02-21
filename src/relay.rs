@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -24,6 +24,48 @@ use tokio::time::sleep;
 
 const DASHBOARD_HTML: &str = include_str!("../web/src/relay_dashboard.html");
 
+/// Per-tier limits for per-sender-per-inbox quotas.
+#[derive(Clone, Debug)]
+pub struct TierLimits {
+    /// Maximum number of envelopes from this sender currently in the inbox.
+    pub max_envelopes: usize,
+    /// Maximum total bytes from this sender currently in the inbox.
+    pub max_bytes: usize,
+}
+
+/// QoS configuration for the relay.
+#[derive(Clone, Debug)]
+pub struct RelayQosConfig {
+    /// Limits for Tier 1 (unknown / no reply observed).
+    pub tier1: TierLimits,
+    /// Limits for Tier 2 (acknowledged — recipient has sent to sender at any point).
+    pub tier2: TierLimits,
+    /// Limits for Tier 3 (active — bidirectional traffic within the window).
+    pub tier3: TierLimits,
+    /// How long bidirectional activity must be absent before downgrading from Tier 3 to Tier 2.
+    pub bidirectional_window: Duration,
+}
+
+impl Default for RelayQosConfig {
+    fn default() -> Self {
+        Self {
+            tier1: TierLimits {
+                max_envelopes: 20,
+                max_bytes: 256 * 1024,
+            },
+            tier2: TierLimits {
+                max_envelopes: 100,
+                max_bytes: 2 * 1024 * 1024,
+            },
+            tier3: TierLimits {
+                max_envelopes: 500,
+                max_bytes: 10 * 1024 * 1024,
+            },
+            bidirectional_window: Duration::from_secs(7 * 24 * 3600),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RelayConfig {
     pub ttl: Duration,
@@ -34,6 +76,8 @@ pub struct RelayConfig {
     pub peer_log_interval: Duration,
     pub log_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub pause_flag: Arc<AtomicBool>,
+    /// QoS configuration. Use `RelayQosConfig::default()` for standard limits.
+    pub qos: RelayQosConfig,
 }
 
 const WS_BROADCAST_CAPACITY: usize = 128;
@@ -64,6 +108,12 @@ struct RelayStateInner {
     // Active WebSocket connections
     ws_clients: HashMap<u64, WsClientInfo>,
     next_conn_id: u64,
+    // QoS: per-(sender_id, recipient_id) envelope/byte count of messages currently in inbox.
+    sender_inbox_usage: HashMap<(String, String), SenderUsage>,
+    // QoS: most recent send timestamp for each directed (sender, recipient) pair.
+    directed_last_seen: HashMap<(String, String), Instant>,
+    // QoS: set of (min, max) peer-id pairs where bidirectionality has been observed.
+    bidirectional_pairs: HashSet<(String, String)>,
 }
 
 struct WsClientInfo {
@@ -72,6 +122,13 @@ struct WsClientInfo {
     web_ui_url: Option<String>,
     version: Option<String>,
     connected_at: Instant,
+}
+
+/// Tracks how many envelopes and bytes from a given sender currently reside
+/// in a specific recipient's inbox.
+struct SenderUsage {
+    count: usize,
+    bytes: usize,
 }
 
 #[derive(Clone)]
@@ -95,11 +152,16 @@ struct StoredEnvelope {
     expires_at: Instant,
     message_id: String,
     stored_at: Instant,
+    /// Sender identity, used for QoS tracking and smart eviction.
+    sender_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct InboxQuery {
     limit: Option<usize>,
+    /// If set, only return envelopes whose serialised size is ≤ this threshold.
+    /// Envelopes that exceed the threshold remain in the queue for a later fetch.
+    max_size_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +178,8 @@ struct StoreResponse {
 struct BatchInboxRequest {
     recipient_ids: Vec<String>,
     limit: Option<usize>,
+    /// If set, only return envelopes whose serialised size is ≤ this threshold.
+    max_size_bytes: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -126,6 +190,7 @@ enum BatchStoreStatus {
     Expired,
     TooLarge,
     Invalid,
+    QuotaExceeded,
 }
 
 #[derive(Serialize)]
@@ -166,6 +231,9 @@ impl RelayState {
                 peer_sends: HashMap::new(),
                 ws_clients: HashMap::new(),
                 next_conn_id: 0,
+                sender_inbox_usage: HashMap::new(),
+                directed_last_seen: HashMap::new(),
+                bidirectional_pairs: HashSet::new(),
             })),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
@@ -236,6 +304,13 @@ async fn healthcheck() -> impl IntoResponse {
 }
 
 #[derive(Serialize)]
+struct InboxSenderInfo {
+    sender_id: String,
+    count: usize,
+    bytes: usize,
+}
+
+#[derive(Serialize)]
 struct InboxInfo {
     peer_id: String,
     queue_depth: usize,
@@ -244,6 +319,8 @@ struct InboxInfo {
     delivered_1m: usize,
     delivered_1h: usize,
     delivered_24h: usize,
+    /// Per-sender usage currently queued in this inbox, sorted by bytes descending.
+    senders: Vec<InboxSenderInfo>,
 }
 
 #[derive(Serialize)]
@@ -279,6 +356,25 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
     let total: usize = queues.values().sum();
     let peer_count = inner.peer_last_seen.len();
 
+    // Build a per-recipient sender-usage map for the inbox detail rows.
+    let mut recipient_senders: HashMap<&str, Vec<InboxSenderInfo>> = HashMap::new();
+    for ((sender_id, recipient_id), usage) in &inner.sender_inbox_usage {
+        if usage.count > 0 || usage.bytes > 0 {
+            recipient_senders
+                .entry(recipient_id.as_str())
+                .or_default()
+                .push(InboxSenderInfo {
+                    sender_id: sender_id.clone(),
+                    count: usage.count,
+                    bytes: usage.bytes,
+                });
+        }
+    }
+    // Sort each sender list by bytes descending.
+    for senders in recipient_senders.values_mut() {
+        senders.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.sender_id.cmp(&b.sender_id)));
+    }
+
     // Per-inbox detail, sorted by queue depth descending
     let mut inboxes: Vec<InboxInfo> = inner
         .queues
@@ -296,6 +392,9 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
                 .map(|t| now.duration_since(*t).as_secs())
                 .unwrap_or(0);
             let deliveries = inner.inbox_deliveries.get(peer_id);
+            let senders = recipient_senders
+                .remove(peer_id.as_str())
+                .unwrap_or_default();
             InboxInfo {
                 peer_id: peer_id.clone(),
                 queue_depth,
@@ -308,6 +407,7 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
                 delivered_24h: deliveries
                     .map(|d| count_in_window(d, now, 86400))
                     .unwrap_or(0),
+                senders,
             }
         })
         .collect();
@@ -352,6 +452,7 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
     let uptime_secs = state.start_time.elapsed().as_secs();
     let ws_connections = state.ws_connections.load(Ordering::Relaxed);
 
+    let qos = &state.config.qos;
     Json(serde_json::json!({
         // Legacy fields
         "queues": queues,
@@ -372,6 +473,12 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
             "ttl_secs": state.config.ttl.as_secs(),
             "max_messages": state.config.max_messages,
             "max_bytes": state.config.max_bytes,
+            "qos": {
+                "tier1": { "max_envelopes": qos.tier1.max_envelopes, "max_bytes": qos.tier1.max_bytes },
+                "tier2": { "max_envelopes": qos.tier2.max_envelopes, "max_bytes": qos.tier2.max_bytes },
+                "tier3": { "max_envelopes": qos.tier3.max_envelopes, "max_bytes": qos.tier3.max_bytes },
+                "bidirectional_window_secs": qos.bidirectional_window.as_secs(),
+            }
         }
     }))
 }
@@ -549,6 +656,11 @@ async fn store_envelope(
         Ok(StoreDecision::TooLarge { .. }) => {
             (StatusCode::PAYLOAD_TOO_LARGE, "payload exceeds max size").into_response()
         }
+        Ok(StoreDecision::QuotaExceeded { .. }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "sender quota exceeded for this inbox"})),
+        )
+            .into_response(),
         Err(StoreError::MissingRecipient) => {
             (StatusCode::BAD_REQUEST, "missing recipient_id").into_response()
         }
@@ -621,6 +733,14 @@ async fn store_envelopes_batch(
                         },
                         None,
                     ),
+                    Ok(StoreDecision::QuotaExceeded { message_id }) => (
+                        BatchStoreResult {
+                            message_id: Some(message_id),
+                            status: BatchStoreStatus::QuotaExceeded,
+                            detail: None,
+                        },
+                        None,
+                    ),
                     Err(StoreError::MissingRecipient) => (
                         BatchStoreResult {
                             message_id: None,
@@ -680,11 +800,17 @@ async fn fetch_inbox(
     };
     let now = Instant::now();
     record_peer_connection(&state.config, &mut inner, &recipient_id, now);
-    let (expired_ids, envelopes, latencies) = match inner.queues.get_mut(&recipient_id) {
-        Some(queue) => pop_envelopes(queue, query.limit, now),
-        None => return (StatusCode::OK, Json(Vec::<Value>::new())).into_response(),
-    };
+    let (expired_ids, envelopes, latencies, usage_decrements) =
+        match inner.queues.get_mut(&recipient_id) {
+            Some(queue) => pop_envelopes(queue, query.limit, query.max_size_bytes, now),
+            None => return (StatusCode::OK, Json(Vec::<Value>::new())).into_response(),
+        };
 
+    apply_usage_decrements(
+        &mut inner.sender_inbox_usage,
+        &recipient_id,
+        &usage_decrements,
+    );
     record_deliveries(&mut inner, &recipient_id, &latencies, now);
 
     for message_id in expired_ids {
@@ -715,21 +841,30 @@ async fn fetch_inbox_batch(
     let mut expired_ids = Vec::new();
     let mut results = HashMap::new();
 
-    // Collect (recipient_id, latencies) pairs before calling record_deliveries
+    // Collect (recipient_id, latencies, usage_decrements) before calling record_deliveries
     // to avoid borrowing inner.queues while mutably borrowing inner.inbox_deliveries.
     let mut delivery_records: Vec<(String, Vec<u128>)> = Vec::new();
+    let mut all_usage_decrements: Vec<(String, Vec<(Option<String>, usize)>)> = Vec::new();
 
     for recipient_id in request.recipient_ids {
         record_peer_connection(&state.config, &mut inner, &recipient_id, now);
-        let (expired, envelopes, latencies) = match inner.queues.get_mut(&recipient_id) {
-            Some(queue) => pop_envelopes(queue, request.limit, now),
-            None => (Vec::new(), Vec::new(), Vec::new()),
-        };
+        let (expired, envelopes, latencies, usage_decrements) =
+            match inner.queues.get_mut(&recipient_id) {
+                Some(queue) => pop_envelopes(queue, request.limit, request.max_size_bytes, now),
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
         expired_ids.extend(expired);
         if !latencies.is_empty() {
             delivery_records.push((recipient_id.clone(), latencies));
         }
+        if !usage_decrements.is_empty() {
+            all_usage_decrements.push((recipient_id.clone(), usage_decrements));
+        }
         results.insert(recipient_id, envelopes);
+    }
+
+    for (recipient_id, decrements) in all_usage_decrements {
+        apply_usage_decrements(&mut inner.sender_inbox_usage, &recipient_id, &decrements);
     }
 
     for (recipient_id, latencies) in delivery_records {
@@ -776,24 +911,73 @@ fn message_id_from(value: &Value, body_bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
+/// Pop envelopes from the queue, optionally filtering by max serialised size.
+///
+/// Returns `(expired_ids, envelopes, latencies, usage_decrements)`.
+/// `usage_decrements` contains `(sender_id, size_bytes)` for every envelope removed
+/// from the queue (both expired and delivered), so callers can update `sender_inbox_usage`.
+/// Envelopes whose size exceeds `max_size_bytes` are left in the queue unchanged.
 fn pop_envelopes(
     queue: &mut VecDeque<StoredEnvelope>,
     limit: Option<usize>,
+    max_size_bytes: Option<usize>,
     now: Instant,
-) -> (Vec<String>, Vec<Value>, Vec<u128>) {
-    let expired_ids = prune_expired(queue, now);
+) -> (
+    Vec<String>,
+    Vec<Value>,
+    Vec<u128>,
+    Vec<(Option<String>, usize)>,
+) {
+    let (expired_ids, mut usage_decrements) = prune_expired(queue, now);
     let limit = limit.unwrap_or(queue.len());
     let mut envelopes = Vec::new();
     let mut latencies = Vec::new();
 
-    for _ in 0..limit.min(queue.len()) {
-        if let Some(item) = queue.pop_front() {
-            latencies.push(now.duration_since(item.stored_at).as_millis());
-            envelopes.push(item.body);
+    if let Some(max_size) = max_size_bytes {
+        // Size-filtered: walk front-to-back, pop items within the size budget,
+        // leave oversized items in place for a later (unfiltered) fetch.
+        let mut i = 0;
+        while envelopes.len() < limit && i < queue.len() {
+            if queue[i].size_bytes <= max_size {
+                // remove(i) shifts later elements left; next item lands at index i.
+                if let Some(item) = queue.remove(i) {
+                    latencies.push(now.duration_since(item.stored_at).as_millis());
+                    usage_decrements.push((item.sender_id.clone(), item.size_bytes));
+                    envelopes.push(item.body);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    } else {
+        for _ in 0..limit.min(queue.len()) {
+            if let Some(item) = queue.pop_front() {
+                latencies.push(now.duration_since(item.stored_at).as_millis());
+                usage_decrements.push((item.sender_id.clone(), item.size_bytes));
+                envelopes.push(item.body);
+            }
         }
     }
 
-    (expired_ids, envelopes, latencies)
+    (expired_ids, envelopes, latencies, usage_decrements)
+}
+
+/// Decrement `sender_inbox_usage` for all (sender_id, size_bytes) pairs that were
+/// removed from `recipient_id`'s inbox (expired or delivered).
+fn apply_usage_decrements(
+    sender_inbox_usage: &mut HashMap<(String, String), SenderUsage>,
+    recipient_id: &str,
+    decrements: &[(Option<String>, usize)],
+) {
+    for (sender_id, bytes) in decrements {
+        if let Some(sid) = sender_id {
+            let key = (sid.clone(), recipient_id.to_string());
+            if let Some(usage) = sender_inbox_usage.get_mut(&key) {
+                usage.count = usage.count.saturating_sub(1);
+                usage.bytes = usage.bytes.saturating_sub(*bytes);
+            }
+        }
+    }
 }
 
 /// Push a delivery timestamp for `recipient_id` and update lifetime latency stats.
@@ -848,17 +1032,26 @@ fn count_in_window(deque: &VecDeque<Instant>, now: Instant, window_secs: u64) ->
         .count()
 }
 
-fn prune_expired(queue: &mut VecDeque<StoredEnvelope>, now: Instant) -> Vec<String> {
+/// Remove expired envelopes and return:
+/// - `expired_ids`: message IDs to clean from the dedup map.
+/// - `usage_decrements`: `(sender_id, size_bytes)` for each removed envelope,
+///   so callers can update `sender_inbox_usage`.
+fn prune_expired(
+    queue: &mut VecDeque<StoredEnvelope>,
+    now: Instant,
+) -> (Vec<String>, Vec<(Option<String>, usize)>) {
     let mut expired_ids = Vec::new();
+    let mut usage_decrements = Vec::new();
     queue.retain(|item| {
         if item.expires_at <= now {
             expired_ids.push(item.message_id.clone());
+            usage_decrements.push((item.sender_id.clone(), item.size_bytes));
             false
         } else {
             true
         }
     });
-    expired_ids
+    (expired_ids, usage_decrements)
 }
 
 fn prune_dedup(dedup: &mut HashMap<String, Instant>) {
@@ -904,11 +1097,60 @@ enum StoreDecision {
     TooLarge {
         message_id: String,
     },
+    /// Sender has exceeded the per-tier quota for this recipient's inbox.
+    QuotaExceeded {
+        message_id: String,
+    },
 }
 
 enum StoreError {
     MissingRecipient,
     InvalidPayload(String),
+}
+
+/// Return the QoS tier limits for a (sender → recipient) message given the current
+/// bidirectionality state.
+fn get_tier<'a>(
+    config: &'a RelayQosConfig,
+    inner: &RelayStateInner,
+    sender: &str,
+    recipient: &str,
+    now: Instant,
+) -> &'a TierLimits {
+    // Canonical key: lexicographic-min peer first.
+    let canonical = if sender <= recipient {
+        (sender.to_string(), recipient.to_string())
+    } else {
+        (recipient.to_string(), sender.to_string())
+    };
+
+    // Tier 3: bidirectionality observed and both sides active within the window.
+    if inner.bidirectional_pairs.contains(&canonical) {
+        let s_to_r = inner
+            .directed_last_seen
+            .get(&(sender.to_string(), recipient.to_string()));
+        let r_to_s = inner
+            .directed_last_seen
+            .get(&(recipient.to_string(), sender.to_string()));
+        if let (Some(&s_ts), Some(&r_ts)) = (s_to_r, r_to_s) {
+            if now.duration_since(s_ts) <= config.bidirectional_window
+                && now.duration_since(r_ts) <= config.bidirectional_window
+            {
+                return &config.tier3;
+            }
+        }
+    }
+
+    // Tier 2: recipient has sent to sender at any point in relay history.
+    if inner
+        .directed_last_seen
+        .contains_key(&(recipient.to_string(), sender.to_string()))
+    {
+        return &config.tier2;
+    }
+
+    // Tier 1: no reply ever observed.
+    &config.tier1
 }
 
 fn store_envelope_locked(
@@ -955,7 +1197,8 @@ fn store_envelope_locked(
     inner.dedup.insert(message_id.clone(), expires_at);
 
     if is_broadcast {
-        // Fan out to all known peers except the sender
+        // Fan out to all known peers except the sender.
+        // Broadcasts bypass per-sender QoS (recipient is "*", not a specific peer).
         let recipients: Vec<String> = inner
             .peer_last_seen
             .keys()
@@ -970,12 +1213,14 @@ fn store_envelope_locked(
                 expires_at,
                 message_id: message_id.clone(),
                 stored_at: now,
+                sender_id: sender_id.clone(),
             };
             let queue = inner
                 .queues
                 .entry(rid.clone())
                 .or_insert_with(VecDeque::new);
-            let evicted_ids = prune_expired(queue, now);
+            let (evicted_ids, expired_usage) = prune_expired(queue, now);
+            apply_usage_decrements(&mut inner.sender_inbox_usage, rid, &expired_usage);
             for eid in evicted_ids {
                 inner.dedup.remove(&eid);
             }
@@ -984,6 +1229,13 @@ fn store_envelope_locked(
             {
                 if let Some(evicted) = queue.pop_front() {
                     inner.dedup.remove(&evicted.message_id);
+                    if let Some(ref sid) = evicted.sender_id {
+                        let key = (sid.clone(), rid.clone());
+                        if let Some(usage) = inner.sender_inbox_usage.get_mut(&key) {
+                            usage.count = usage.count.saturating_sub(1);
+                            usage.bytes = usage.bytes.saturating_sub(evicted.size_bytes);
+                        }
+                    }
                 }
             }
             queue.push_back(stored);
@@ -1020,40 +1272,131 @@ fn store_envelope_locked(
         });
     }
 
+    // ── Non-broadcast path ────────────────────────────────────────────────────
+
+    // QoS: update bidirectionality tracking.
+    // Record that sender_id sent to recipient_id at this instant.
+    if let Some(ref sid) = sender_id {
+        inner
+            .directed_last_seen
+            .insert((sid.clone(), recipient_id.clone()), now);
+
+        // Check if the reverse direction has been seen within the window.
+        let reverse_key = (recipient_id.clone(), sid.clone());
+        if let Some(&reverse_ts) = inner.directed_last_seen.get(&reverse_key) {
+            if now.duration_since(reverse_ts) <= config.qos.bidirectional_window {
+                // Both directions active within window → record bidirectionality.
+                let canonical = if sid.as_str() <= recipient_id.as_str() {
+                    (sid.clone(), recipient_id.clone())
+                } else {
+                    (recipient_id.clone(), sid.clone())
+                };
+                inner.bidirectional_pairs.insert(canonical);
+            }
+        }
+    }
+
+    // Get the queue entry, prune expired messages, then apply QoS quota check.
+    let entry = inner.queues.entry(recipient_id.clone());
+    if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
+        log_message(
+            config,
+            format!("relay: inbox created {}", format_peer_id(&recipient_id)),
+        );
+    }
+    let queue = entry.or_insert_with(VecDeque::new);
+
+    // Prune expired envelopes and update usage accounting.
+    let (expired_ids_from_prune, expired_usage) = prune_expired(queue, now);
+    apply_usage_decrements(&mut inner.sender_inbox_usage, &recipient_id, &expired_usage);
+    let mut evicted_ids = expired_ids_from_prune;
+
+    // QoS: check per-sender quota for this inbox (after pruning expired).
+    if let Some(ref sid) = sender_id {
+        let limits = get_tier(&config.qos, inner, sid, &recipient_id, now);
+        let usage = inner
+            .sender_inbox_usage
+            .get(&(sid.clone(), recipient_id.clone()))
+            .map(|u| (u.count, u.bytes))
+            .unwrap_or((0, 0));
+        if usage.0 >= limits.max_envelopes || usage.1 + size_bytes > limits.max_bytes {
+            // Clean up dedup entry we just inserted (we're rejecting the envelope).
+            inner.dedup.remove(&message_id);
+            return Ok(StoreDecision::QuotaExceeded { message_id });
+        }
+    }
+
+    // Evict to make room for the new envelope, preferring the sender with the
+    // most bytes currently in this inbox (fair eviction).
+    let queue = inner.queues.get_mut(&recipient_id).expect("queue exists");
+    while queue.len() >= config.max_messages || queue_bytes(queue) + size_bytes > config.max_bytes {
+        // Find the sender currently holding the most bytes in this inbox.
+        let heaviest_sender: Option<String> = {
+            let mut sender_bytes: HashMap<&str, usize> = HashMap::new();
+            for item in queue.iter() {
+                if let Some(ref sid) = item.sender_id {
+                    *sender_bytes.entry(sid.as_str()).or_insert(0) += item.size_bytes;
+                }
+            }
+            sender_bytes
+                .into_iter()
+                .max_by_key(|(_, b)| *b)
+                .map(|(s, _)| s.to_string())
+        };
+
+        // Remove the oldest message from that sender (or fall back to front).
+        let evicted = if let Some(ref heaviest) = heaviest_sender {
+            let pos = queue
+                .iter()
+                .position(|item| item.sender_id.as_deref() == Some(heaviest.as_str()));
+            pos.and_then(|i| queue.remove(i))
+        } else {
+            queue.pop_front()
+        };
+
+        if let Some(ev) = evicted {
+            evicted_ids.push(ev.message_id.clone());
+            if let Some(ref sid) = ev.sender_id {
+                let key = (sid.clone(), recipient_id.clone());
+                if let Some(usage) = inner.sender_inbox_usage.get_mut(&key) {
+                    usage.count = usage.count.saturating_sub(1);
+                    usage.bytes = usage.bytes.saturating_sub(ev.size_bytes);
+                }
+            }
+        } else {
+            break; // queue is empty
+        }
+    }
+
+    // Enqueue the new envelope.
     let stored = StoredEnvelope {
         body: payload,
         size_bytes,
         expires_at,
         message_id: message_id.clone(),
         stored_at: now,
+        sender_id: sender_id.clone(),
     };
-    let mut evicted_ids = Vec::new();
-    {
-        let entry = inner.queues.entry(recipient_id.clone());
-        if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
-            log_message(
-                config,
-                format!("relay: inbox created {}", format_peer_id(&recipient_id)),
-            );
-        }
-        let queue = entry.or_insert_with(VecDeque::new);
-        evicted_ids.extend(prune_expired(queue, now));
+    inner
+        .queues
+        .get_mut(&recipient_id)
+        .expect("queue exists")
+        .push_back(stored);
 
-        while queue.len() >= config.max_messages
-            || queue_bytes(queue) + size_bytes > config.max_bytes
-        {
-            if let Some(evicted) = queue.pop_front() {
-                evicted_ids.push(evicted.message_id);
-            }
-        }
-
-        queue.push_back(stored);
+    // Update sender_inbox_usage for the new envelope.
+    if let Some(ref sid) = sender_id {
+        let usage = inner
+            .sender_inbox_usage
+            .entry((sid.clone(), recipient_id.clone()))
+            .or_insert(SenderUsage { count: 0, bytes: 0 });
+        usage.count += 1;
+        usage.bytes += size_bytes;
     }
 
     inner.total_stored += 1;
 
-    for message_id in evicted_ids {
-        inner.dedup.remove(&message_id);
+    for mid in evicted_ids {
+        inner.dedup.remove(&mid);
     }
 
     if let Some(sender_id) = sender_id {

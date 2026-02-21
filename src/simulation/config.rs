@@ -438,6 +438,7 @@ impl RelayConfigToml {
             peer_log_interval: Duration::from_secs(self.peer_log_interval_seconds.unwrap_or(30)),
             log_sink: None,
             pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qos: crate::relay::RelayQosConfig::default(),
         }
     }
 }

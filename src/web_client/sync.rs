@@ -176,14 +176,32 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
         my_peer_id: keypair.id.clone(),
     }));
 
-    // sync_inbox calls the handler for each envelope during processing.
-    let outcome = relay_client.sync_inbox(None).map_err(|e| e.to_string())?;
+    // Two-pass fetch: small envelopes first (protocol/text messages) so the UI
+    // unblocks quickly, then a second pass to drain any remaining large-payload
+    // envelopes (attachments, etc.) that were left behind by the size filter.
+    const SMALL_ENVELOPE_THRESHOLD: usize = 8 * 1024; // 8 KB
 
-    if outcome.fetched == 0 {
+    let outcome_small = relay_client
+        .sync_inbox_size_filtered(None, Some(SMALL_ENVELOPE_THRESHOLD))
+        .map_err(|e| e.to_string())?;
+
+    let outcome_large = relay_client.sync_inbox(None).map_err(|e| e.to_string())?;
+
+    let total_fetched = outcome_small.fetched + outcome_large.fetched;
+    if total_fetched == 0 {
         return Ok(());
     }
 
-    crate::tlog!("sync: fetched {} envelope(s) from relay", outcome.fetched);
+    if outcome_small.fetched > 0 && outcome_large.fetched > 0 {
+        crate::tlog!(
+            "sync: fetched {} envelope(s) from relay ({} small, {} large)",
+            total_fetched,
+            outcome_small.fetched,
+            outcome_large.fetched
+        );
+    } else {
+        crate::tlog!("sync: fetched {} envelope(s) from relay", total_fetched);
+    }
 
     let now = now_secs();
     {

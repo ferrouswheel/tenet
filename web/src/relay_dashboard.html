@@ -42,6 +42,7 @@ tr:hover td{background:#fafafa}
 .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:#f0f4ff;color:#2563eb;font-weight:500}
 .empty{padding:24px;text-align:center;color:#bbb;font-size:13px}
 .footer{text-align:center;color:#bbb;font-size:12px;margin-top:16px;margin-bottom:32px}
+.sender-row{font-size:12px;line-height:1.6}
 @media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr)}.lat-row{flex-wrap:wrap}}
 </style>
 </head>
@@ -118,15 +119,24 @@ async function refresh(){
   else{
     const maxB=Math.max(...inboxes.map(i=>i.queue_bytes),1);
     ib.innerHTML='<table><thead><tr>'+
-      '<th>Peer ID</th><th>Queue</th><th>Size</th><th>Last Seen</th><th>Delivered (1m / 1h / 24h)</th>'+
+      '<th>Peer ID</th><th>Queue</th><th>Size</th><th>Last Seen</th><th>Delivered (1m / 1h / 24h)</th><th>Top Senders</th>'+
       '</tr></thead><tbody>'+
-    inboxes.map(i=>'<tr>'+
-      '<td class="mono">'+fmtPeer(i.peer_id)+'</td>'+
-      '<td>'+i.queue_depth+'</td>'+
-      '<td>'+fmtBytes(i.queue_bytes)+'<span class="bar-wrap"><div class="bar-fill" style="width:'+Math.round(i.queue_bytes/maxB*100)+'%"></div></span></td>'+
-      '<td class="muted">'+fmtDur(i.last_seen_secs)+' ago</td>'+
-      '<td>'+rateCell(i.delivered_1m||0,i.delivered_1h||0,i.delivered_24h||0)+'</td>'+
-      '</tr>').join('')+'</tbody></table>'
+    inboxes.map(i=>{
+      const senders=i.senders||[];
+      const senderCell=senders.length===0?'<span class="muted">\u2014</span>':
+        senders.slice(0,3).map(s=>
+          '<div class="sender-row"><span class="mono">'+fmtPeer(s.sender_id)+'</span>'+
+          ' <span class="muted">('+s.count+' msg, '+fmtBytes(s.bytes)+')</span></div>'
+        ).join('')+(senders.length>3?'<div class="muted">+' +(senders.length-3)+' more</div>':'');
+      return '<tr>'+
+        '<td class="mono">'+fmtPeer(i.peer_id)+'</td>'+
+        '<td>'+i.queue_depth+'</td>'+
+        '<td>'+fmtBytes(i.queue_bytes)+'<span class="bar-wrap"><div class="bar-fill" style="width:'+Math.round(i.queue_bytes/maxB*100)+'%"></div></span></td>'+
+        '<td class="muted">'+fmtDur(i.last_seen_secs)+' ago</td>'+
+        '<td>'+rateCell(i.delivered_1m||0,i.delivered_1h||0,i.delivered_24h||0)+'</td>'+
+        '<td>'+senderCell+'</td>'+
+        '</tr>';
+    }).join('')+'</tbody></table>'
   }
 
   // Latency

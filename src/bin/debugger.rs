@@ -179,6 +179,7 @@ fn start_in_process_relay(rt: &tokio::runtime::Runtime) -> Result<SocketAddr, Bo
             peer_log_interval: Duration::ZERO,
             log_sink: Some(Arc::new(|_| {})), // silence relay logs
             pause_flag: Arc::new(AtomicBool::new(false)),
+            qos: tenet::relay::RelayQosConfig::default(),
         };
         let state = RelayState::new(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

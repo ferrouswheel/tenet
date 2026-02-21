@@ -2,7 +2,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tenet::relay::{app, RelayConfig, RelayState};
+use tenet::relay::{app, RelayConfig, RelayQosConfig, RelayState, TierLimits};
 
 #[tokio::main]
 async fn main() {
@@ -22,6 +22,24 @@ async fn main() {
         peer_log_interval: Duration::from_secs(env_u64("TENET_RELAY_PEER_LOG_INTERVAL_SECS", 30)),
         log_sink: None,
         pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        qos: RelayQosConfig {
+            tier1: TierLimits {
+                max_envelopes: env_usize("TENET_QOS_TIER1_MAX_ENVELOPES", 20),
+                max_bytes: env_usize("TENET_QOS_TIER1_MAX_BYTES", 256 * 1024),
+            },
+            tier2: TierLimits {
+                max_envelopes: env_usize("TENET_QOS_TIER2_MAX_ENVELOPES", 100),
+                max_bytes: env_usize("TENET_QOS_TIER2_MAX_BYTES", 2 * 1024 * 1024),
+            },
+            tier3: TierLimits {
+                max_envelopes: env_usize("TENET_QOS_TIER3_MAX_ENVELOPES", 500),
+                max_bytes: env_usize("TENET_QOS_TIER3_MAX_BYTES", 10 * 1024 * 1024),
+            },
+            bidirectional_window: Duration::from_secs(env_u64(
+                "TENET_QOS_BIDIRECTIONAL_WINDOW_SECS",
+                7 * 24 * 3600,
+            )),
+        },
     };
 
     let state = RelayState::new(config);

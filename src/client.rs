@@ -957,6 +957,12 @@ impl RelayClient {
                 errors: Vec::new(),
             });
         }
+        self.process_envelopes(envelopes)
+    }
+
+    /// Process a batch of already-fetched envelopes: verify, decrypt, dispatch to handler.
+    fn process_envelopes(&mut self, envelopes: Vec<Envelope>) -> Result<SyncOutcome, ClientError> {
+        let fetched = envelopes.len();
 
         // Log what message kinds we fetched
         for env in &envelopes {
@@ -1245,11 +1251,26 @@ impl RelayClient {
     }
 
     fn fetch_inbox(&self, limit: Option<usize>) -> Result<Vec<Envelope>, ClientError> {
+        self.fetch_inbox_filtered(limit, None)
+    }
+
+    fn fetch_inbox_filtered(
+        &self,
+        limit: Option<usize>,
+        max_size_bytes: Option<usize>,
+    ) -> Result<Vec<Envelope>, ClientError> {
         let base = self.config.relay_url().trim_end_matches('/');
-        let url = if let Some(limit) = limit {
-            format!("{base}/inbox/{}?limit={limit}", self.id())
-        } else {
+        let mut params: Vec<String> = Vec::new();
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        if let Some(msb) = max_size_bytes {
+            params.push(format!("max_size_bytes={msb}"));
+        }
+        let url = if params.is_empty() {
             format!("{base}/inbox/{}", self.id())
+        } else {
+            format!("{base}/inbox/{}?{}", self.id(), params.join("&"))
         };
         let token =
             crate::crypto::make_relay_auth_token(&self.keypair.signing_private_key_hex, self.id())
@@ -1261,6 +1282,31 @@ impl RelayClient {
         response
             .into_json()
             .map_err(|error| ClientError::Protocol(format!("deserialize inbox: {error}")))
+    }
+
+    /// Fetch and process envelopes from the relay, applying a size filter so that
+    /// only envelopes whose serialised size is ≤ `max_size_bytes` are returned.
+    /// Oversized envelopes remain in the relay queue for a subsequent unfiltered fetch.
+    pub fn sync_inbox_size_filtered(
+        &mut self,
+        limit: Option<usize>,
+        max_size_bytes: Option<usize>,
+    ) -> Result<SyncOutcome, ClientError> {
+        if !self.online {
+            return Err(ClientError::Offline);
+        }
+        let envelopes = self.fetch_inbox_filtered(limit, max_size_bytes)?;
+        let fetched = envelopes.len();
+        if fetched == 0 {
+            return Ok(SyncOutcome {
+                events: Vec::new(),
+                fetched: 0,
+                messages: Vec::new(),
+                errors: Vec::new(),
+            });
+        }
+        // Reuse the same processing logic as sync_inbox by delegating to a shared helper.
+        self.process_envelopes(envelopes)
     }
 }
 
