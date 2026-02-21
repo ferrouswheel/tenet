@@ -1,5 +1,6 @@
 // UniFFI Interface Definition for Tenet Android FFI
 // Phase 1: Identity init, sync, list/send messages, peer management
+// Phase 2: Conversations, replies, reactions, attachments, group messages
 
 namespace tenet_ffi {};
 
@@ -49,72 +50,138 @@ dictionary FfiSyncResult {
     sequence<string> errors;
 };
 
+/// Summary of a single DM conversation (one entry per peer).
+dictionary FfiConversation {
+    string peer_id;
+    string? display_name;
+    string? last_message;
+    i64 last_timestamp;
+    u32 unread_count;
+};
+
+/// Aggregated reaction counts plus the local user's own reaction.
+dictionary FfiReactionSummary {
+    u32 upvotes;
+    u32 downvotes;
+    /// "upvote" | "downvote" | null
+    string? my_reaction;
+};
+
 // ---------------------------------------------------------------------------
 // TenetClient interface
-//
-// Wraps RelayClient + Storage behind a Mutex.  All calls are synchronous —
-// Kotlin callers dispatch to Dispatchers.IO so the FFI blocking never touches
-// the main thread.
 // ---------------------------------------------------------------------------
 
 interface TenetClient {
     // Initialize (or load) an identity in data_dir and set the relay URL.
-    // Creates a new identity if none exists; loads the existing one otherwise.
     [Throws=TenetError]
     constructor(string data_dir, string relay_url);
 
-    // Return the local peer ID (derived from the Ed25519 signing public key).
     string my_peer_id();
-
-    // Return the configured relay URL.
     string relay_url();
 
     // ---------------------------------------------------------------------------
-    // Messages
+    // Messages — individual access
     // ---------------------------------------------------------------------------
 
-    // List messages from the local database.
-    // kind: optional filter — "public" | "direct" | "friend_group"
-    // limit: max rows to return (use 50 as a sensible default)
-    // before_ts: optional upper-bound timestamp for pagination (pass null for latest)
+    /// Fetch a single message by ID, or null if not found.
+    [Throws=TenetError]
+    FfiMessage? get_message(string message_id);
+
+    /// List messages from the local database.
+    /// kind: optional filter — "public" | "direct" | "friend_group"
     [Throws=TenetError]
     sequence<FfiMessage> list_messages(string? kind, u32 limit, i64? before_ts);
 
-    // Mark a message as read.
     [Throws=TenetError]
     void mark_read(string message_id);
 
-    // Send an end-to-end encrypted direct message to a known peer.
+    // ---------------------------------------------------------------------------
+    // Direct messages
+    // ---------------------------------------------------------------------------
+
+    /// Send an encrypted direct message to a known peer.
     [Throws=TenetError]
     void send_direct(string recipient_id, string body);
 
-    // Send a public (broadcast) message.
+    /// List messages exchanged with a specific peer (both directions), newest first.
+    [Throws=TenetError]
+    sequence<FfiMessage> list_direct_messages(string peer_id, u32 limit, i64? before_ts);
+
+    // ---------------------------------------------------------------------------
+    // Public / group messages
+    // ---------------------------------------------------------------------------
+
     [Throws=TenetError]
     void send_public(string body);
+
+    [Throws=TenetError]
+    void send_group(string group_id, string body);
+
+    // ---------------------------------------------------------------------------
+    // Replies
+    // ---------------------------------------------------------------------------
+
+    /// Reply to a public or friend-group message.
+    [Throws=TenetError]
+    void reply_to(string parent_message_id, string body);
+
+    /// List replies to a message, oldest first (chronological thread order).
+    [Throws=TenetError]
+    sequence<FfiMessage> list_replies(string parent_message_id, u32 limit, i64? before_ts);
+
+    // ---------------------------------------------------------------------------
+    // Reactions
+    // ---------------------------------------------------------------------------
+
+    /// Add or update a reaction.  reaction must be "upvote" or "downvote".
+    [Throws=TenetError]
+    FfiReactionSummary react(string target_message_id, string reaction);
+
+    /// Remove the local user's reaction from a message.
+    [Throws=TenetError]
+    FfiReactionSummary unreact(string target_message_id);
+
+    /// Get aggregated reaction counts for a message.
+    [Throws=TenetError]
+    FfiReactionSummary get_reactions(string target_message_id);
+
+    // ---------------------------------------------------------------------------
+    // Attachments
+    // ---------------------------------------------------------------------------
+
+    /// Content-address and persist raw bytes.  Returns the content hash (key for download).
+    [Throws=TenetError]
+    string upload_attachment(bytes data, string content_type);
+
+    /// Retrieve attachment bytes by content hash.
+    [Throws=TenetError]
+    bytes download_attachment(string content_hash);
 
     // ---------------------------------------------------------------------------
     // Sync
     // ---------------------------------------------------------------------------
 
-    // Fetch envelopes from the relay, decrypt and persist them.
-    // Returns a summary of what was fetched and how many were new.
     [Throws=TenetError]
     FfiSyncResult sync();
+
+    // ---------------------------------------------------------------------------
+    // Conversations
+    // ---------------------------------------------------------------------------
+
+    /// List DM conversations grouped by peer, sorted by most-recent-first.
+    [Throws=TenetError]
+    sequence<FfiConversation> list_conversations();
 
     // ---------------------------------------------------------------------------
     // Peers
     // ---------------------------------------------------------------------------
 
-    // List all known peers.
     [Throws=TenetError]
     sequence<FfiPeer> list_peers();
 
-    // Add a peer by peer ID and their Ed25519 signing public key (hex).
-    // display_name is stored locally for UI purposes only.
     [Throws=TenetError]
     void add_peer(string peer_id, string? display_name, string signing_public_key_hex);
 
-    // Remove a peer and all associated data.
     [Throws=TenetError]
     void remove_peer(string peer_id);
 };

@@ -35,3 +35,20 @@ pub struct FfiSyncResult {
     pub new_messages: u32,
     pub errors: Vec<String>,
 }
+
+/// Summary of a single DM conversation.
+pub struct FfiConversation {
+    pub peer_id: String,
+    pub display_name: Option<String>,
+    pub last_message: Option<String>,
+    pub last_timestamp: i64,
+    pub unread_count: u32,
+}
+
+/// Aggregated reaction counts plus the local user's own reaction.
+pub struct FfiReactionSummary {
+    pub upvotes: u32,
+    pub downvotes: u32,
+    /// "upvote" | "downvote" | None
+    pub my_reaction: Option<String>,
+}

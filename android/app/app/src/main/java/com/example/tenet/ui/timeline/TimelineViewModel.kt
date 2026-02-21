@@ -11,11 +11,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+enum class TimelineTab { PUBLIC, FRIEND_GROUP }
+
 data class TimelineUiState(
     val messages: List<FfiMessage> = emptyList(),
     val isLoading: Boolean = false,
     val isSyncing: Boolean = false,
     val error: String? = null,
+    val activeTab: TimelineTab = TimelineTab.PUBLIC,
 )
 
 @HiltViewModel
@@ -30,14 +33,23 @@ class TimelineViewModel @Inject constructor(
         loadMessages()
     }
 
+    fun selectTab(tab: TimelineTab) {
+        _uiState.value = _uiState.value.copy(activeTab = tab)
+        loadMessages()
+    }
+
     fun loadMessages() {
+        val kind = when (_uiState.value.activeTab) {
+            TimelineTab.PUBLIC -> "public"
+            TimelineTab.FRIEND_GROUP -> "friend_group"
+        }
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, error = null)
             try {
-                val messages = repository.listMessages(kind = "public", limit = 50u)
-                _uiState.value = TimelineUiState(messages = messages)
+                val messages = repository.listMessages(kind = kind, limit = 50u)
+                _uiState.value = _uiState.value.copy(isLoading = false, messages = messages)
             } catch (e: Exception) {
-                _uiState.value = TimelineUiState(error = e.message)
+                _uiState.value = _uiState.value.copy(isLoading = false, error = e.message)
             }
         }
     }
@@ -47,8 +59,12 @@ class TimelineViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(isSyncing = true, error = null)
             try {
                 repository.sync()
-                val messages = repository.listMessages(kind = "public", limit = 50u)
-                _uiState.value = TimelineUiState(messages = messages)
+                val kind = when (_uiState.value.activeTab) {
+                    TimelineTab.PUBLIC -> "public"
+                    TimelineTab.FRIEND_GROUP -> "friend_group"
+                }
+                val messages = repository.listMessages(kind = kind, limit = 50u)
+                _uiState.value = _uiState.value.copy(isSyncing = false, messages = messages)
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(isSyncing = false, error = e.message)
             }

@@ -2247,7 +2247,10 @@ dependencies = [
 name = "tenet-ffi"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "rand",
  "serde_json",
+ "sha2",
  "tenet",
  "uniffi",
 ]

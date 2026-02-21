@@ -10,6 +10,9 @@ crate-type = ["cdylib", "staticlib"]
 tenet = { path = "../../" }
 uniffi = "0.28"
 serde_json = "1.0"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

@@ -1,8 +1,10 @@
 package com.example.tenet.data
 
 import android.content.Context
+import com.example.tenet.uniffi.FfiConversation
 import com.example.tenet.uniffi.FfiMessage
 import com.example.tenet.uniffi.FfiPeer
+import com.example.tenet.uniffi.FfiReactionSummary
 import com.example.tenet.uniffi.FfiSyncResult
 import com.example.tenet.uniffi.TenetClient
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -68,6 +70,10 @@ class TenetRepository @Inject constructor(
     // Messages
     // ---------------------------------------------------------------------------
 
+    suspend fun getMessage(messageId: String): FfiMessage? = withContext(Dispatchers.IO) {
+        requireClient().getMessage(messageId)
+    }
+
     suspend fun listMessages(
         kind: String? = null,
         limit: UInt = 50u,
@@ -80,13 +86,82 @@ class TenetRepository @Inject constructor(
         requireClient().markRead(messageId)
     }
 
+    // ---------------------------------------------------------------------------
+    // Direct messages
+    // ---------------------------------------------------------------------------
+
     suspend fun sendDirect(recipientId: String, body: String) = withContext(Dispatchers.IO) {
         requireClient().sendDirect(recipientId, body)
     }
 
+    suspend fun listDirectMessages(
+        peerId: String,
+        limit: UInt = 50u,
+        beforeTs: Long? = null,
+    ): List<FfiMessage> = withContext(Dispatchers.IO) {
+        requireClient().listDirectMessages(peerId, limit, beforeTs)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Public / group messages
+    // ---------------------------------------------------------------------------
+
     suspend fun sendPublic(body: String) = withContext(Dispatchers.IO) {
         requireClient().sendPublic(body)
     }
+
+    suspend fun sendGroup(groupId: String, body: String) = withContext(Dispatchers.IO) {
+        requireClient().sendGroup(groupId, body)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Replies
+    // ---------------------------------------------------------------------------
+
+    suspend fun replyTo(parentMessageId: String, body: String) = withContext(Dispatchers.IO) {
+        requireClient().replyTo(parentMessageId, body)
+    }
+
+    suspend fun listReplies(
+        parentMessageId: String,
+        limit: UInt = 50u,
+        beforeTs: Long? = null,
+    ): List<FfiMessage> = withContext(Dispatchers.IO) {
+        requireClient().listReplies(parentMessageId, limit, beforeTs)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Reactions
+    // ---------------------------------------------------------------------------
+
+    suspend fun react(targetMessageId: String, reaction: String): FfiReactionSummary =
+        withContext(Dispatchers.IO) {
+            requireClient().react(targetMessageId, reaction)
+        }
+
+    suspend fun unreact(targetMessageId: String): FfiReactionSummary =
+        withContext(Dispatchers.IO) {
+            requireClient().unreact(targetMessageId)
+        }
+
+    suspend fun getReactions(targetMessageId: String): FfiReactionSummary =
+        withContext(Dispatchers.IO) {
+            requireClient().getReactions(targetMessageId)
+        }
+
+    // ---------------------------------------------------------------------------
+    // Attachments
+    // ---------------------------------------------------------------------------
+
+    suspend fun uploadAttachment(data: ByteArray, contentType: String): String =
+        withContext(Dispatchers.IO) {
+            requireClient().uploadAttachment(data, contentType)
+        }
+
+    suspend fun downloadAttachment(contentHash: String): ByteArray =
+        withContext(Dispatchers.IO) {
+            requireClient().downloadAttachment(contentHash)
+        }
 
     // ---------------------------------------------------------------------------
     // Sync
@@ -94,6 +169,14 @@ class TenetRepository @Inject constructor(
 
     suspend fun sync(): FfiSyncResult = withContext(Dispatchers.IO) {
         requireClient().sync()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Conversations
+    // ---------------------------------------------------------------------------
+
+    suspend fun listConversations(): List<FfiConversation> = withContext(Dispatchers.IO) {
+        requireClient().listConversations()
     }
 
     // ---------------------------------------------------------------------------

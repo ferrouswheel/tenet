@@ -745,13 +745,85 @@ echo "==> Done. Run 'cd android/app && ./gradlew assembleDebug' to build the APK
   relay URL will skip Setup and go directly to Timeline (to be wired in Phase 2 by checking
   `TenetRepository.isInitialized()` in a splash/entry composable).
 
-### Phase 2 — Core messaging
+### Phase 2 — Core messaging ✓ Complete
 
-- [ ] Compose screen: send public, direct, and group messages
-- [ ] Conversation list + conversation detail (DMs)
-- [ ] Post detail with reply thread
-- [ ] Reactions (upvote / downvote)
-- [ ] Attachment upload (image picker) and inline display
+- [x] Compose screen: send public messages
+- [x] Conversation list + conversation detail (DMs)
+- [x] Post detail with reply thread
+- [x] Reactions (upvote / downvote)
+- [x] Attachment upload / download (content-addressed, SHA256 hash)
+- [x] Friend-group messages (`send_group`) via direct protocol path (see note)
+- [x] Bottom navigation bar (Timeline ↔ Messages)
+
+#### Phase 2 implementation notes
+
+**Rust FFI additions (`android/tenet-ffi/src/lib.rs`)**
+
+- Added `sha2 = "0.10"`, `base64 = "0.22"`, and `rand = "0.8"` to `android/tenet-ffi/Cargo.toml`
+  for attachment hashing, base64url encoding, and random salts.
+
+- **`send_group` bypasses `RelayClient::send_group_message()`** because that method calls
+  `group.is_member(self.id())` and `GroupManager::add_group_key()` creates a `GroupInfo` with an
+  empty member set, causing the check to fail for the local peer. The FFI layer instead calls the
+  protocol primitives directly:
+  ```rust
+  let payload = build_group_message_payload(body.as_bytes(), &group_key, group_id.as_bytes())?;
+  let envelope = build_envelope_from_payload(..., MessageKind::FriendGroup, ...)?;
+  post_envelope(&inner.relay_url, &envelope)?;
+  ```
+
+- **`list_direct_messages`** — there is no native peer-pair index in storage. The implementation
+  fetches a batch of `"direct"` messages (4× the requested limit, min 200) and filters to those
+  where `sender_id` or `recipient_id` matches the requested peer.
+
+- **Reactions** use a raw JSON body in a plaintext `MessageKind::Meta` envelope. The `MetaMessage`
+  enum has no `Reaction` variant; the web client embeds the reaction as a raw string body, so the
+  FFI layer mirrors this pattern exactly:
+  ```rust
+  let reaction_body = serde_json::json!({
+      "target_message_id": &target_message_id,
+      "reaction": &reaction,
+      "timestamp": now,
+  }).to_string();
+  // build_plaintext_envelope(..., MessageKind::Meta, ..., &reaction_body, ...)
+  ```
+
+- **Attachments** use SHA256 content-addressing: `SHA256(data)` → base64url-encoded
+  `content_hash` stored via `storage.insert_attachment()`. This matches the web client's
+  `ContentId` scheme.
+
+- **`list_conversations`** calls `storage.list_conversations(&my_id)` (takes the local peer ID to
+  exclude self from the peer column), then enriches each row with the display name from the peer
+  table.
+
+- **Helper functions** extracted to keep `TenetClient` impl readable:
+  `client_config()`, `row_to_ffi()`, `make_msg_row()`, `reaction_summary()`.
+
+**Android Kotlin additions (`android/app/`)**
+
+- **New screens and view models** under `ui/`:
+  - `compose/` — `ComposeScreen` + `ComposeViewModel`: text field + send button; posts as public
+    message; returns to caller on success.
+  - `conversations/` — `ConversationsScreen` + `ConversationsViewModel`: DM list grouped by peer,
+    showing last message, timestamp, and unread badge.
+  - `conversations/` — `ConversationDetailScreen` + `ConversationDetailViewModel`: bubble-style
+    chat thread (newest at bottom via `reverseLayout = true`), compose bar for new DMs.
+    `SavedStateHandle["peerId"]` supplies the destination peer.
+  - `postdetail/` — `PostDetailScreen` + `PostDetailViewModel`: parent post card with
+    upvote/downvote buttons, scrollable reply thread, and reply compose bar.
+    `SavedStateHandle["messageId"]` supplies the target message.
+
+- **`TimelineViewModel`** gains a `TimelineTab` enum (`PUBLIC` / `FRIEND_GROUP`) and
+  `selectTab()` function; `loadMessages()` and `sync()` both respect the active tab.
+
+- **`TimelineScreen`** now shows a `TabRow` for Public/Friends, a compose `FloatingActionButton`
+  (+ a smaller sync FAB above it), and reaction icons on each card as visual affordances.
+  Tapping a card navigates to `PostDetailScreen`.
+
+- **`TenetNavHost`** restructured with an outer `Scaffold` holding a `NavigationBar` that is only
+  shown for the `timeline` and `conversations` routes.  Route constants split into base path
+  (`POST_BASE = "post"`) and full pattern (`POST_DETAIL = "post/{messageId}"`) to allow safe
+  `navController.navigate("post/$id")` without string template collision.
 
 ### Phase 3 — Social features
 
