@@ -104,4 +104,10 @@ dependencies {
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
+
+    // QR code — generation and scanning (ZXing Android Embedded bundles ZXing core)
+    implementation(libs.zxing.android.embedded)
+
+    // Unit testing
+    testImplementation("junit:junit:4.13.2")
 }

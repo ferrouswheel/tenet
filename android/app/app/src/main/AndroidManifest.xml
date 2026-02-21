@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Camera permission for QR code scanning via ZXing Android Embedded -->
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <application
         android:name=".TenetApplication"
@@ -16,13 +19,17 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.Tenet">
+            <!-- App launcher -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Deep link handler for notification taps -->
+            <!-- Deep-link handler for notification taps.
+                 URIs: tenet://conversations, tenet://friends, tenet://groups,
+                        tenet://conversation/<peerId>, tenet://post/<messageId> -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -30,12 +37,14 @@
                 <data android:scheme="tenet" />
             </intent-filter>
 
-            <!-- Share-to intent: receive shared text/images from other apps -->
+            <!-- Share-to intent: receive shared text from other apps -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
             </intent-filter>
+
+            <!-- Share-to intent: receive shared images from other apps -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

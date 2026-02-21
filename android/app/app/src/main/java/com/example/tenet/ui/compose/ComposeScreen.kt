@@ -48,7 +48,8 @@ fun ComposeScreen(
         return
     }
 
-    var body by remember { mutableStateOf("") }
+    // Seed body from sharedText nav argument (set when opened from a share-to intent).
+    var body by remember { mutableStateOf(state.initialBody) }
 
     Scaffold(
         topBar = {
