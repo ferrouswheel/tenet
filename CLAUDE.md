@@ -37,6 +37,7 @@ The web application UI is automatically built during `cargo build` via the `buil
    - `index.html` - HTML template with `{{STYLES}}` and `{{SCRIPTS}}` placeholders
    - `styles.css` - CSS styles
    - `app.js` - JavaScript application code
+   - `relay_dashboard.html` - Standalone relay status dashboard (not inlined; served separately)
 
 2. The build script inlines CSS and JS into the HTML template and outputs `web/dist/index.html`
 
@@ -63,6 +64,9 @@ cargo run --bin tenet-debugger -- --peers 4 --relay http://127.0.0.1:8080
 # Simulation scenario runner
 cargo run --bin tenet-sim -- scenarios/small_dense_6.toml
 cargo run --bin tenet-sim -- --tui scenarios/small_dense_6.toml
+
+# Web client server (REST API + WebSocket + embedded SPA)
+cargo run --bin tenet-web
 ```
 
 ## Architecture
@@ -81,33 +85,14 @@ See `docs/architecture.md` for detailed design and threat model documentation.
 | `src/identity.rs` | Multi-identity management, config, legacy migration |
 | `src/storage.rs` | SQLite persistence layer (messages, peers, groups, profiles, etc.) |
 | `src/groups.rs` | Group messaging: `GroupInfo`, `GroupManager`, membership |
+| `src/logging.rs` | Structured logging: `tlog!` macro, colour-coded peer/message IDs, configurable writer |
+| `src/message_handler.rs` | `StorageMessageHandler` implementing `MessageHandler` trait for protocol-level persistence |
 | `src/web_client/` | Web server module (REST API + WebSocket + embedded SPA) |
 | `src/simulation/` | Simulation harness, scenario configuration, metrics tracking |
 
-### Web Client Submodules (`src/web_client/`)
+### Web Client (`src/web_client/`)
 
-The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is organized as:
-
-| File | Purpose |
-|------|---------|
-| `mod.rs` | Entry point `run()`: CLI parsing, identity resolution, server startup |
-| `config.rs` | `Cli` (clap), `Config`, constants (`DEFAULT_TTL_SECONDS`, etc.) |
-| `state.rs` | `AppState`, `SharedState` (`Arc<Mutex<AppState>>`), `WsEvent` enum |
-| `router.rs` | `build_router()` — all Axum route definitions |
-| `sync.rs` | Background relay sync loop, envelope processing, online announcements |
-| `static_files.rs` | Embedded SPA serving via `rust-embed` |
-| `utils.rs` | `api_error()`, `message_to_json()`, `link_attachments()`, `now_secs()`, `SendAttachmentRef` |
-| `handlers/health.rs` | `GET /api/health` |
-| `handlers/messages.rs` | Message CRUD + send direct/public/group, mark read |
-| `handlers/peers.rs` | Peer CRUD + key validation |
-| `handlers/friends.rs` | Friend request lifecycle (send, list, accept, ignore, block) |
-| `handlers/groups.rs` | Group CRUD + symmetric key distribution |
-| `handlers/attachments.rs` | Multipart upload + content-addressed download |
-| `handlers/reactions.rs` | Upvote/downvote reactions |
-| `handlers/replies.rs` | Threaded replies to public/group messages |
-| `handlers/profiles.rs` | Profile management + broadcasting to friends |
-| `handlers/conversations.rs` | Direct message conversation listing |
-| `handlers/websocket.rs` | WebSocket upgrade + broadcast connection |
+The `tenet-web` binary delegates to `tenet::web_client::run()`. REST API + WebSocket + embedded SPA. See `src/web_client/CLAUDE.md` for the full module and handler breakdown.
 
 ### Simulation Submodules
 
@@ -116,6 +101,7 @@ The `tenet-web` binary delegates to `tenet::web_client::run()`. The module is or
 | `simulation/mod.rs` | `SimulationHarness` orchestration and message routing |
 | `simulation/config.rs` | TOML-serializable scenario configuration types |
 | `simulation/scenario.rs` | Graph building, schedule generation, scenario execution |
+| `simulation/event.rs` | `Event` types, `EventQueue`, `EventLog`, `SimulationClock`, `TimeControlMode` |
 | `simulation/metrics.rs` | Latency tracking, delivery statistics, aggregation |
 | `simulation/random.rs` | Distribution sampling (Poisson, Zipf, etc.) |
 
@@ -176,6 +162,7 @@ Test files:
 - `tests/relay_tests.rs` - HTTP relay endpoints
 - `tests/simulation_client_tests.rs` - Client behavior
 - `tests/simulation_harness_tests.rs` - Multi-peer scenarios
+- `tests/client_sync_tests.rs` - `SyncEvent`/`MessageHandler` trait, `sync_inbox()` integration
 
 ## Async/Threading Model
 
@@ -189,6 +176,47 @@ Test files:
 - **Networking**: `axum`, `tokio`, `ureq`
 - **Serialization**: `serde`, `serde_json`, `toml`
 - **TUI**: `ratatui`, `crossterm`, `rustyline`
+
+## Android Client
+
+The `android/` directory contains a separate Android client. It is **not** part of the main Cargo workspace — it has its own build system.
+
+### Structure
+
+```
+android/
+├── build.sh                    # Build script (compiles FFI + assembles APK)
+├── tenet-ffi/                  # Rust→Kotlin bridge (UniFFI)
+│   ├── Cargo.toml              # Separate Rust crate
+│   ├── build.rs                # UniFFI bindgen step
+│   ├── src/lib.rs              # TenetClient: synchronous Rust API, Mutex-protected
+│   ├── src/types.rs            # FFI-safe type definitions (FfiMessage, FfiPeer, etc.)
+│   └── src/tenet_ffi.udl       # UniFFI interface definition
+└── app/                        # Android Jetpack Compose application
+    └── app/src/main/java/com/example/tenet/
+        ├── data/
+        │   ├── TenetRepository.kt      # Singleton wrapping TenetClient FFI
+        │   ├── KeystoreManager.kt      # Android Keystore integration
+        │   ├── SyncWorker.kt           # Background WorkManager sync
+        │   └── TenetPreferences.kt     # DataStore preferences
+        └── ui/                         # Compose screens + ViewModels
+            ├── conversations/          # Direct message conversations
+            ├── compose/                # Message composition
+            ├── friends/                # Friend request management
+            ├── groups/                 # Group messaging
+            ├── peers/                  # Peer management
+            ├── timeline/               # Public message feed
+            ├── profile/                # User profile
+            ├── qr/                     # QR code peer discovery
+            └── setup/                  # First-run setup
+```
+
+### Key Design Points
+
+- The Android app uses the **UniFFI FFI bridge** (not the web REST API) for all protocol operations.
+- `TenetClient` (Rust) wraps all mutable state behind a `Mutex`; Kotlin dispatches calls to `Dispatchers.IO`.
+- Sync opens a second SQLite connection (WAL mode) to avoid holding the main lock during network I/O.
+- The FFI crate depends on the main `tenet` library crate.
 
 ## Pre-Commit Checklist
 
