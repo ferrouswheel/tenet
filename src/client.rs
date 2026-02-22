@@ -626,7 +626,7 @@ impl RelayClient {
         {
             envelope
                 .header
-                .verify_signature(envelope.version, sender_signing_key)
+                .verify_signature(envelope.version, sender_signing_key, &envelope.payload.body)
                 .map_err(|_| ClientError::Protocol("Invalid signature".to_string()))?;
         } else {
             return Err(ClientError::Protocol(format!(
@@ -844,7 +844,7 @@ impl RelayClient {
         {
             envelope
                 .header
-                .verify_signature(envelope.version, sender_signing_key)
+                .verify_signature(envelope.version, sender_signing_key, &envelope.payload.body)
                 .map_err(|_| ClientError::Protocol("Invalid signature".to_string()))?;
         } else {
             return Err(ClientError::Protocol(format!(
@@ -1069,10 +1069,11 @@ impl RelayClient {
             if let Some(ref signing_key) = signing_key {
                 // Known sender: verify signature (skip if key is empty - placeholder peer)
                 if !signing_key.is_empty() {
-                    if let Err(e) = envelope
-                        .header
-                        .verify_signature(envelope.version, signing_key)
-                    {
+                    if let Err(e) = envelope.header.verify_signature(
+                        envelope.version,
+                        signing_key,
+                        &envelope.payload.body,
+                    ) {
                         let reason = format!("invalid header signature: {e:?}");
                         eprintln!(
                             "DISCARDED: {} (kind={:?}, sender={}, msg_id={})",
@@ -1848,7 +1849,11 @@ impl SimulationClient {
         };
         if envelope
             .header
-            .verify_signature(envelope.version, &sender_keypair.signing_public_key_hex)
+            .verify_signature(
+                envelope.version,
+                &sender_keypair.signing_public_key_hex,
+                &envelope.payload.body,
+            )
             .is_err()
         {
             return false;
@@ -2043,7 +2048,11 @@ impl SimulationClient {
         };
         if envelope
             .header
-            .verify_signature(envelope.version, &sender_keypair.signing_public_key_hex)
+            .verify_signature(
+                envelope.version,
+                &sender_keypair.signing_public_key_hex,
+                &envelope.payload.body,
+            )
             .is_err()
         {
             return false;
@@ -2341,7 +2350,11 @@ impl SimulationClient {
         let sender_keypair = context.keypairs.get(&envelope.header.sender_id)?;
         if envelope
             .header
-            .verify_signature(envelope.version, &sender_keypair.signing_public_key_hex)
+            .verify_signature(
+                envelope.version,
+                &sender_keypair.signing_public_key_hex,
+                &envelope.payload.body,
+            )
             .is_err()
         {
             return None;

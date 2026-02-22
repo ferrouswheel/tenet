@@ -54,11 +54,12 @@ pub struct RecipientKey {
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolVersion {
     V1,
+    V2,
 }
 
 impl ProtocolVersion {
     pub fn is_supported(self) -> bool {
-        matches!(self, ProtocolVersion::V1)
+        matches!(self, ProtocolVersion::V1 | ProtocolVersion::V2)
     }
 }
 
@@ -87,6 +88,8 @@ pub struct Header {
     pub group_id: Option<String>,
     pub ttl_seconds: u64,
     pub payload_size: u64,
+    #[serde(default)]
+    pub payload_hash: Option<String>,
     pub signature: Option<String>,
     #[serde(default)]
     pub reply_to: Option<String>,
@@ -105,7 +108,7 @@ struct CanonicalHeader<'a> {
     message_kind: &'a MessageKind,
     group_id: Option<&'a str>,
     ttl_seconds: u64,
-    payload_size: u64,
+    payload_hash: &'a str,
     reply_to: Option<&'a str>,
 }
 
@@ -116,6 +119,8 @@ pub enum HeaderError {
     UnsupportedVersion(ProtocolVersion),
     TtlOutOfRange { ttl_seconds: u64 },
     InvalidMessageKind(String),
+    MissingPayloadHash,
+    PayloadHashMismatch,
 }
 
 #[derive(Debug)]
@@ -154,7 +159,9 @@ impl Header {
     pub fn canonical_signing_bytes(
         &self,
         version: ProtocolVersion,
+        payload_body: &str,
     ) -> Result<Vec<u8>, serde_json::Error> {
+        let hash = hex::encode(Sha256::digest(payload_body.as_bytes()));
         let canonical = CanonicalHeader {
             version,
             sender_id: &self.sender_id,
@@ -166,7 +173,7 @@ impl Header {
             message_kind: &self.message_kind,
             group_id: self.group_id.as_deref(),
             ttl_seconds: self.ttl_seconds,
-            payload_size: self.payload_size,
+            payload_hash: &hash,
             reply_to: self.reply_to.as_deref(),
         };
         serde_json::to_vec(&canonical)
@@ -177,9 +184,10 @@ impl Header {
         &self,
         version: ProtocolVersion,
         signing_private_key_hex: &str,
+        payload_body: &str,
     ) -> Result<String, HeaderError> {
         let bytes = self
-            .canonical_signing_bytes(version)
+            .canonical_signing_bytes(version, payload_body)
             .map_err(|_| HeaderError::InvalidSignature)?;
         sign_message(&bytes, signing_private_key_hex).map_err(|_| HeaderError::InvalidSignature)
     }
@@ -189,6 +197,7 @@ impl Header {
         &self,
         version: ProtocolVersion,
         signing_public_key_hex: &str,
+        payload_body: &str,
     ) -> Result<(), HeaderError> {
         if !version.is_supported() {
             return Err(HeaderError::UnsupportedVersion(version));
@@ -199,12 +208,23 @@ impl Header {
             });
         }
         self.validate_message_kind()?;
+
+        // Verify payload hash matches (required for V2)
+        let expected = hex::encode(Sha256::digest(payload_body.as_bytes()));
+        let declared = self
+            .payload_hash
+            .as_deref()
+            .ok_or(HeaderError::MissingPayloadHash)?;
+        if expected != declared {
+            return Err(HeaderError::PayloadHashMismatch);
+        }
+
         let signature = self
             .signature
             .as_deref()
             .ok_or(HeaderError::MissingSignature)?;
         let bytes = self
-            .canonical_signing_bytes(version)
+            .canonical_signing_bytes(version, payload_body)
             .map_err(|_| HeaderError::InvalidSignature)?;
         verify_signature(&bytes, signature, signing_public_key_hex)
             .map_err(|_| HeaderError::InvalidSignature)
@@ -453,14 +473,21 @@ pub fn build_envelope_from_payload(
         group_id,
         ttl_seconds,
         payload_size: payload.body.len() as u64,
+        payload_hash: None,
         signature: None,
         reply_to,
     };
     header.validate_message_kind()?;
-    let signature = header.compute_signature(ProtocolVersion::V1, signing_private_key_hex)?;
+
+    // Compute and store hash for V2
+    header.payload_hash = Some(hex::encode(Sha256::digest(payload.body.as_bytes())));
+
+    let signature =
+        header.compute_signature(ProtocolVersion::V2, signing_private_key_hex, &payload.body)?;
     header.signature = Some(signature);
+
     Ok(Envelope {
-        version: ProtocolVersion::V1,
+        version: ProtocolVersion::V2,
         header,
         payload,
     })

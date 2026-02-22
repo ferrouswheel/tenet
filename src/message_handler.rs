@@ -156,7 +156,7 @@ impl StorageMessageHandler {
             };
             if envelope
                 .header
-                .verify_signature(crate::protocol::ProtocolVersion::V1, signing_key_hex)
+                .verify_signature(envelope.version, signing_key_hex, &envelope.payload.body)
                 .is_err()
             {
                 all_valid = false;
@@ -734,8 +734,9 @@ impl StorageMessageHandler {
             return envelope
                 .header
                 .verify_signature(
-                    crate::protocol::ProtocolVersion::V1,
+                    envelope.version,
                     &peer.signing_public_key,
+                    &envelope.payload.body,
                 )
                 .is_ok();
         }
@@ -747,7 +748,7 @@ impl StorageMessageHandler {
                 if derived == *sender_id {
                     return envelope
                         .header
-                        .verify_signature(crate::protocol::ProtocolVersion::V1, key_hex)
+                        .verify_signature(envelope.version, key_hex, &envelope.payload.body)
                         .is_ok();
                 }
             }
@@ -792,7 +793,7 @@ impl StorageMessageHandler {
             };
             if envelope
                 .header
-                .verify_signature(crate::protocol::ProtocolVersion::V1, signing_key_hex)
+                .verify_signature(envelope.version, signing_key_hex, &envelope.payload.body)
                 .is_err()
             {
                 all_valid = false;
