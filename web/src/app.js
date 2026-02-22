@@ -536,7 +536,8 @@ async function showConversationDetail(peerId, fromRoute, requireFriend = true) {
             `;
             document.getElementById('conversation-peer-name').textContent = peerName;
             document.getElementById('dm-peer-info').innerHTML = '';
-            document.getElementById('dm-compose').style.display = 'none';
+            const composeBox = document.getElementById('dm-compose-box');
+            if (composeBox) composeBox.style.display = 'none';
             return;
         }
     }
@@ -544,7 +545,6 @@ async function showConversationDetail(peerId, fromRoute, requireFriend = true) {
     const peer = peers.find(p => p.peer_id === peerId);
     const peerName = peer?.display_name || peerInfo?.display_name || peerId.substring(0, 12) + '...';
     document.getElementById('conversation-peer-name').textContent = peerName;
-    document.getElementById('dm-compose').style.display = 'block';
 
     renderDmPeerInfo(peerId);
     loadConversationMessages(peerId, false);
@@ -1141,12 +1141,13 @@ async function loadPeers() {
 
 function renderFriendsList() {
     const el = document.getElementById('friends-list');
-    if (peers.length === 0) {
+    const friends = peers.filter(p => p.is_friend);
+    if (friends.length === 0) {
         el.innerHTML = '<div class="friends-empty">No friends yet</div>';
         return;
     }
 
-    el.innerHTML = peers.map(p => {
+    el.innerHTML = friends.map(p => {
         const displayName = p.display_name || p.peer_id.substring(0, 12) + '...';
         const initial = displayName[0].toUpperCase();
         const lastSeen = p.last_seen_online ? timeAgo(p.last_seen_online) : 'never';
@@ -1154,10 +1155,10 @@ function renderFriendsList() {
             ? `<img src="/api/attachments/${encodeURIComponent(p.avatar_hash)}" alt="" />`
             : escapeHtml(initial);
         const onlineBadge = p.online ? '<span class="friend-online-badge"></span>' : '';
-        return `<div class="friend-item" data-peer-id="${p.peer_id}" onclick="openConversationWithPeer('${p.peer_id}')">
+        return `<div class="friend-item" data-peer-id="${escapeHtml(p.peer_id)}" onclick="openConversationWithPeer(this.dataset.peerId)">
             <div class="friend-avatar">${avatarInner}${onlineBadge}</div>
             <div class="friend-info">
-                <div class="friend-name" title="${p.peer_id}">${escapeHtml(displayName)}</div>
+                <div class="friend-name" title="${escapeHtml(p.peer_id)}">${escapeHtml(displayName)}</div>
                 <div class="friend-last-seen">${p.online ? 'online' : 'last seen ' + lastSeen}</div>
             </div>
         </div>`;
