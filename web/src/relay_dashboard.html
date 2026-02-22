@@ -75,6 +75,7 @@ tr:hover td{background:#fafafa}
 <script>
 function fmtBytes(b){return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(2)+'MB'}
 function fmtDur(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+pad(s%60)+'s';return Math.floor(s/3600)+'h '+pad(Math.floor((s%3600)/60))+'m'}
+function fmtMs(ms){if(ms<1000)return ms+'ms';const s=Math.floor(ms/1000);if(s<60)return(ms/1000).toFixed(1)+'s';if(s<3600)return Math.floor(s/60)+'m '+pad(s%60)+'s';return Math.floor(s/3600)+'h '+pad(Math.floor((s%3600)/60))+'m'}
 function pad(n){return String(n).padStart(2,'0')}
 function fmtPeer(id){return id.length>20?id.slice(0,8)+'\u2026'+id.slice(-8):id}
 function set(id,v){const el=document.getElementById(id);if(el)el.textContent=v}
@@ -145,9 +146,9 @@ async function refresh(){
   if(!lat.count){lb.innerHTML='<div class="empty">No deliveries recorded yet</div>'}
   else{
     lb.innerHTML='<div class="lat-row">'+
-      '<div class="lat-item"><label>Min</label><div class="n">'+lat.min+'ms</div></div>'+
-      '<div class="lat-item"><label>Avg</label><div class="n">'+lat.avg+'ms</div></div>'+
-      '<div class="lat-item"><label>Max</label><div class="n">'+lat.max+'ms</div></div>'+
+      '<div class="lat-item"><label>Min</label><div class="n">'+fmtMs(lat.min)+'</div></div>'+
+      '<div class="lat-item"><label>Avg</label><div class="n">'+fmtMs(lat.avg)+'</div></div>'+
+      '<div class="lat-item"><label>Max</label><div class="n">'+fmtMs(lat.max)+'</div></div>'+
       '<div class="lat-item cnt"><label>Deliveries</label><div class="n">'+lat.count+'</div></div>'+
       '</div>'
   }
