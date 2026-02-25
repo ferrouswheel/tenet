@@ -122,16 +122,14 @@ Sources: code `// TODO` comments, `docs/relay_qos.md`, `docs/public_payload_fix.
 
 ## CLI (`tenet` binary)
 
-- [ ] **Peer registry not shared with web client** — the CLI stores peers in `peers.json`; the
-  web client uses the SQLite `peers` table. Adding a peer in the CLI does not make them visible
-  in the web UI and vice versa. Full fix would have both clients read/write the same SQLite table.
-  Medium-term workaround: add a `--db` flag to the CLI to target the web client's `tenet.db`.
-- [ ] **Limited to Direct messages** — the CLI has no commands for public posts, friend requests,
-  group messaging, reactions, or profiles. These require `tenet-web`. If the CLI is to be a
-  standalone tool, it needs at minimum `receive-all` (public + direct) and `post` commands.
-- [ ] **JSONL message storage** — received messages are appended to `inbox.jsonl` rather than the
-  structured SQLite `messages` table. This prevents the CLI and web client from sharing message
-  history. Migrating CLI receive to use SQLite would unify history across clients.
+- [x] **Peer registry not shared with web client** — CLI now uses the same `resolve_identity()`
+  system as the web client; `add-peer` writes to the identity's SQLite `peers` table and all
+  commands read peers from SQLite. Both clients share the same database.
+- [x] **Limited to Direct messages** — added `post <message> [--relay <url>]` for public posts
+  and `receive-all [--relay <url>]` to sync all message kinds (direct, public, group).
+- [x] **JSONL message storage** — received messages are stored via `store_received_envelope` into
+  the SQLite `messages` table; sent envelopes go into the SQLite `outbox` table. The CLI and web
+  client now share the same message history.
 
 ---
 
