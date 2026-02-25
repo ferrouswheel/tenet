@@ -23,6 +23,13 @@ use crate::protocol::ContentId;
 /// Maximum number of hops a public message can propagate
 pub const MAX_PUBLIC_MESSAGE_HOPS: usize = 10;
 
+/// Maximum public message IDs advertised in a single `MeshAvailable` response (simulation)
+const MAX_SIM_MESH_IDS: usize = 500;
+/// Maximum message IDs requested in a single `MeshRequest` (simulation)
+const MAX_SIM_MESH_REQUEST_IDS: usize = 100;
+/// Maximum envelopes per `MeshDelivery` batch (simulation)
+const MAX_SIM_MESH_BATCH: usize = 10;
+
 /// Metadata for tracking public message propagation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicMessageMetadata {
@@ -273,7 +280,26 @@ pub trait MessageHandler: Send {
         Vec::new()
     }
 
-    /// Called for each structured meta-message (Online, Ack, FriendRequest, etc.).
+    /// Called for each structured meta-message.
+    ///
+    /// Common variants and their return conventions:
+    /// - `Online` / `Ack` — no reply needed; update peer presence state.
+    /// - `FriendRequest` — optionally return a `FriendAccept` envelope.
+    /// - `FriendAccept` — no reply; record the peer's keys.
+    /// - `GroupInvite` — optionally return a `GroupInviteAccept` envelope.
+    /// - `GroupInviteAccept` — no reply; distribute the group key.
+    /// - `MessageRequest { peer_id, since_timestamp }` — public-mesh Phase 1.
+    ///   Respond with a `MeshAvailable` envelope addressed to `peer_id` listing
+    ///   public message IDs held since `since_timestamp`.
+    /// - `MeshAvailable { peer_id, message_ids, since_timestamp }` — Phase 2.
+    ///   Respond with a `MeshRequest` envelope to `peer_id` for unknown IDs.
+    /// - `MeshRequest { peer_id, message_ids }` — Phase 3.
+    ///   Respond with one or more `MeshDelivery` envelopes (batched, max 10 per
+    ///   envelope) containing the requested public-message payloads and a
+    ///   `sender_keys` map so the receiver can verify signatures.
+    /// - `MeshDelivery { peer_id, envelopes, sender_keys }` — Phase 4 (terminal).
+    ///   No reply; store the delivered public messages.
+    ///
     /// Returns any outgoing envelopes to be sent by the caller.
     fn on_meta(&mut self, _meta: &MetaMessage) -> Vec<Envelope> {
         Vec::new()
@@ -2477,6 +2503,156 @@ impl SimulationClient {
             .is_some()
     }
 
+    /// Handle the four-phase mesh catch-up protocol for public messages.
+    ///
+    /// Called from `handle_inbox` when a mesh-related `Meta` message is received and
+    /// no external `MessageHandler` is registered (the normal case in simulation).
+    ///
+    /// - **Phase 1 responder** (`MessageRequest`): peer asked for our public messages since a
+    ///   timestamp → respond with `MeshAvailable` listing matching IDs.
+    /// - **Phase 2 requester** (`MeshAvailable`): peer told us what they have → respond with
+    ///   `MeshRequest` for the IDs we are missing.
+    /// - **Phase 3 responder** (`MeshRequest`): peer asked for specific messages → respond with
+    ///   batched `MeshDelivery` envelopes plus sender signing keys.
+    /// - **Phase 4 requester** (`MeshDelivery`): peer delivered public messages → store them in
+    ///   the in-memory cache so subsequent steps see them.
+    fn handle_mesh_meta(
+        &mut self,
+        meta: &MetaMessage,
+        sender_id: &str,
+        step: usize,
+        context: &mut ClientContext<'_>,
+    ) -> Vec<Envelope> {
+        match meta {
+            MetaMessage::MessageRequest {
+                since_timestamp, ..
+            } => {
+                // Phase 1 responder: offer IDs of public messages we have since the timestamp.
+                let message_ids: Vec<String> = self
+                    .public_message_cache
+                    .iter()
+                    .filter(|env| env.header.timestamp >= *since_timestamp)
+                    .map(|env| env.header.message_id.0.clone())
+                    .take(MAX_SIM_MESH_IDS)
+                    .collect();
+                if message_ids.is_empty() {
+                    return vec![];
+                }
+                let response = MetaMessage::MeshAvailable {
+                    peer_id: self.id.clone(),
+                    message_ids,
+                    since_timestamp: *since_timestamp,
+                };
+                self.build_meta_envelope(&self.id, sender_id, step, &response, context)
+                    .into_iter()
+                    .collect()
+            }
+            MetaMessage::MeshAvailable { message_ids, .. } => {
+                // Phase 2 requester: request the IDs we do not have yet.
+                let unknown_ids: Vec<String> = message_ids
+                    .iter()
+                    .filter(|id| {
+                        !self
+                            .public_message_metadata
+                            .contains_key(&ContentId((*id).clone()))
+                    })
+                    .take(MAX_SIM_MESH_REQUEST_IDS)
+                    .cloned()
+                    .collect();
+                if unknown_ids.is_empty() {
+                    return vec![];
+                }
+                let request = MetaMessage::MeshRequest {
+                    peer_id: self.id.clone(),
+                    message_ids: unknown_ids,
+                };
+                self.build_meta_envelope(&self.id, sender_id, step, &request, context)
+                    .into_iter()
+                    .collect()
+            }
+            MetaMessage::MeshRequest { message_ids, .. } => {
+                // Phase 3 responder: deliver the requested public messages in batches.
+                let mut batch: Vec<serde_json::Value> = Vec::new();
+                let mut sender_keys: HashMap<String, String> = HashMap::new();
+                let mut outgoing = Vec::new();
+
+                for id in message_ids.iter().take(MAX_SIM_MESH_REQUEST_IDS) {
+                    let found = self
+                        .public_message_cache
+                        .iter()
+                        .find(|e| e.header.message_id.0 == *id);
+                    let Some(env) = found else { continue };
+                    if env.header.message_kind != MessageKind::Public {
+                        continue;
+                    }
+                    if let Ok(val) = serde_json::to_value(env) {
+                        // Include the sender's signing key so the receiver can verify.
+                        if let Some(kp) = context.keypairs.get(&env.header.sender_id) {
+                            sender_keys.insert(
+                                env.header.sender_id.clone(),
+                                kp.signing_public_key_hex.clone(),
+                            );
+                        }
+                        batch.push(val);
+                        if batch.len() >= MAX_SIM_MESH_BATCH {
+                            let delivery = MetaMessage::MeshDelivery {
+                                peer_id: self.id.clone(),
+                                envelopes: std::mem::take(&mut batch),
+                                sender_keys: std::mem::take(&mut sender_keys),
+                            };
+                            if let Some(out) = self
+                                .build_meta_envelope(&self.id, sender_id, step, &delivery, context)
+                            {
+                                outgoing.push(out);
+                            }
+                        }
+                    }
+                }
+                // Flush any remaining messages in the last (partial) batch.
+                if !batch.is_empty() {
+                    let delivery = MetaMessage::MeshDelivery {
+                        peer_id: self.id.clone(),
+                        envelopes: batch,
+                        sender_keys,
+                    };
+                    if let Some(out) =
+                        self.build_meta_envelope(&self.id, sender_id, step, &delivery, context)
+                    {
+                        outgoing.push(out);
+                    }
+                }
+                outgoing
+            }
+            MetaMessage::MeshDelivery { envelopes, .. } => {
+                // Phase 4 requester: store delivered public messages in the in-memory cache.
+                for env_val in envelopes {
+                    let Ok(envelope) = serde_json::from_value::<Envelope>(env_val.clone()) else {
+                        continue;
+                    };
+                    if envelope.header.message_kind != MessageKind::Public {
+                        continue;
+                    }
+                    let content_id = envelope.header.message_id.clone();
+                    if !self.public_message_metadata.contains_key(&content_id) {
+                        let metadata = PublicMessageMetadata::new(step as u64);
+                        self.public_message_metadata.insert(content_id, metadata);
+                        self.seen.insert(envelope.header.message_id.0.clone());
+                        self.log_action(
+                            step,
+                            format!(
+                                "{} received mesh-delivered public message from {}",
+                                self.id, envelope.header.sender_id
+                            ),
+                        );
+                        self.public_message_cache.push(envelope);
+                    }
+                }
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
     fn online_at(&self, step: usize) -> bool {
         // Use online_state if set (event-based mode), otherwise use schedule (step-based mode)
         if let Some(online) = self.online_state {
@@ -2727,6 +2903,11 @@ impl Client for SimulationClient {
                 if let Ok(meta) = decode_meta_payload(&envelope.payload) {
                     if let Some(ref mut h) = handler {
                         outgoing.extend(h.on_meta(&meta));
+                    } else {
+                        // No external handler: use built-in four-phase mesh protocol handling
+                        // so simulation peers can catch up on missed public messages.
+                        let sender_id = envelope.header.sender_id.clone();
+                        outgoing.extend(self.handle_mesh_meta(&meta, &sender_id, step, context));
                     }
                 }
                 continue;
