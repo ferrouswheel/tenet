@@ -26,9 +26,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // Extract --identity and --db flags from anywhere in args
+    // Extract --identity flag from anywhere in args
     let mut identity_flag: Option<String> = env::var("TENET_IDENTITY").ok();
-    let mut db_flag: Option<PathBuf> = None;
     let mut filtered_args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -37,12 +36,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 i += 1;
                 if i < args.len() {
                     identity_flag = Some(args[i].clone());
-                }
-            }
-            "--db" => {
-                i += 1;
-                if i < args.len() {
-                    db_flag = Some(PathBuf::from(&args[i]));
                 }
             }
             _ => {
@@ -61,11 +54,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match command.as_str() {
         "init" => init_identity(identity_flag.as_deref()),
-        "add-peer" => add_peer(&command_args, identity_flag.as_deref(), db_flag.as_deref()),
-        "send" => send_message(&command_args, identity_flag.as_deref(), db_flag.as_deref()),
-        "sync" => sync_messages(&command_args, identity_flag.as_deref(), db_flag.as_deref()),
-        "post" => post_message(&command_args, identity_flag.as_deref(), db_flag.as_deref()),
-        "receive-all" => receive_all(&command_args, identity_flag.as_deref(), db_flag.as_deref()),
+        "add-peer" => add_peer(&command_args, identity_flag.as_deref()),
+        "send" => send_message(&command_args, identity_flag.as_deref()),
+        "sync" => sync_messages(&command_args, identity_flag.as_deref()),
+        "post" => post_message(&command_args, identity_flag.as_deref()),
+        "receive-all" => receive_all(&command_args, identity_flag.as_deref()),
         "export-key" => export_key(&command_args, identity_flag.as_deref()),
         "import-key" => import_key(&command_args, identity_flag.as_deref()),
         "rotate-key" => rotate_identity(identity_flag.as_deref()),
@@ -92,7 +85,6 @@ fn print_usage() {
          \n\
          Options:\n\
          --identity <id>   Select identity (short ID prefix)\n\
-         --db <path>       Use a specific SQLite database file for peer/message storage\n\
          \n\
          Environment:\n\
          TENET_HOME       defaults to .tenet\n\
@@ -131,14 +123,8 @@ fn ensure_dir(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 /// Resolve identity and return (keypair, storage, stored_relay_url).
-///
-/// The storage is the identity's own SQLite database unless `--db` was
-/// supplied, in which case the override path is opened instead.  Either
-/// way, any legacy `peers.json` / `inbox.jsonl` / `outbox.jsonl` files
-/// found in the identity directory are migrated into SQLite automatically.
 fn resolve_and_log(
     explicit_id: Option<&str>,
-    db_override: Option<&Path>,
 ) -> Result<(StoredKeypair, Storage, Option<String>), Box<dyn Error>> {
     let dir = data_dir();
     let resolved = resolve_identity(&dir, explicit_id)?;
@@ -155,18 +141,11 @@ fn resolve_and_log(
         );
     }
 
-    let stored_relay = resolved.stored_relay_url.clone();
-
-    // Migrate any legacy JSON/JSONL files in the identity directory into SQLite.
-    let _ = resolved.storage.migrate_from_json(&resolved.identity_dir);
-
-    let storage = if let Some(override_path) = db_override {
-        Storage::open(override_path)?
-    } else {
-        resolved.storage
-    };
-
-    Ok((resolved.keypair, storage, stored_relay))
+    Ok((
+        resolved.keypair,
+        resolved.storage,
+        resolved.stored_relay_url,
+    ))
 }
 
 /// Populate a relay client's peer registry from the SQLite peers table so
@@ -211,16 +190,12 @@ fn init_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn add_peer(
-    args: &[String],
-    explicit_id: Option<&str>,
-    db_override: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+fn add_peer(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     if args.len() < 2 {
         return Err("add-peer requires <name> <public_key_hex>".into());
     }
 
-    let (_keypair, storage, _) = resolve_and_log(explicit_id, db_override)?;
+    let (_keypair, storage, _) = resolve_and_log(explicit_id)?;
 
     let name = args[0].clone();
     let public_key_hex = args[1].clone();
@@ -255,11 +230,7 @@ fn add_peer(
     Ok(())
 }
 
-fn send_message(
-    args: &[String],
-    explicit_id: Option<&str>,
-    db_override: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+fn send_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
     let mut peer_name: Option<String> = None;
     let mut message_parts: Vec<String> = Vec::new();
@@ -285,7 +256,7 @@ fn send_message(
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id, db_override)?;
+    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
 
     let relay_url = relay_url_override
         .or(stored_relay)
@@ -330,11 +301,7 @@ fn send_message(
     Ok(())
 }
 
-fn sync_messages(
-    args: &[String],
-    explicit_id: Option<&str>,
-    db_override: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
     let mut index = 0;
     while index < args.len() {
@@ -351,7 +318,7 @@ fn sync_messages(
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id, db_override)?;
+    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
 
     let relay_url = relay_url_override
         .or(stored_relay)
@@ -385,11 +352,7 @@ fn sync_messages(
     Ok(())
 }
 
-fn post_message(
-    args: &[String],
-    explicit_id: Option<&str>,
-    db_override: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
     let mut message_parts: Vec<String> = Vec::new();
 
@@ -410,7 +373,7 @@ fn post_message(
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id, db_override)?;
+    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
 
     let relay_url = relay_url_override
         .or(stored_relay)
@@ -441,11 +404,7 @@ fn post_message(
     Ok(())
 }
 
-fn receive_all(
-    args: &[String],
-    explicit_id: Option<&str>,
-    db_override: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+fn receive_all(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
     let mut index = 0;
     while index < args.len() {
@@ -462,7 +421,7 @@ fn receive_all(
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id, db_override)?;
+    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
 
     let relay_url = relay_url_override
         .or(stored_relay)
@@ -508,7 +467,7 @@ fn export_key(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn 
         return Err("export-key accepts at most one flag".into());
     }
 
-    let (identity, _, _) = resolve_and_log(explicit_id, None)?;
+    let (identity, _, _) = resolve_and_log(explicit_id)?;
     match args.first().map(String::as_str) {
         None => println!("{}", serde_json::to_string_pretty(&identity)?),
         Some("--public") => println!("{}", identity.public_key_hex),
@@ -581,7 +540,7 @@ fn rotate_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let dir = data_dir();
     ensure_dir(&dir)?;
 
-    let (old_keypair, _, _) = resolve_and_log(explicit_id, None)?;
+    let (old_keypair, _, _) = resolve_and_log(explicit_id)?;
 
     let new_keypair = generate_keypair();
 
