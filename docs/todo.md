@@ -137,26 +137,24 @@ Sources: code `// TODO` comments, `docs/relay_qos.md`, `docs/public_payload_fix.
 
 ### Mesh protocol in simulation
 
-- [ ] **Simulation client mesh catch-up** — `src/client.rs` has a separate gossip path
-  (`handle_message_request`, `forward_public_message_to_peers`). The four-phase mesh protocol
-  (MeshAvailable / MeshRequest / MeshDelivery) implemented in `message_handler.rs` for the web
-  client is not wired into the simulation client. Without this, multi-peer catch-up scenarios
-  cannot be tested in simulation. (`docs/public_mesh_plan.md` — "not done, tracked as future
-  work")
+- [x] **Simulation client mesh catch-up** — `SimulationClient.handle_inbox` now handles
+  `MessageRequest` / `MeshAvailable` / `MeshRequest` / `MeshDelivery` directly via the new
+  `handle_mesh_meta()` method when no external `MessageHandler` is registered. The simulation
+  harness already routes outgoing envelopes through the relay, so all four phases are exercised
+  end-to-end in simulation scenarios.
 
 ### Debugger REPL mesh queries
 
-- [ ] **Wire mesh queries into `tenet-debugger`** — the REPL uses the simulation harness, not
-  the web client stack. Mesh queries (`MessageRequest` → `MeshAvailable` → `MeshRequest` →
-  `MeshDelivery`) are not invocable from the debugger. A `mesh-query <peer-a> <peer-b>` command
-  would let developers test catch-up interactively. (`docs/public_mesh_plan.md` — "not done,
-  tracked as future work")
+- [x] **Wire mesh queries into `tenet-debugger`** — added `mesh-query <peer-a> <peer-b>` REPL
+  command. The command posts a `MessageRequest` from peer-a to peer-b then drives five sync
+  rounds to complete the full four-phase exchange, printing each step's outcome.
 
 ### Doc comment updates
 
-- [ ] **Update `CLAUDE.md` and `Client` trait doc comments** for the mesh protocol `MetaMessage`
-  variants (`MeshAvailable`, `MeshRequest`, `MeshDelivery`) and when `on_meta` is called for
-  them. (`docs/public_mesh_plan.md` — "update when API stabilises")
+- [x] **Update `CLAUDE.md` and `Client` trait doc comments** — `CLAUDE.md` now contains a
+  "Public-Message Mesh Catch-up Protocol" section with a phase table, implementation notes, and
+  pointers to each implementation. `MessageHandler.on_meta` doc comment lists all four mesh
+  variants and their expected response envelopes.
 
 ---
 

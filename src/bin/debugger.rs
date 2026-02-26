@@ -260,6 +260,7 @@ fn print_help() {
 
   -- Sync --
   sync <peer|all> [limit]
+  mesh-query <peer-a> <peer-b>
 
   -- Feeds & storage --
   feed <peer>
@@ -337,6 +338,9 @@ fn handle_command(
             let target = parts.get(1).copied();
             let limit = parts.get(2).map(|v| v.parse::<usize>()).transpose()?;
             sync_peers(peers, target, limit)?;
+        }
+        "mesh-query" => {
+            mesh_query(peers, parts.get(1).copied(), parts.get(2).copied())?;
         }
 
         // Feeds & storage
@@ -826,6 +830,110 @@ fn sync_one(
         outcome.messages.len(),
         outcome.errors.len()
     );
+    Ok(())
+}
+
+/// Perform an interactive four-phase mesh catch-up query from `peer_a` to `peer_b`.
+///
+/// Phase 1 — peer-a posts a `MessageRequest` to peer-b's relay inbox.
+/// Phase 2 — peer-b syncs: receives `MessageRequest`, handler posts `MeshAvailable` to peer-a.
+/// Phase 3 — peer-a syncs: receives `MeshAvailable`, handler posts `MeshRequest` to peer-b.
+/// Phase 4 — peer-b syncs: receives `MeshRequest`, handler posts `MeshDelivery` to peer-a.
+/// Phase 5 — peer-a syncs: receives `MeshDelivery`, stores newly-discovered public messages.
+///
+/// Both peers must be online. The operation is useful for testing public-message catch-up
+/// after a period of disconnection.
+fn mesh_query(
+    peers: &mut [DebugPeer],
+    peer_a_name: Option<&str>,
+    peer_b_name: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let peer_a_name = peer_a_name.ok_or("mesh-query requires <peer-a> <peer-b>")?;
+    let peer_b_name = peer_b_name.ok_or("mesh-query requires <peer-a> <peer-b>")?;
+    if peer_a_name == peer_b_name {
+        return Err("mesh-query requires two different peers".into());
+    }
+
+    let peer_a_index = peers
+        .iter()
+        .position(|p| p.name == peer_a_name)
+        .ok_or_else(|| format!("unknown peer: {peer_a_name}"))?;
+    let peer_b_index = peers
+        .iter()
+        .position(|p| p.name == peer_b_name)
+        .ok_or_else(|| format!("unknown peer: {peer_b_name}"))?;
+
+    if !peers[peer_a_index].client.is_online() {
+        println!("{} is offline; cannot issue mesh query", peer_a_name);
+        return Ok(());
+    }
+    if !peers[peer_b_index].client.is_online() {
+        println!("{} is offline; cannot respond to mesh query", peer_b_name);
+        return Ok(());
+    }
+
+    // --- Phase 1: peer-a sends MessageRequest to peer-b ---
+    let peer_a_id = peers[peer_a_index].client.id().to_string();
+    let peer_b_id = peers[peer_b_index].client.id().to_string();
+    let signing_key = peers[peer_a_index]
+        .client
+        .signing_private_key_hex()
+        .to_string();
+
+    let meta = MetaMessage::MessageRequest {
+        peer_id: peer_a_id.clone(),
+        since_timestamp: 0, // request all stored public messages
+    };
+    let payload = build_meta_payload(&meta)?;
+    let now = now_secs();
+    let envelope = build_envelope_from_payload(
+        peer_a_id,
+        peer_b_id,
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Meta,
+        None,
+        None,
+        payload,
+        &signing_key,
+    )?;
+    peers[peer_a_index].client.post_envelope(&envelope)?;
+    println!(
+        "mesh-query: {} → {} (MessageRequest posted)",
+        peer_a_name, peer_b_name
+    );
+
+    // --- Phase 2: peer-b receives MessageRequest, posts MeshAvailable ---
+    println!(
+        "mesh-query: syncing {} (expect MeshAvailable response)…",
+        peer_b_name
+    );
+    sync_one(peers, peer_b_index, None)?;
+
+    // --- Phase 3: peer-a receives MeshAvailable, posts MeshRequest ---
+    println!(
+        "mesh-query: syncing {} (expect MeshRequest response)…",
+        peer_a_name
+    );
+    sync_one(peers, peer_a_index, None)?;
+
+    // --- Phase 4: peer-b receives MeshRequest, posts MeshDelivery ---
+    println!(
+        "mesh-query: syncing {} (expect MeshDelivery response)…",
+        peer_b_name
+    );
+    sync_one(peers, peer_b_index, None)?;
+
+    // --- Phase 5: peer-a receives MeshDelivery, stores public messages ---
+    println!(
+        "mesh-query: syncing {} (storing delivered messages)…",
+        peer_a_name
+    );
+    sync_one(peers, peer_a_index, None)?;
+
+    println!("mesh-query: complete");
     Ok(())
 }
 

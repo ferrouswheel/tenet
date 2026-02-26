@@ -113,6 +113,35 @@ The `tenet-web` binary delegates to `tenet::web_client::run()`. REST API + WebSo
 - `MessageKind` - `Public`, `Meta`, `Direct`, `FriendGroup`, `StoreForPeer`
 - `RelayClient` / `SimulationClient` - Client implementations (both implement `Client` trait)
 
+## Public-Message Mesh Catch-up Protocol
+
+Peers that were offline miss public messages broadcast during their absence. A pull-based four-phase
+mesh protocol (carried inside `MessageKind::Meta` envelopes) fills this gap.
+
+| Phase | Initiator → Responder | `MetaMessage` variant | Purpose |
+|-------|-----------------------|----------------------|---------|
+| 1 | A → B | `MessageRequest { peer_id, since_timestamp }` | A asks B for public-message IDs since a timestamp |
+| 2 | B → A | `MeshAvailable { peer_id, message_ids, since_timestamp }` | B replies with up to 500 IDs it holds |
+| 3 | A → B | `MeshRequest { peer_id, message_ids }` | A requests the subset of IDs it does not have (up to 100) |
+| 4 | B → A | `MeshDelivery { peer_id, envelopes, sender_keys }` | B delivers envelopes in batches of ≤ 10; `sender_keys` lets A verify signatures |
+
+**`MessageHandler.on_meta` is called for all four variants.**  Implementations should:
+- `MessageRequest` — query stored public messages since `since_timestamp`, return a `MeshAvailable`.
+- `MeshAvailable` — diff against local storage, return a `MeshRequest` for unknown IDs (or nothing
+  if already up-to-date).
+- `MeshRequest` — fetch raw envelopes and signing keys, return one or more `MeshDelivery` envelopes.
+- `MeshDelivery` — validate each envelope (public kind, TTL, signature), store new ones; return `[]`.
+
+**`StorageMessageHandler`** (`src/message_handler.rs`) implements all four phases using SQLite.
+
+**`SimulationClient`** (`src/client.rs`) implements all four phases using its in-memory
+`public_message_cache` when no external `MessageHandler` is registered.  The simulation harness
+routes outgoing envelopes (returned by `handle_inbox`) through the relay so the full round-trip is
+exercised in simulation scenarios.
+
+**`tenet-debugger`** exposes a `mesh-query <peer-a> <peer-b>` REPL command that drives the complete
+four-phase exchange interactively, printing each sync step's outcome.
+
 ## Coding Conventions
 
 ### Error Handling
