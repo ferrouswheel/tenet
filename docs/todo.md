@@ -204,9 +204,13 @@ These are not tracked elsewhere and emerged from examining the current design:
   on constrained relays with small `max_messages` limits and would complement the QoS tier
   system.
 
-- [ ] **QR-code / short-code peer discovery for web client** — the Android client doc mentions
+- [x] **QR-code / short-code peer discovery for web client** — the Android client doc mentions
   QR code peer discovery as a planned feature. The web client currently requires manually copying
   and pasting a 64-character hex public key and a peer ID. A web-client-native QR code display
   (for `#/profile`) and a QR scanner (via `getUserMedia`) would make key exchange practical for
   co-located users without the Android app. The QR payload would encode the peer ID and
   encryption public key in a URI scheme (e.g. `tenet://peer/<peer_id>?key=<pubkey_hex>`).
+  Implemented: `GET /api/qr` returns an SVG QR code (via the `qrcode` crate); the profile
+  page (`#/profile`) displays it inline; the Friends view has a "Scan QR" button that opens a
+  camera modal using `getUserMedia` + `BarcodeDetector`; the scanner auto-fills the friend
+  request form on success; a manual URI paste fallback handles unsupported browsers.

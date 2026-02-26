@@ -2,6 +2,7 @@
 // State
 // ---------------------------------------------------------------------------
 let myPeerId = '';
+let myEncryptionPublicKey = ''; // X25519 public key hex, loaded from /api/health
 let currentFilter = 'public'; // 'public' or 'friend_group'
 let groups = [];
 let groupInvites = [];
@@ -2131,11 +2132,159 @@ function showMyProfile(fromRoute) {
     const editPeerId = document.getElementById('profile-edit-peer-id');
     if (editPeerId) editPeerId.textContent = myPeerId;
 
+    // Render QR code for this identity
+    renderProfileQr();
+
     // Pre-fill form
     document.getElementById('profile-display-name').value = (myProfile && myProfile.display_name) || '';
     document.getElementById('profile-bio').value = (myProfile && myProfile.bio) || '';
     pendingAvatarHash = (myProfile && myProfile.avatar_hash) || null;
     renderAvatarUploadPreview();
+}
+
+function renderProfileQr() {
+    const container = document.getElementById('profile-qr-container');
+    if (!container) return;
+    // Use the server-side generated QR SVG via /api/qr
+    container.innerHTML = `
+        <div class="profile-qr-label">Scan to add me as a peer</div>
+        <a href="/api/qr" target="_blank" title="Open QR code">
+            <img class="profile-qr-img" src="/api/qr" alt="QR code for ${escapeHtml(myPeerId)}" />
+        </a>
+        <div class="profile-qr-uri" title="${escapeHtml('tenet://peer/' + myPeerId + '?key=' + myEncryptionPublicKey)}">
+            <code>tenet://peer/${escapeHtml(myPeerId.substring(0, 16))}...?key=${escapeHtml(myEncryptionPublicKey.substring(0, 8))}...</code>
+            <button class="copy-btn" onclick="copyTenetUri()">Copy URI</button>
+        </div>
+    `;
+}
+
+function copyTenetUri() {
+    const uri = `tenet://peer/${myPeerId}?key=${myEncryptionPublicKey}`;
+    navigator.clipboard.writeText(uri).then(() => showToast('Tenet URI copied'));
+}
+
+// ---------------------------------------------------------------------------
+// QR Scanner (peer discovery via camera)
+// ---------------------------------------------------------------------------
+let qrScanStream = null;
+let qrScanAnimFrame = null;
+
+function openQrScanner() {
+    const modal = document.getElementById('qr-scanner-modal');
+    if (modal) modal.classList.add('visible');
+    startQrScan();
+}
+
+function closeQrScanner() {
+    stopQrScan();
+    const modal = document.getElementById('qr-scanner-modal');
+    if (modal) modal.classList.remove('visible');
+}
+
+async function startQrScan() {
+    const video = document.getElementById('qr-video');
+    const status = document.getElementById('qr-scan-status');
+    const canvas = document.getElementById('qr-canvas');
+
+    if (!video || !canvas) return;
+
+    // Check for BarcodeDetector support
+    const hasBarcodeDetector = 'BarcodeDetector' in window;
+
+    if (!hasBarcodeDetector) {
+        if (status) status.textContent = 'QR scanning requires Chrome 88+ or Edge 88+. Please use a QR scanner app and paste the Tenet URI manually below.';
+        return;
+    }
+
+    if (status) status.textContent = 'Requesting camera access...';
+
+    try {
+        qrScanStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: 'environment' } }
+        });
+        video.srcObject = qrScanStream;
+        await video.play();
+        if (status) status.textContent = 'Point camera at a Tenet QR code';
+
+        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const ctx = canvas.getContext('2d');
+
+        function scan() {
+            if (!qrScanStream) return;
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                detector.detect(canvas).then(codes => {
+                    if (codes.length > 0) {
+                        const raw = codes[0].rawValue;
+                        handleQrResult(raw);
+                    }
+                }).catch(() => {});
+            }
+            qrScanAnimFrame = requestAnimationFrame(scan);
+        }
+        qrScanAnimFrame = requestAnimationFrame(scan);
+    } catch (e) {
+        if (status) {
+            if (e.name === 'NotAllowedError') {
+                status.textContent = 'Camera access denied. Please allow camera access or paste the Tenet URI manually below.';
+            } else {
+                status.textContent = 'Camera unavailable: ' + e.message;
+            }
+        }
+    }
+}
+
+function stopQrScan() {
+    if (qrScanAnimFrame) {
+        cancelAnimationFrame(qrScanAnimFrame);
+        qrScanAnimFrame = null;
+    }
+    if (qrScanStream) {
+        qrScanStream.getTracks().forEach(t => t.stop());
+        qrScanStream = null;
+    }
+    const video = document.getElementById('qr-video');
+    if (video) video.srcObject = null;
+}
+
+function handleQrResult(raw) {
+    // Expected: tenet://peer/<peer_id>?key=<pubkey_hex>
+    let parsed = null;
+    try {
+        const url = new URL(raw);
+        if (url.protocol === 'tenet:' && url.pathname.startsWith('//peer/')) {
+            const peerId = url.pathname.replace('//peer/', '');
+            const key = url.searchParams.get('key') || '';
+            parsed = { peerId, key };
+        }
+    } catch (_) {}
+
+    if (!parsed) {
+        // Not a tenet URI - ignore
+        return;
+    }
+
+    stopQrScan();
+    closeQrScanner();
+
+    // Fill in the add-friend form with the discovered peer ID
+    showFriendsView();
+    const formEl = document.getElementById('add-friend-form');
+    if (formEl && !formEl.classList.contains('visible')) {
+        formEl.classList.add('visible');
+    }
+    const peerIdInput = document.getElementById('friend-peer-id');
+    if (peerIdInput) peerIdInput.value = parsed.peerId;
+
+    showToast('QR code scanned — peer ID filled in. Send a friend request to connect.');
+}
+
+function submitQrManualUri() {
+    const input = document.getElementById('qr-manual-uri');
+    if (!input) return;
+    handleQrResult(input.value.trim());
 }
 
 async function saveProfile() {
@@ -2463,6 +2612,7 @@ async function init() {
     try {
         const health = await apiGet('/api/health');
         myPeerId = health.peer_id || '';
+        myEncryptionPublicKey = health.encryption_public_key || '';
         document.getElementById('status-dot').classList.add('ok');
         const pidEl = document.getElementById('peer-id');
         pidEl.textContent = myPeerId.substring(0, 16) + '...';

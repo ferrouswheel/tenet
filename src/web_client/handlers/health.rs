@@ -23,6 +23,7 @@ pub async fn health_handler(State(state): State<SharedState>) -> impl IntoRespon
     let body = serde_json::json!({
         "status": "ok",
         "peer_id": state.keypair.id,
+        "encryption_public_key": state.keypair.public_key_hex,
         "relay": relay_url,
         "relay_connected": relay_connected,
         "peers": peer_count,

@@ -189,6 +189,10 @@
                         <code class="profile-peer-id" id="profile-edit-peer-id"></code>
                         <button type="button" class="copy-btn" onclick="copyPeerId()">Copy</button>
                     </div>
+                    <!-- QR code for peer discovery -->
+                    <div class="profile-qr-section">
+                        <div id="profile-qr-container" class="profile-qr-container"></div>
+                    </div>
                     <label>Display Name</label>
                     <input type="text" id="profile-display-name" placeholder="Your name" />
                     <label>Bio</label>
@@ -239,7 +243,10 @@
             <div id="friends-view" class="friends-view">
                 <div class="friends-view-header">
                     <h2>Friends</h2>
-                    <button class="add-friend-btn friends-view-add-btn" onclick="toggleAddFriendForm()">+ Add Friend</button>
+                    <div style="display:flex;gap:0.5rem;">
+                        <button class="add-friend-btn friends-view-add-btn" onclick="openQrScanner()" title="Scan peer QR code">&#128247; Scan QR</button>
+                        <button class="add-friend-btn friends-view-add-btn" onclick="toggleAddFriendForm()">+ Add Friend</button>
+                    </div>
                 </div>
                 <div id="add-friend-form" class="add-friend-form">
                     <h3>Send Friend Request</h3>
@@ -278,6 +285,28 @@
             <div id="empty-state" class="empty" style="display:none;">
                 <div class="icon">&#128172;</div>
                 <div>No messages yet</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- QR Scanner Modal -->
+    <div class="qr-scanner-modal" id="qr-scanner-modal">
+        <div class="qr-scanner-dialog">
+            <div class="qr-scanner-header">
+                <span>Scan Peer QR Code</span>
+                <button class="qr-scanner-close" onclick="closeQrScanner()">&#10005;</button>
+            </div>
+            <div class="qr-video-wrap">
+                <video id="qr-video" playsinline muted autoplay></video>
+                <canvas id="qr-canvas" style="display:none;"></canvas>
+            </div>
+            <div class="qr-scan-status" id="qr-scan-status">Starting camera...</div>
+            <div class="qr-manual-section">
+                <div class="qr-manual-label">Or paste a Tenet URI:</div>
+                <div class="qr-manual-row">
+                    <input type="text" id="qr-manual-uri" class="qr-manual-input" placeholder="tenet://peer/...?key=..." />
+                    <button class="btn-primary" onclick="submitQrManualUri()">Add</button>
+                </div>
             </div>
         </div>
     </div>
