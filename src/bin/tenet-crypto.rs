@@ -62,6 +62,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "export-key" => export_key(&command_args, identity_flag.as_deref()),
         "import-key" => import_key(&command_args, identity_flag.as_deref()),
         "rotate-key" => rotate_identity(identity_flag.as_deref()),
+        "list-peers" => list_peers_cmd(&command_args, identity_flag.as_deref()),
+        "list-friends" => list_friends_cmd(&command_args, identity_flag.as_deref()),
+        "peer" => peer_info_cmd(&command_args, identity_flag.as_deref()),
+        "feed" => feed_cmd(&command_args, identity_flag.as_deref()),
         _ => {
             print_usage();
             Ok(())
@@ -83,8 +87,14 @@ fn print_usage() {
          import-key <public_key_hex> <private_key_hex>\n\
          rotate-key\n\
          \n\
+         list-peers [--sort recent|name|added] [--limit N] [--friends]\n\
+         list-friends [--sort recent|name|added] [--limit N]\n\
+         peer <peer_id_or_name> [--limit N]\n\
+         feed [--limit N]\n\
+         \n\
          Options:\n\
          --identity <id>   Select identity (short ID prefix)\n\
+         --relay <url>     Relay URL (default: http://127.0.0.1:8080)\n\
          \n\
          Environment:\n\
          TENET_HOME       defaults to .tenet\n\
@@ -96,6 +106,7 @@ fn print_usage() {
 const DEFAULT_TTL_SECONDS: u64 = 3600;
 const CLI_HPKE_INFO: &[u8] = b"tenet-cli";
 const CLI_PAYLOAD_AAD: &[u8] = b"tenet-cli";
+const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8080";
 
 fn build_relay_client(identity: StoredKeypair, relay_url: &str) -> RelayClient {
     let config = ClientConfig::new(
@@ -162,6 +173,68 @@ fn populate_peer_registry(
         }
     }
     Ok(())
+}
+
+/// Format a Unix timestamp as a human-readable "X ago" string.
+fn format_ago(ts: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if ts == 0 || now < ts {
+        return "unknown".to_string();
+    }
+    let diff = now - ts;
+    if diff < 60 {
+        format!("{}s ago", diff)
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
+}
+
+/// Get the best display label for a peer (display_name or truncated peer_id).
+fn peer_label(peer: &PeerRow) -> String {
+    peer.display_name
+        .clone()
+        .unwrap_or_else(|| peer.peer_id.chars().take(12).collect())
+}
+
+/// Search for a peer by peer_id prefix or display_name (case-insensitive).
+fn find_peer<'a>(peers: &'a [PeerRow], query: &str) -> Option<&'a PeerRow> {
+    let lower = query.to_lowercase();
+    // Exact peer_id match first
+    if let Some(p) = peers.iter().find(|p| p.peer_id == query) {
+        return Some(p);
+    }
+    // peer_id prefix match
+    if let Some(p) = peers.iter().find(|p| p.peer_id.starts_with(query)) {
+        return Some(p);
+    }
+    // display_name exact match (case-insensitive)
+    if let Some(p) = peers
+        .iter()
+        .find(|p| p.display_name.as_deref().map(str::to_lowercase).as_deref() == Some(&lower))
+    {
+        return Some(p);
+    }
+    // display_name contains match
+    peers.iter().find(|p| {
+        p.display_name
+            .as_deref()
+            .map(|n| n.to_lowercase().contains(&lower))
+            .unwrap_or(false)
+    })
+}
+
+fn resolve_relay(relay_url_override: Option<String>, stored_relay: Option<String>) -> String {
+    relay_url_override
+        .or(stored_relay)
+        .or_else(|| env::var("TENET_RELAY_URL").ok())
+        .unwrap_or_else(|| DEFAULT_RELAY_URL.to_string())
 }
 
 fn init_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
@@ -231,7 +304,7 @@ fn add_peer(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Er
 }
 
 fn send_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
+    let mut relay_url_override: Option<String> = None;
     let mut peer_name: Option<String> = None;
     let mut message_parts: Vec<String> = Vec::new();
 
@@ -257,10 +330,7 @@ fn send_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
     }
 
     let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
-
-    let relay_url = relay_url_override
-        .or(stored_relay)
-        .ok_or("relay URL required (use --relay, TENET_RELAY_URL, or store one with init)")?;
+    let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let peer_name = peer_name.ok_or("send requires <peer_name>")?;
     let message = message_parts.join(" ");
@@ -302,7 +372,7 @@ fn send_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
 }
 
 fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
+    let mut relay_url_override: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -319,10 +389,7 @@ fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<d
     }
 
     let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
-
-    let relay_url = relay_url_override
-        .or(stored_relay)
-        .ok_or("relay URL required (use --relay, TENET_RELAY_URL, or store one with init)")?;
+    let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let mut client = build_relay_client(identity, &relay_url);
     populate_peer_registry(&mut client, &storage)?;
@@ -353,7 +420,7 @@ fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<d
 }
 
 fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
+    let mut relay_url_override: Option<String> = None;
     let mut message_parts: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -374,10 +441,7 @@ fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
     }
 
     let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
-
-    let relay_url = relay_url_override
-        .or(stored_relay)
-        .ok_or("relay URL required (use --relay, TENET_RELAY_URL, or store one with init)")?;
+    let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let message = message_parts.join(" ");
     if message.trim().is_empty() {
@@ -405,7 +469,7 @@ fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
 }
 
 fn receive_all(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut relay_url_override = env::var("TENET_RELAY_URL").ok();
+    let mut relay_url_override: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -422,10 +486,7 @@ fn receive_all(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn
     }
 
     let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
-
-    let relay_url = relay_url_override
-        .or(stored_relay)
-        .ok_or("relay URL required (use --relay, TENET_RELAY_URL, or store one with init)")?;
+    let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let mut client = build_relay_client(identity, &relay_url);
     populate_peer_registry(&mut client, &storage)?;
@@ -563,6 +624,293 @@ fn rotate_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
         old_keypair.id, new_keypair.id
     );
     Ok(())
+}
+
+/// List peers with optional sort and filter.
+///
+/// Usage: list-peers [--sort recent|name|added] [--limit N] [--friends]
+fn list_peers_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let mut sort = "recent".to_string();
+    let mut limit: usize = 20;
+    let mut friends_only = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sort" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--sort requires recent|name|added".into());
+                }
+                sort = args[index].clone();
+            }
+            "--limit" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--limit requires a number".into());
+                }
+                limit = args[index]
+                    .parse()
+                    .map_err(|_| "--limit requires a number")?;
+            }
+            "--friends" => {
+                friends_only = true;
+            }
+            unknown => {
+                return Err(format!("unknown option: {unknown}").into());
+            }
+        }
+        index += 1;
+    }
+
+    let (keypair, storage, _) = resolve_and_log(explicit_id)?;
+
+    let mut peers = storage.list_peers()?;
+
+    if friends_only {
+        peers.retain(|p| p.is_friend);
+    }
+
+    // Build a lookup of peer_id -> last message timestamp from conversations
+    let convs = storage.list_conversations(&keypair.id)?;
+    let conv_map: std::collections::HashMap<String, u64> = convs
+        .iter()
+        .map(|c| (c.peer_id.clone(), c.last_timestamp))
+        .collect();
+
+    match sort.as_str() {
+        "recent" => {
+            peers.sort_by(|a, b| {
+                let ta = conv_map.get(&a.peer_id).copied().unwrap_or(0);
+                let tb = conv_map.get(&b.peer_id).copied().unwrap_or(0);
+                tb.cmp(&ta)
+            });
+        }
+        "name" => {
+            peers.sort_by(|a, b| {
+                let na = peer_label(a).to_lowercase();
+                let nb = peer_label(b).to_lowercase();
+                na.cmp(&nb)
+            });
+        }
+        "added" => {
+            peers.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+        }
+        other => {
+            return Err(format!("unknown sort: {other} (use recent|name|added)").into());
+        }
+    }
+
+    peers.truncate(limit);
+
+    if peers.is_empty() {
+        println!("no peers found");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<16} {:<8} {}",
+        "NAME", "PEER ID", "FRIEND", "LAST MESSAGE"
+    );
+    println!("{}", "-".repeat(72));
+
+    for peer in &peers {
+        let name = peer_label(peer);
+        let short_id: String = peer.peer_id.chars().take(14).collect();
+        let friend_flag = if peer.is_friend { "yes" } else { "no" };
+        let last_msg = if let Some(&ts) = conv_map.get(&peer.peer_id) {
+            format_ago(ts)
+        } else {
+            "never".to_string()
+        };
+        println!(
+            "{:<20} {:<16} {:<8} {}",
+            truncate(&name, 20),
+            short_id,
+            friend_flag,
+            last_msg
+        );
+    }
+
+    Ok(())
+}
+
+/// Shortcut for list-peers --friends.
+fn list_friends_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let mut new_args = vec!["--friends".to_string()];
+    new_args.extend_from_slice(args);
+    list_peers_cmd(&new_args, explicit_id)
+}
+
+/// Show detailed info for a single peer including recent messages and posts.
+///
+/// Usage: peer <peer_id_or_name> [--limit N]
+fn peer_info_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let mut query: Option<String> = None;
+    let mut limit: u32 = 10;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--limit requires a number".into());
+                }
+                limit = args[index]
+                    .parse()
+                    .map_err(|_| "--limit requires a number")?;
+            }
+            value if !value.starts_with("--") => {
+                query = Some(value.to_string());
+            }
+            unknown => {
+                return Err(format!("unknown option: {unknown}").into());
+            }
+        }
+        index += 1;
+    }
+
+    let query = query.ok_or("peer requires <peer_id_or_name>")?;
+
+    let (keypair, storage, _) = resolve_and_log(explicit_id)?;
+    let peers = storage.list_peers()?;
+
+    let peer = find_peer(&peers, &query).ok_or("peer not found")?;
+
+    // Header
+    let name = peer_label(peer);
+    println!("Peer: {}", name);
+    println!("  ID:      {}", peer.peer_id);
+    println!("  Friend:  {}", if peer.is_friend { "yes" } else { "no" });
+    if peer.is_muted {
+        println!("  Muted:   yes");
+    }
+    if peer.is_blocked {
+        println!("  Blocked: yes");
+    }
+    println!("  Added:   {}", format_ago(peer.added_at));
+    if let Some(ts) = peer.last_seen_online {
+        println!("  Last seen: {}", format_ago(ts));
+    }
+
+    // Profile
+    if let Some(profile) = storage.get_profile(&peer.peer_id)? {
+        if let Some(bio) = &profile.bio {
+            if !bio.is_empty() {
+                println!("  Bio:     {}", bio);
+            }
+        }
+        if let Some(display) = &profile.display_name {
+            if !display.is_empty() && display != &name {
+                println!("  Profile name: {}", display);
+            }
+        }
+    }
+
+    // Recent direct messages
+    let direct = storage.list_conversation_messages(&keypair.id, &peer.peer_id, None, limit)?;
+    if !direct.is_empty() {
+        println!("\nDirect messages ({}):", direct.len());
+        // Messages come back newest-first; reverse to show oldest first
+        for msg in direct.iter().rev() {
+            let sender = if msg.sender_id == keypair.id {
+                "you".to_string()
+            } else {
+                name.clone()
+            };
+            let body = msg.body.as_deref().unwrap_or("(no body)");
+            println!("  [{}] {}: {}", format_ago(msg.timestamp), sender, body);
+        }
+    }
+
+    // Recent public posts from this peer
+    let all_public = storage.list_messages(Some("public"), None, None, 200)?;
+    let posts: Vec<_> = all_public
+        .iter()
+        .filter(|m| m.sender_id == peer.peer_id)
+        .take(limit as usize)
+        .collect();
+
+    if !posts.is_empty() {
+        println!("\nPublic posts ({}):", posts.len());
+        for post in posts.iter().rev() {
+            let body = post.body.as_deref().unwrap_or("(no body)");
+            println!("  [{}] {}", format_ago(post.timestamp), body);
+        }
+    }
+
+    if direct.is_empty() && posts.is_empty() {
+        println!("\nNo messages or posts stored for this peer.");
+    }
+
+    Ok(())
+}
+
+/// Show the public message feed.
+///
+/// Usage: feed [--limit N]
+fn feed_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let mut limit: u32 = 20;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--limit requires a number".into());
+                }
+                limit = args[index]
+                    .parse()
+                    .map_err(|_| "--limit requires a number")?;
+            }
+            unknown => {
+                return Err(format!("unknown option: {unknown}").into());
+            }
+        }
+        index += 1;
+    }
+
+    let (_keypair, storage, _) = resolve_and_log(explicit_id)?;
+
+    let messages = storage.list_messages(Some("public"), None, None, limit)?;
+
+    if messages.is_empty() {
+        println!("no public messages in feed (run sync or receive-all to fetch)");
+        return Ok(());
+    }
+
+    // Build peer name lookup
+    let peers = storage.list_peers()?;
+    let peer_names: std::collections::HashMap<String, String> = peers
+        .iter()
+        .map(|p| (p.peer_id.clone(), peer_label(p)))
+        .collect();
+
+    println!("Public feed ({} messages):", messages.len());
+    println!("{}", "-".repeat(60));
+
+    // Messages come back newest-first; show newest first
+    for msg in &messages {
+        let sender_name = peer_names
+            .get(&msg.sender_id)
+            .cloned()
+            .unwrap_or_else(|| msg.sender_id.chars().take(12).collect());
+        let body = msg.body.as_deref().unwrap_or("(no body)");
+        println!("[{}] {}: {}", format_ago(msg.timestamp), sender_name, body);
+    }
+
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{}…", truncated)
+    }
 }
 
 fn validate_key_len(bytes: &[u8], label: &str) -> Result<(), Box<dyn Error>> {
