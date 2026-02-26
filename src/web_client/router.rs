@@ -15,6 +15,8 @@ pub fn build_router(state: SharedState) -> Router {
         // Health / sync
         .route("/api/health", get(handlers::health::health_handler))
         .route("/api/sync", post(handlers::health::sync_now_handler))
+        // QR code peer discovery
+        .route("/api/qr", get(handlers::qr::qr_handler))
         // Messages API
         .route(
             "/api/messages",

@@ -10,6 +10,7 @@ pub mod messages;
 pub mod notifications;
 pub mod peers;
 pub mod profiles;
+pub mod qr;
 pub mod reactions;
 pub mod replies;
 pub mod websocket;
