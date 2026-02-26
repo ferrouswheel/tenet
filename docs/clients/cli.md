@@ -1,11 +1,11 @@
 # `tenet` CLI
 
-The `tenet` binary is a lightweight command-line client for key management and basic messaging.
-It stores its peer list as a `peers.json` file and appends messages to JSONL files. It does
-**not** use the web client's SQLite database for peer state — the two clients have separate peer
-registries.
+The `tenet` binary is a lightweight command-line client for key management, messaging, and
+local database inspection. It uses the same SQLite database as `tenet-web`, so peers, messages,
+and identities are shared between the two clients.
 
-For a richer experience (groups, friend requests, reactions, profiles), use `tenet-web` instead.
+For a richer interactive experience (groups, friend requests, reactions, profiles), use
+`tenet-web` instead.
 
 ## Running
 
@@ -18,7 +18,7 @@ cargo run --bin tenet -- <command> [args] [--identity <id>]
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TENET_HOME` | `.tenet` | Data directory containing identities |
-| `TENET_RELAY_URL` | — | Default relay URL for `send` and `sync` |
+| `TENET_RELAY_URL` | — | Default relay URL (overrides the `http://127.0.0.1:8080` fallback) |
 | `TENET_IDENTITY` | — | Select identity by short ID prefix |
 
 ## Commands
@@ -40,38 +40,100 @@ cargo run --bin tenet -- --identity alice init
 ### `add-peer <name> <public_key_hex>`
 
 Register a peer by their X25519 public key (hex). The peer's ID is derived from their key.
+Writes directly to the SQLite `peers` table shared with `tenet-web`.
 
 ```bash
 cargo run --bin tenet -- add-peer alice abc123...
 # peer saved: alice (<peer_id>)
 ```
 
-Peers are stored in `{TENET_HOME}/identities/{short_id}/peers.json`.
-
 ### `send <peer_name> <message> [--relay <url>]`
 
-Encrypt and send a Direct message to a named peer via relay.
+Encrypt and send a Direct message to a named peer via relay. Defaults to
+`http://127.0.0.1:8080` if no relay URL is given.
 
 ```bash
-cargo run --bin tenet -- send alice "hello there" --relay http://localhost:8080
-
-# Or use environment variable:
-TENET_RELAY_URL=http://localhost:8080 cargo run --bin tenet -- send alice "hello"
+cargo run --bin tenet -- send alice "hello there"
+cargo run --bin tenet -- send alice "hello" --relay http://relay.example.com
+TENET_RELAY_URL=http://relay.example.com cargo run --bin tenet -- send alice "hello"
 ```
 
-The sent envelope is appended to `outbox.jsonl` in the identity directory.
+The sent envelope is recorded in the SQLite `outbox` table.
 
 ### `sync [--relay <url>]`
 
-Fetch and decrypt incoming Direct messages from the relay inbox.
+Fetch and decrypt incoming Direct messages from the relay inbox. Defaults to
+`http://127.0.0.1:8080` if no relay URL is given.
 
 ```bash
-cargo run --bin tenet -- sync --relay http://localhost:8080
+cargo run --bin tenet -- sync
 # from <peer_id>: hello there
-# synced 1 envelopes
+# synced 1 direct message(s)
 ```
 
-Received messages are appended to `inbox.jsonl` in the identity directory.
+Received messages are stored in the SQLite `messages` table.
+
+### `post <message> [--relay <url>]`
+
+Broadcast a Public message to the relay. Defaults to `http://127.0.0.1:8080`.
+
+```bash
+cargo run --bin tenet -- post "hello world"
+```
+
+### `receive-all [--relay <url>]`
+
+Like `sync` but shows all message kinds (direct, public, group). Defaults to
+`http://127.0.0.1:8080`.
+
+```bash
+cargo run --bin tenet -- receive-all
+# [public] from <peer_id>: hello world
+# [direct] from <peer_id>: hey
+# received 2 message(s)
+```
+
+### `list-peers [--sort recent|name|added] [--limit N] [--friends]`
+
+List known peers from the local database, sorted by most recent message by default.
+
+```bash
+cargo run --bin tenet -- list-peers
+cargo run --bin tenet -- list-peers --sort name
+cargo run --bin tenet -- list-peers --friends --limit 5
+```
+
+Output columns: name, peer ID prefix, friend status, last message age.
+
+### `list-friends [--sort recent|name|added] [--limit N]`
+
+Shortcut for `list-peers --friends`.
+
+```bash
+cargo run --bin tenet -- list-friends
+```
+
+### `peer <peer_id_or_name> [--limit N]`
+
+Show detailed info for a single peer: metadata, profile bio (if stored), recent direct
+messages, and recent public posts. The query matches peer ID (exact or prefix) or display
+name (case-insensitive, substring).
+
+```bash
+cargo run --bin tenet -- peer alice
+cargo run --bin tenet -- peer abc123def456  # peer_id prefix
+cargo run --bin tenet -- peer alice --limit 20
+```
+
+### `feed [--limit N]`
+
+Show the local public message feed (messages previously received via `sync`,
+`receive-all`, or `post`). Defaults to 20 most recent messages.
+
+```bash
+cargo run --bin tenet -- feed
+cargo run --bin tenet -- feed --limit 50
+```
 
 ### `export-key [--public | --private]`
 
@@ -88,7 +150,7 @@ The public key is what you share with peers so they can `add-peer` you.
 ### `import-key <public_key_hex> <private_key_hex>`
 
 Import an existing X25519 keypair as a new identity. New Ed25519 signing keys are generated
-automatically (signing keys are not part of the importable key format).
+automatically.
 
 ```bash
 cargo run --bin tenet -- import-key <pub_hex> <priv_hex>
@@ -97,8 +159,7 @@ cargo run --bin tenet -- import-key <pub_hex> <priv_hex>
 ### `rotate-key`
 
 Generate a new keypair as a new identity and set it as default. The old identity remains in
-`{TENET_HOME}/identities/` and can be selected with `--identity`. Peers are copied to the new
-identity directory.
+`{TENET_HOME}/identities/` and can be selected with `--identity`.
 
 ```bash
 cargo run --bin tenet -- rotate-key
@@ -113,7 +174,7 @@ identity management model.
 
 ```bash
 # Create a second identity
-cargo run --bin tenet -- init  # creates another identity
+cargo run --bin tenet -- init
 
 # Select by short ID prefix
 cargo run --bin tenet -- --identity abc12 export-key
@@ -129,20 +190,10 @@ TENET_IDENTITY=abc12 cargo run --bin tenet -- export-key
   config.toml               <- default_identity setting
   identities/
     {short_id}/
-      tenet.db              <- SQLite (identity + relay config)
-      peers.json            <- peer registry (CLI-managed, NOT shared with tenet-web)
-      inbox.jsonl           <- received messages (appended by sync)
-      outbox.jsonl          <- sent envelopes (appended by send)
+      tenet.db              <- SQLite (identity, peers, messages, outbox, relay config)
+  attachments/              <- shared attachment blobs
 ```
 
-## Limitations
-
-- **Peers are not shared with `tenet-web`**: the CLI stores peers in `peers.json`; the web
-  client uses the SQLite `peers` table. Adding a peer in the CLI does not make them visible in
-  the web UI, and vice versa.
-- **Direct messages only**: the CLI sends and receives `Direct` messages only. Public posts,
-  group messages, friend requests, reactions, and profiles require `tenet-web`.
-- **No SQLite message storage**: received messages are appended to `inbox.jsonl` (plain text),
-  not into the structured SQLite `messages` table used by `tenet-web`.
-- **Relay URL required for send/sync**: the CLI does not discover relays; a URL must be given
-  via `--relay`, `TENET_RELAY_URL`, or stored in the identity's relay table by `tenet-web`.
+All state (identity, peers, sent and received messages, relays) lives in a single SQLite
+database per identity. The CLI and `tenet-web` share this database when using the same
+`TENET_HOME`.

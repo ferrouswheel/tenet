@@ -919,3 +919,168 @@ fn validate_key_len(bytes: &[u8], label: &str) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tenet::storage::PeerRow;
+
+    fn make_peer(peer_id: &str, display_name: Option<&str>) -> PeerRow {
+        PeerRow {
+            peer_id: peer_id.to_string(),
+            display_name: display_name.map(str::to_string),
+            signing_public_key: String::new(),
+            encryption_public_key: None,
+            added_at: 0,
+            is_friend: false,
+            last_seen_online: None,
+            online: false,
+            last_profile_requested_at: None,
+            last_profile_responded_at: None,
+            is_blocked: false,
+            is_muted: false,
+            blocked_at: None,
+            muted_at: None,
+        }
+    }
+
+    // --- format_ago ---
+
+    #[test]
+    fn format_ago_zero_returns_unknown() {
+        assert_eq!(format_ago(0), "unknown");
+    }
+
+    #[test]
+    fn format_ago_seconds() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = format_ago(now - 30);
+        assert!(result.ends_with("s ago"), "got: {result}");
+    }
+
+    #[test]
+    fn format_ago_minutes() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = format_ago(now - 90); // 1.5 minutes
+        assert!(result.ends_with("m ago"), "got: {result}");
+    }
+
+    #[test]
+    fn format_ago_hours() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = format_ago(now - 7200); // 2 hours
+        assert_eq!(result, "2h ago");
+    }
+
+    #[test]
+    fn format_ago_days() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = format_ago(now - 3 * 86400); // 3 days
+        assert_eq!(result, "3d ago");
+    }
+
+    // --- peer_label ---
+
+    #[test]
+    fn peer_label_uses_display_name_when_present() {
+        let peer = make_peer("abc123def456xyz", Some("alice"));
+        assert_eq!(peer_label(&peer), "alice");
+    }
+
+    #[test]
+    fn peer_label_falls_back_to_truncated_id() {
+        let peer = make_peer("abc123def456xyz", None);
+        assert_eq!(peer_label(&peer), "abc123def456");
+    }
+
+    // --- truncate ---
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        let result = truncate("hello world", 8);
+        assert!(result.ends_with('…'), "got: {result}");
+        assert!(result.chars().count() <= 8, "got: {result}");
+    }
+
+    // --- find_peer ---
+
+    #[test]
+    fn find_peer_exact_id_match() {
+        let peers = vec![
+            make_peer("abc123", Some("alice")),
+            make_peer("def456", Some("bob")),
+        ];
+        let found = find_peer(&peers, "abc123").unwrap();
+        assert_eq!(found.peer_id, "abc123");
+    }
+
+    #[test]
+    fn find_peer_prefix_id_match() {
+        let peers = vec![
+            make_peer("abc123def456", Some("alice")),
+            make_peer("xyz789", Some("bob")),
+        ];
+        let found = find_peer(&peers, "abc123").unwrap();
+        assert_eq!(found.peer_id, "abc123def456");
+    }
+
+    #[test]
+    fn find_peer_display_name_exact() {
+        let peers = vec![
+            make_peer("abc123", Some("Alice")),
+            make_peer("def456", Some("Bob")),
+        ];
+        let found = find_peer(&peers, "alice").unwrap(); // case-insensitive
+        assert_eq!(found.peer_id, "abc123");
+    }
+
+    #[test]
+    fn find_peer_display_name_substring() {
+        let peers = vec![
+            make_peer("abc123", Some("Alice Smith")),
+            make_peer("def456", Some("Bob Jones")),
+        ];
+        let found = find_peer(&peers, "smith").unwrap();
+        assert_eq!(found.peer_id, "abc123");
+    }
+
+    #[test]
+    fn find_peer_no_match_returns_none() {
+        let peers = vec![make_peer("abc123", Some("alice"))];
+        assert!(find_peer(&peers, "zzzzzz").is_none());
+    }
+
+    // --- validate_key_len ---
+
+    #[test]
+    fn validate_key_len_correct() {
+        assert!(validate_key_len(&[0u8; 32], "public").is_ok());
+    }
+
+    #[test]
+    fn validate_key_len_wrong_size() {
+        assert!(validate_key_len(&[0u8; 16], "public").is_err());
+    }
+}
