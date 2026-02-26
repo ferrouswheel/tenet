@@ -1,0 +1,92 @@
+# Mesh catch-up scenario
+#
+# Tests the public-message mesh catch-up protocol by pitting two cohorts
+# against each other:
+#
+#   "broadcasters"  – always online; post public messages throughout the run.
+#   "latecomers"    – rarely online at the start (online_probability = 0.1)
+#                     so they miss most early broadcasts.  When a latecomer
+#                     eventually polls its inbox it will receive any
+#                     MessageRequest / MeshAvailable / MeshRequest /
+#                     MeshDelivery envelopes that peers exchange and will
+#                     complete a four-phase catch-up automatically via
+#                     SimulationClient.handle_mesh_meta().
+#
+# To trigger mesh catch-up in a simulation run an initiating peer must post a
+# MessageRequest Meta envelope to the relay (e.g. via the `mesh-query` REPL
+# command in tenet-debugger, or by adding a scheduled event in a custom
+# harness).  This scenario is primarily a documentation / regression fixture
+# for the cohort composition that makes catch-up necessary.
+
+[simulation]
+node_ids = ["broadcaster-1", "broadcaster-2", "broadcaster-3",
+            "latecomer-1",   "latecomer-2",   "latecomer-3"]
+steps = 40
+seed  = 42
+
+[simulation.simulated_time]
+seconds_per_step    = 300   # 5 minutes per step
+default_speed_factor = 1.0
+
+[simulation.friends_per_node]
+type = "uniform"
+min  = 2
+max  = 4
+
+[simulation.post_frequency]
+type           = "poisson"
+lambda_per_hour = 4.0
+
+# Default weights (used for any cohort that does not override them).
+[simulation.message_type_weights]
+direct = 0.2
+public = 0.8
+group  = 0.0
+
+# Broadcasters: always online, focus on public messages so latecomers have
+# something to catch up on.
+[[simulation.cohorts]]
+name  = "broadcasters"
+type  = "always_online"
+share = 0.5
+[simulation.cohorts.message_type_weights]
+direct = 0.1
+public = 0.9
+group  = 0.0
+
+# Latecomers: rarely online so they miss the early broadcasts and need to
+# request them via the four-phase mesh protocol when they eventually appear.
+[[simulation.cohorts]]
+name               = "latecomers"
+type               = "rarely_online"
+share              = 0.5
+online_probability = 0.15
+[simulation.cohorts.message_type_weights]
+direct = 0.3
+public = 0.7
+group  = 0.0
+
+[simulation.message_size_distribution]
+type = "uniform"
+min  = 20
+max  = 120
+
+[simulation.encryption]
+type = "plaintext"
+
+# 20 % reply rate so public messages propagate back into the network.
+[simulation.reaction_config]
+reply_probability = 0.2
+
+[simulation.reaction_config.reply_delay_distribution]
+type = "uniform"
+min  = 60.0    # 1 minute
+max  = 300.0   # 5 minutes
+
+[relay]
+ttl_seconds              = 3600
+max_messages             = 1000
+max_bytes                = 2097152   # 2 MiB
+retry_backoff_seconds    = [1, 2, 4]
+peer_log_window_seconds  = 30
+peer_log_interval_seconds = 10

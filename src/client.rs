@@ -3595,4 +3595,441 @@ mod tests {
         let config = ClientConfig::new("http://localhost:8080/", 3600, ClientEncryption::Plaintext);
         assert_eq!(config.ws_url("charlie"), "ws://localhost:8080/ws/charlie");
     }
+
+    // -----------------------------------------------------------------------
+    // Mesh catch-up protocol tests (four-phase: MessageRequest → MeshAvailable
+    // → MeshRequest → MeshDelivery)
+    // -----------------------------------------------------------------------
+
+    /// Build a ClientContext backed by local variables.
+    ///
+    /// Macro instead of function because `ClientContext` contains borrows that
+    /// must outlive the context itself.  All temporaries are bound with names
+    /// prefixed by `_tc_` to avoid clashing with test-function locals.
+    macro_rules! test_ctx {
+        ($ctx:ident with $kp:ident) => {
+            let _tc_dl: HashSet<(String, String)> = HashSet::new();
+            let _tc_nb: HashMap<String, Vec<String>> = HashMap::new();
+            let mut _tc_mh: HashMap<(String, String), Vec<HistoricalMessage>> = HashMap::new();
+            let mut _tc_ms: HashMap<String, usize> = HashMap::new();
+            let mut _tc_pf: HashSet<String> = HashSet::new();
+            let mut _tc_sm = SimulationMetrics {
+                planned_messages: 0,
+                sent_messages: 0,
+                direct_deliveries: 0,
+                inbox_deliveries: 0,
+                store_forwards_stored: 0,
+                store_forwards_forwarded: 0,
+                store_forwards_delivered: 0,
+            };
+            let mut _tc_mt = MetricsTracker::new(1.0, HashMap::new());
+            let mut $ctx = ClientContext {
+                direct_enabled: true,
+                ttl_seconds: 3600,
+                encryption: MessageEncryption::Plaintext,
+                direct_links: &_tc_dl,
+                neighbors: &_tc_nb,
+                keypairs: &$kp,
+                message_history: &mut _tc_mh,
+                message_send_steps: &mut _tc_ms,
+                pending_forwarded_messages: &mut _tc_pf,
+                metrics: &mut _tc_sm,
+                metrics_tracker: &mut _tc_mt,
+            };
+        };
+    }
+
+    fn mesh_keypairs(ids: &[&str]) -> HashMap<String, StoredKeypair> {
+        ids.iter()
+            .map(|id| (id.to_string(), crate::crypto::generate_keypair()))
+            .collect()
+    }
+
+    fn mesh_public_env(
+        sender_id: &str,
+        body: &str,
+        timestamp: u64,
+        keypair: &StoredKeypair,
+    ) -> Envelope {
+        build_plaintext_envelope(
+            sender_id,
+            "*",
+            None,
+            None,
+            timestamp,
+            3600,
+            MessageKind::Public,
+            None,
+            None,
+            body,
+            &[0u8; 16],
+            &keypair.signing_private_key_hex,
+        )
+        .expect("build public envelope")
+    }
+
+    // --- Phase 1: MessageRequest → MeshAvailable ---
+
+    #[test]
+    fn test_mesh_phase1_empty_cache_returns_no_response() {
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        // Cache is intentionally empty.
+        let meta = MetaMessage::MessageRequest {
+            peer_id: "requester".to_string(),
+            since_timestamp: 0,
+        };
+        let outgoing = responder.handle_mesh_meta(&meta, "requester", 0, &mut ctx);
+        assert!(
+            outgoing.is_empty(),
+            "empty cache must not produce a MeshAvailable"
+        );
+    }
+
+    #[test]
+    fn test_mesh_phase1_returns_mesh_available_with_all_ids() {
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        let env1 = mesh_public_env("responder", "msg one", 5, &kp["responder"]);
+        let env2 = mesh_public_env("responder", "msg two", 10, &kp["responder"]);
+        let id1 = env1.header.message_id.0.clone();
+        let id2 = env2.header.message_id.0.clone();
+        responder.public_message_cache.push(env1);
+        responder.public_message_cache.push(env2);
+
+        let meta = MetaMessage::MessageRequest {
+            peer_id: "requester".to_string(),
+            since_timestamp: 0,
+        };
+        let outgoing = responder.handle_mesh_meta(&meta, "requester", 0, &mut ctx);
+
+        assert_eq!(outgoing.len(), 1, "should emit exactly one MeshAvailable");
+        assert_eq!(outgoing[0].header.message_kind, MessageKind::Meta);
+        match decode_meta_payload(&outgoing[0].payload).unwrap() {
+            MetaMessage::MeshAvailable {
+                message_ids,
+                since_timestamp,
+                ..
+            } => {
+                assert_eq!(since_timestamp, 0);
+                assert!(message_ids.contains(&id1));
+                assert!(message_ids.contains(&id2));
+            }
+            other => panic!("expected MeshAvailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mesh_phase1_since_timestamp_filters_old_messages() {
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        let old_env = mesh_public_env("responder", "old post", 5, &kp["responder"]);
+        let new_env = mesh_public_env("responder", "new post", 15, &kp["responder"]);
+        let new_id = new_env.header.message_id.0.clone();
+        responder.public_message_cache.push(old_env);
+        responder.public_message_cache.push(new_env);
+
+        let meta = MetaMessage::MessageRequest {
+            peer_id: "requester".to_string(),
+            since_timestamp: 10, // only messages with timestamp >= 10
+        };
+        let outgoing = responder.handle_mesh_meta(&meta, "requester", 0, &mut ctx);
+        assert_eq!(outgoing.len(), 1);
+        match decode_meta_payload(&outgoing[0].payload).unwrap() {
+            MetaMessage::MeshAvailable { message_ids, .. } => {
+                assert_eq!(
+                    message_ids,
+                    vec![new_id],
+                    "only the newer message should be offered"
+                );
+            }
+            other => panic!("expected MeshAvailable, got {other:?}"),
+        }
+    }
+
+    // --- Phase 2: MeshAvailable → MeshRequest ---
+
+    #[test]
+    fn test_mesh_phase2_all_unknown_ids_produces_mesh_request() {
+        let kp = mesh_keypairs(&["requester", "responder"]);
+        test_ctx!(ctx with kp);
+
+        let mut requester = SimulationClient::new("requester", vec![true; 5], None);
+        // Requester has no messages yet.
+        let meta = MetaMessage::MeshAvailable {
+            peer_id: "responder".to_string(),
+            message_ids: vec!["id-aaa".to_string(), "id-bbb".to_string()],
+            since_timestamp: 0,
+        };
+        let outgoing = requester.handle_mesh_meta(&meta, "responder", 0, &mut ctx);
+        assert_eq!(outgoing.len(), 1, "should request the unknown IDs");
+        match decode_meta_payload(&outgoing[0].payload).unwrap() {
+            MetaMessage::MeshRequest { message_ids, .. } => {
+                let mut ids = message_ids.clone();
+                ids.sort();
+                assert_eq!(ids, vec!["id-aaa", "id-bbb"]);
+            }
+            other => panic!("expected MeshRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mesh_phase2_all_known_ids_produces_no_request() {
+        let kp = mesh_keypairs(&["requester", "responder"]);
+        test_ctx!(ctx with kp);
+
+        let mut requester = SimulationClient::new("requester", vec![true; 5], None);
+        let known_id = "id-already-known".to_string();
+        requester
+            .public_message_metadata
+            .insert(ContentId(known_id.clone()), PublicMessageMetadata::new(0));
+
+        let meta = MetaMessage::MeshAvailable {
+            peer_id: "responder".to_string(),
+            message_ids: vec![known_id],
+            since_timestamp: 0,
+        };
+        let outgoing = requester.handle_mesh_meta(&meta, "responder", 0, &mut ctx);
+        assert!(
+            outgoing.is_empty(),
+            "should not request IDs already in local cache"
+        );
+    }
+
+    #[test]
+    fn test_mesh_phase2_partial_overlap_requests_only_unknown() {
+        let kp = mesh_keypairs(&["requester", "responder"]);
+        test_ctx!(ctx with kp);
+
+        let mut requester = SimulationClient::new("requester", vec![true; 5], None);
+        let known_id = "id-known".to_string();
+        let unknown_id = "id-unknown".to_string();
+        requester
+            .public_message_metadata
+            .insert(ContentId(known_id.clone()), PublicMessageMetadata::new(0));
+
+        let meta = MetaMessage::MeshAvailable {
+            peer_id: "responder".to_string(),
+            message_ids: vec![known_id, unknown_id.clone()],
+            since_timestamp: 0,
+        };
+        let outgoing = requester.handle_mesh_meta(&meta, "responder", 0, &mut ctx);
+        assert_eq!(outgoing.len(), 1);
+        match decode_meta_payload(&outgoing[0].payload).unwrap() {
+            MetaMessage::MeshRequest { message_ids, .. } => {
+                assert_eq!(message_ids, vec![unknown_id]);
+            }
+            other => panic!("expected MeshRequest, got {other:?}"),
+        }
+    }
+
+    // --- Phase 3: MeshRequest → MeshDelivery ---
+
+    #[test]
+    fn test_mesh_phase3_delivers_requested_message() {
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        let env = mesh_public_env("responder", "catch-up content", 5, &kp["responder"]);
+        let msg_id = env.header.message_id.0.clone();
+        responder.public_message_cache.push(env);
+
+        let meta = MetaMessage::MeshRequest {
+            peer_id: "requester".to_string(),
+            message_ids: vec![msg_id.clone()],
+        };
+        let outgoing = responder.handle_mesh_meta(&meta, "requester", 0, &mut ctx);
+        assert_eq!(outgoing.len(), 1, "should emit one MeshDelivery batch");
+        match decode_meta_payload(&outgoing[0].payload).unwrap() {
+            MetaMessage::MeshDelivery { envelopes, .. } => {
+                assert_eq!(envelopes.len(), 1);
+                let delivered: Envelope =
+                    serde_json::from_value(envelopes[0].clone()).expect("deserialize envelope");
+                assert_eq!(delivered.header.message_id.0, msg_id);
+                assert_eq!(delivered.header.message_kind, MessageKind::Public);
+            }
+            other => panic!("expected MeshDelivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mesh_phase3_unknown_id_produces_no_delivery() {
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        // Cache is empty — the requested ID doesn't exist.
+        let meta = MetaMessage::MeshRequest {
+            peer_id: "requester".to_string(),
+            message_ids: vec!["id-nonexistent".to_string()],
+        };
+        let outgoing = responder.handle_mesh_meta(&meta, "requester", 0, &mut ctx);
+        assert!(outgoing.is_empty(), "no delivery for unknown message IDs");
+    }
+
+    // --- Phase 4: MeshDelivery → local cache ---
+
+    #[test]
+    fn test_mesh_phase4_stores_delivered_messages() {
+        let kp = mesh_keypairs(&["requester", "responder"]);
+        test_ctx!(ctx with kp);
+
+        let mut requester = SimulationClient::new("requester", vec![true; 5], None);
+        let env = mesh_public_env("responder", "missed broadcast", 5, &kp["responder"]);
+        let msg_id = env.header.message_id.0.clone();
+        let env_val = serde_json::to_value(&env).unwrap();
+
+        let meta = MetaMessage::MeshDelivery {
+            peer_id: "responder".to_string(),
+            envelopes: vec![env_val],
+            sender_keys: HashMap::new(),
+        };
+        let outgoing = requester.handle_mesh_meta(&meta, "responder", 1, &mut ctx);
+        assert!(
+            outgoing.is_empty(),
+            "MeshDelivery should produce no outgoing"
+        );
+        assert_eq!(requester.public_message_cache.len(), 1);
+        assert_eq!(
+            requester.public_message_cache[0].header.message_id.0,
+            msg_id
+        );
+    }
+
+    #[test]
+    fn test_mesh_phase4_does_not_duplicate_known_messages() {
+        let kp = mesh_keypairs(&["requester", "responder"]);
+        test_ctx!(ctx with kp);
+
+        let mut requester = SimulationClient::new("requester", vec![true; 5], None);
+        let env = mesh_public_env("responder", "already here", 5, &kp["responder"]);
+        let env_val = serde_json::to_value(&env).unwrap();
+
+        // Pre-populate so requester already holds this message.
+        requester
+            .public_message_metadata
+            .insert(env.header.message_id.clone(), PublicMessageMetadata::new(0));
+        requester.public_message_cache.push(env);
+
+        let meta = MetaMessage::MeshDelivery {
+            peer_id: "responder".to_string(),
+            envelopes: vec![env_val],
+            sender_keys: HashMap::new(),
+        };
+        requester.handle_mesh_meta(&meta, "responder", 1, &mut ctx);
+        // Cache should still contain exactly one copy.
+        assert_eq!(requester.public_message_cache.len(), 1);
+    }
+
+    // --- End-to-end: all four phases chained ---
+
+    #[test]
+    fn test_mesh_full_four_phase_exchange() {
+        // Scenario: responder holds a public message that requester missed.
+        // Drive all four phases and verify the message ends up in requester's cache.
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        let mut requester = SimulationClient::new("requester", vec![true; 5], None);
+
+        let env = mesh_public_env("responder", "missed broadcast", 5, &kp["responder"]);
+        let msg_id = env.header.message_id.0.clone();
+        responder.public_message_cache.push(env);
+
+        assert_eq!(requester.public_message_cache.len(), 0);
+
+        // Phase 1: requester → responder (MessageRequest)
+        let p1 = MetaMessage::MessageRequest {
+            peer_id: "requester".to_string(),
+            since_timestamp: 0,
+        };
+        let p2_envs = responder.handle_mesh_meta(&p1, "requester", 0, &mut ctx);
+        assert_eq!(p2_envs.len(), 1, "responder should advertise its messages");
+
+        // Phase 2: responder → requester (MeshAvailable)
+        let p2 = decode_meta_payload(&p2_envs[0].payload).unwrap();
+        let p3_envs = requester.handle_mesh_meta(&p2, "responder", 0, &mut ctx);
+        assert_eq!(p3_envs.len(), 1, "requester should request the unknown ID");
+
+        // Phase 3: requester → responder (MeshRequest)
+        let p3 = decode_meta_payload(&p3_envs[0].payload).unwrap();
+        let p4_envs = responder.handle_mesh_meta(&p3, "requester", 0, &mut ctx);
+        assert_eq!(p4_envs.len(), 1, "responder should deliver the envelope");
+
+        // Phase 4: responder → requester (MeshDelivery)
+        let p4 = decode_meta_payload(&p4_envs[0].payload).unwrap();
+        let done = requester.handle_mesh_meta(&p4, "responder", 0, &mut ctx);
+        assert!(done.is_empty(), "no further envelopes after MeshDelivery");
+
+        // The message must now be in the requester's cache.
+        assert_eq!(requester.public_message_cache.len(), 1);
+        assert_eq!(
+            requester.public_message_cache[0].header.message_id.0,
+            msg_id
+        );
+        assert!(
+            requester
+                .public_message_metadata
+                .contains_key(&requester.public_message_cache[0].header.message_id),
+            "metadata entry should be present"
+        );
+    }
+
+    /// Verify that mesh Meta envelopes are routed through handle_inbox and
+    /// produce the expected outgoing envelopes (phase-1 responder path).
+    #[test]
+    fn test_mesh_via_handle_inbox_triggers_mesh_available() {
+        use crate::protocol::{build_envelope_from_payload, build_meta_payload};
+
+        let kp = mesh_keypairs(&["responder", "requester"]);
+        test_ctx!(ctx with kp);
+
+        let mut responder = SimulationClient::new("responder", vec![true; 5], None);
+        let env = mesh_public_env("responder", "test msg", 1, &kp["responder"]);
+        let msg_id = env.header.message_id.0.clone();
+        responder.public_message_cache.push(env);
+
+        // Build a Meta envelope containing MessageRequest addressed to responder.
+        let request_meta = MetaMessage::MessageRequest {
+            peer_id: "requester".to_string(),
+            since_timestamp: 0,
+        };
+        let payload = build_meta_payload(&request_meta).unwrap();
+        let meta_env = build_envelope_from_payload(
+            "requester",
+            "responder",
+            None,
+            None,
+            0u64,
+            3600,
+            MessageKind::Meta,
+            None,
+            None,
+            payload,
+            &kp["requester"].signing_private_key_hex,
+        )
+        .unwrap();
+
+        // handle_inbox should call handle_mesh_meta internally.
+        let outcome = responder.handle_inbox(0, vec![meta_env], &mut ctx, None);
+        assert_eq!(
+            outcome.outgoing.len(),
+            1,
+            "handle_inbox should emit MeshAvailable"
+        );
+        match decode_meta_payload(&outcome.outgoing[0].payload).unwrap() {
+            MetaMessage::MeshAvailable { message_ids, .. } => {
+                assert!(message_ids.contains(&msg_id));
+            }
+            other => panic!("expected MeshAvailable, got {other:?}"),
+        }
+    }
 }
