@@ -61,6 +61,8 @@ tokio-tungstenite = "0.21"
 futures-util = "0.3"
 tempfile = "3"
 qrcode = "0.14"
+geohash = "0.13"
+reverse_geocoder = "3"
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"
