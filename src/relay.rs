@@ -87,6 +87,11 @@ pub struct RelayConfig {
     /// Maximum bytes a single sender may upload via `POST /blobs` per calendar
     /// day (UTC).  Default: 500 MiB.
     pub blob_daily_quota_bytes: u64,
+    /// How long blob chunks are retained after their first upload.
+    /// Independent of envelope TTL so recipients that come online late can
+    /// still fetch chunks after the referencing envelope has expired.
+    /// Default: 30 days.
+    pub blob_ttl: Duration,
 }
 
 const WS_BROADCAST_CAPACITY: usize = 128;
@@ -135,9 +140,16 @@ struct RelayStateInner {
 struct BlobEntry {
     /// Raw encrypted chunk bytes.
     data: Vec<u8>,
-    /// Uploader peer ID (reserved for future authorised DELETE enforcement).
-    #[allow(dead_code)]
-    uploader_id: Option<String>,
+    /// Peer IDs that have uploaded this chunk.  Each uploader holds one
+    /// reference; the chunk is only physically deleted when this set empties.
+    uploaders: HashSet<String>,
+    /// Count of uploads submitted without a `sender_id`.  Anonymous uploads
+    /// each hold one reference; decremented on anonymous delete requests.
+    anon_refs: u64,
+    /// Unix timestamp (seconds) of first upload (for dashboard display).
+    uploaded_epoch: u64,
+    /// When this chunk expires (wall-clock).
+    expires_at: Instant,
 }
 
 struct WsClientInfo {
@@ -360,6 +372,33 @@ struct InboxInfo {
     senders: Vec<InboxSenderInfo>,
 }
 
+/// Dashboard representation of a stored blob chunk.
+#[derive(Serialize)]
+struct BlobInfo {
+    chunk_hash: String,
+    size_bytes: usize,
+    /// Named peer IDs holding a reference to this chunk.
+    uploaders: Vec<String>,
+    /// Number of anonymous (no sender_id) references.
+    anon_refs: u64,
+    /// Unix timestamp (seconds) when the chunk was first uploaded.
+    uploaded_epoch: u64,
+    /// Unix timestamp (seconds) when the chunk expires.
+    expires_epoch: u64,
+    /// Seconds remaining until expiry (0 if already expired).
+    expires_in_secs: u64,
+}
+
+/// Dashboard representation of a sender's blob upload quota.
+#[derive(Serialize)]
+struct BlobQuotaInfo {
+    sender_id: String,
+    bytes_today: u64,
+    quota_bytes: u64,
+    /// UTC epoch day (days since 1970-01-01) the counter applies to.
+    day: u64,
+}
+
 #[derive(Serialize)]
 struct LatencyInfo {
     min: u64,
@@ -489,6 +528,54 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
     let uptime_secs = state.start_time.elapsed().as_secs();
     let ws_connections = state.ws_connections.load(Ordering::Relaxed);
 
+    // Blob store stats
+    let blob_ttl_secs = state.config.blob_ttl.as_secs();
+    let mut blobs: Vec<BlobInfo> = inner
+        .blobs
+        .iter()
+        .map(|(hash, entry)| {
+            let expires_epoch = entry.uploaded_epoch.saturating_add(blob_ttl_secs);
+            let expires_in_secs = expires_epoch.saturating_sub(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            let mut uploaders: Vec<String> = entry.uploaders.iter().cloned().collect();
+            uploaders.sort();
+            BlobInfo {
+                chunk_hash: hash.clone(),
+                size_bytes: entry.data.len(),
+                uploaders,
+                anon_refs: entry.anon_refs,
+                uploaded_epoch: entry.uploaded_epoch,
+                expires_epoch,
+                expires_in_secs,
+            }
+        })
+        .collect();
+    blobs.sort_by(|a, b| b.uploaded_epoch.cmp(&a.uploaded_epoch));
+    let total_blob_bytes: usize = inner.blobs.values().map(|e| e.data.len()).sum();
+
+    // Blob upload quota stats (show all senders with any recorded quota)
+    let today = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86400;
+    let mut blob_quotas: Vec<BlobQuotaInfo> = inner
+        .blob_daily_upload
+        .iter()
+        .filter(|(_, (day, _))| *day == today) // only show today's active senders
+        .map(|(sender_id, (day, bytes))| BlobQuotaInfo {
+            sender_id: sender_id.clone(),
+            bytes_today: *bytes,
+            quota_bytes: state.config.blob_daily_quota_bytes,
+            day: *day,
+        })
+        .collect();
+    blob_quotas.sort_by(|a, b| b.bytes_today.cmp(&a.bytes_today));
+
     let qos = &state.config.qos;
     Json(serde_json::json!({
         // Legacy fields
@@ -506,10 +593,18 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
         "ws_clients": ws_clients,
         "inboxes": inboxes,
         "latency_ms": latency,
+        // Blob store
+        "total_blobs": blobs.len(),
+        "total_blob_bytes": total_blob_bytes,
+        "blobs": blobs,
+        "blob_quotas": blob_quotas,
         "config": {
             "ttl_secs": state.config.ttl.as_secs(),
             "max_messages": state.config.max_messages,
             "max_bytes": state.config.max_bytes,
+            "blob_ttl_secs": blob_ttl_secs,
+            "blob_max_chunk_bytes": state.config.blob_max_chunk_bytes,
+            "blob_daily_quota_bytes": state.config.blob_daily_quota_bytes,
             "qos": {
                 "tier1": { "max_envelopes": qos.tier1.max_envelopes, "max_bytes": qos.tier1.max_bytes },
                 "tier2": { "max_envelopes": qos.tier2.max_envelopes, "max_bytes": qos.tier2.max_bytes },
@@ -1582,9 +1677,15 @@ struct UploadBlobRequest {
 
 /// Upload a single encrypted chunk to the relay blob store.
 ///
-/// Returns `201 Created` on success, `409 Conflict` if the chunk already
-/// exists, `400 Bad Request` on validation failure, or `413 Payload Too Large`
-/// / `429 Too Many Requests` for quota violations.
+/// If the chunk is new, it is stored and `201 Created` is returned.  If the
+/// same chunk was already uploaded by another peer (identified by `sender_id`),
+/// the caller is added as an additional reference holder so that a delete by
+/// the other peer does not evict the chunk prematurely.  In that case `200 OK`
+/// is returned (the chunk was not newly created).
+///
+/// Returns `400 Bad Request` on validation failure, `413 Payload Too Large` if
+/// the chunk exceeds the configured limit, or `429 Too Many Requests` if the
+/// sender has exhausted their daily quota.
 async fn upload_blob(
     State(state): State<RelayState>,
     Json(req): Json<UploadBlobRequest>,
@@ -1628,16 +1729,26 @@ async fn upload_blob(
         Err(status) => return (status, "relay busy").into_response(),
     };
 
-    // Deduplicate: if already stored, return 409 Conflict.
-    if inner.blobs.contains_key(&req.chunk_hash) {
+    // If chunk already exists: add a reference for this sender and return 200.
+    // This means two different peers can both "hold" the same chunk, and
+    // neither can evict the other's content via DELETE.
+    if let Some(entry) = inner.blobs.get_mut(&req.chunk_hash) {
+        match &req.sender_id {
+            Some(sid) => {
+                entry.uploaders.insert(sid.clone());
+            }
+            None => {
+                entry.anon_refs += 1;
+            }
+        }
         return (
-            StatusCode::CONFLICT,
+            StatusCode::OK,
             Json(serde_json::json!({"status": "exists", "chunk_hash": req.chunk_hash})),
         )
             .into_response();
     }
 
-    // Enforce per-sender daily upload quota.
+    // New chunk: enforce per-sender daily upload quota before storing.
     if let Some(ref sender_id) = req.sender_id {
         let today = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1662,11 +1773,32 @@ async fn upload_blob(
         entry.1 += data.len() as u64;
     }
 
+    let now = Instant::now();
+    let uploaded_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = now + state.config.blob_ttl;
+
+    let mut uploaders = HashSet::new();
+    let mut anon_refs = 0u64;
+    match &req.sender_id {
+        Some(sid) => {
+            uploaders.insert(sid.clone());
+        }
+        None => {
+            anon_refs = 1;
+        }
+    }
+
     inner.blobs.insert(
         req.chunk_hash.clone(),
         BlobEntry {
             data,
-            uploader_id: req.sender_id,
+            uploaders,
+            anon_refs,
+            uploaded_epoch,
+            expires_at,
         },
     );
 
@@ -1680,7 +1812,8 @@ async fn upload_blob(
 /// Download a single encrypted chunk by its SHA-256 hex hash.
 ///
 /// No authentication required — content is opaque ciphertext, and the hash
-/// is self-authenticating.  Returns `200 OK` with raw bytes or `404 Not Found`.
+/// is self-authenticating.  Returns `200 OK` with raw bytes, `404 Not Found`
+/// if absent, or `404` if the chunk has expired.
 async fn download_blob(
     State(state): State<RelayState>,
     Path(chunk_hash): Path<String>,
@@ -1691,8 +1824,10 @@ async fn download_blob(
             Ok(inner) => inner,
             Err(status) => return (status, "relay busy").into_response(),
         };
+        let now = Instant::now();
         match inner.blobs.get(&chunk_hash) {
-            Some(entry) => entry.data.clone(),
+            Some(entry) if entry.expires_at > now => entry.data.clone(),
+            Some(_) => return (StatusCode::NOT_FOUND, "chunk expired").into_response(),
             None => return (StatusCode::NOT_FOUND, "chunk not found").into_response(),
         }
     };
@@ -1705,20 +1840,56 @@ async fn download_blob(
         .into_response()
 }
 
-/// Delete a stored chunk by its SHA-256 hex hash.
+/// Release one reference to a stored chunk.
 ///
-/// Returns `204 No Content` on success or `404 Not Found` if absent.
+/// Pass `?sender_id=<id>` to release a named uploader's reference.  Omit the
+/// parameter to release one anonymous reference.  The chunk is physically
+/// deleted only when **all** references (named and anonymous) are gone.
+///
+/// Returns `204 No Content` when the reference was released, or `404` if the
+/// chunk does not exist or the caller holds no reference to it.
 async fn delete_blob(
     State(state): State<RelayState>,
     Path(chunk_hash): Path<String>,
+    Query(params): Query<DeleteBlobParams>,
 ) -> impl IntoResponse {
     let mut inner = match lock_with_retry(&state).await {
         Ok(inner) => inner,
         Err(status) => return (status, "relay busy").into_response(),
     };
-    if inner.blobs.remove(&chunk_hash).is_some() {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "chunk not found").into_response()
+
+    let entry = match inner.blobs.get_mut(&chunk_hash) {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "chunk not found").into_response(),
+    };
+
+    // Release the caller's reference.
+    let had_ref = match &params.sender_id {
+        Some(sid) => entry.uploaders.remove(sid),
+        None => {
+            if entry.anon_refs > 0 {
+                entry.anon_refs -= 1;
+                true
+            } else {
+                false
+            }
+        }
+    };
+
+    if !had_ref {
+        return (StatusCode::NOT_FOUND, "no reference held by this sender").into_response();
     }
+
+    // Physically remove the chunk only when all references are gone.
+    if entry.uploaders.is_empty() && entry.anon_refs == 0 {
+        inner.blobs.remove(&chunk_hash);
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Query parameters for `DELETE /blobs/:hash`.
+#[derive(Deserialize)]
+struct DeleteBlobParams {
+    sender_id: Option<String>,
 }

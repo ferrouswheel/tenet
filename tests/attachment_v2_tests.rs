@@ -39,6 +39,7 @@ fn make_config(blob_max_chunk_bytes: usize, blob_daily_quota_bytes: u64) -> Rela
         qos: RelayQosConfig::default(),
         blob_max_chunk_bytes,
         blob_daily_quota_bytes,
+        blob_ttl: Duration::from_secs(30 * 24 * 3600),
     }
 }
 
@@ -113,8 +114,11 @@ fn get_blob(base_url: &str, chunk_hash: &str) -> (u16, Vec<u8>) {
     }
 }
 
-fn delete_blob(base_url: &str, chunk_hash: &str) -> u16 {
-    let url = format!("{base_url}/blobs/{chunk_hash}");
+fn delete_blob(base_url: &str, chunk_hash: &str, sender_id: Option<&str>) -> u16 {
+    let mut url = format!("{base_url}/blobs/{chunk_hash}");
+    if let Some(sid) = sender_id {
+        url = format!("{url}?sender_id={sid}");
+    }
     match ureq::delete(&url).call() {
         Ok(r) => r.status(),
         Err(ureq::Error::Status(code, _)) => code,
@@ -159,23 +163,83 @@ async fn blob_upload_and_download_roundtrip() {
 }
 
 #[tokio::test]
-async fn blob_upload_conflict_returns_409() {
+async fn blob_duplicate_upload_adds_reference() {
+    // When the same chunk is uploaded by two different peers, both become
+    // reference holders: the second upload returns 200 (not 201), and the
+    // chunk stays alive until both peers delete their reference.
     let (base_url, shutdown_tx) = start_relay(make_config(512 * 1024, 500 * 1024 * 1024)).await;
 
-    let (hash, b64, _) = make_chunk(b"duplicate chunk");
+    let (hash, b64, _) = make_chunk(b"shared chunk");
 
-    let upload = {
+    // First upload: peer-a creates the chunk.
+    let s1 = tokio::task::spawn_blocking({
         let base_url = base_url.clone();
         let hash = hash.clone();
         let b64 = b64.clone();
-        move || post_blob(&base_url, &hash, &b64, None)
-    };
+        move || post_blob(&base_url, &hash, &b64, Some("peer-a"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(s1, 201, "first upload should return 201 Created");
 
-    let s1 = tokio::task::spawn_blocking(upload.clone()).await.unwrap();
-    assert_eq!(s1, 201, "first upload should succeed");
+    // Second upload: peer-b adds a reference (returns 200, not 201).
+    let s2 = tokio::task::spawn_blocking({
+        let base_url = base_url.clone();
+        let hash = hash.clone();
+        let b64 = b64.clone();
+        move || post_blob(&base_url, &hash, &b64, Some("peer-b"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        s2, 200,
+        "second upload should return 200 (ref added, not newly created)"
+    );
 
-    let s2 = tokio::task::spawn_blocking(upload).await.unwrap();
-    assert_eq!(s2, 409, "second upload should return 409 Conflict");
+    // peer-a deletes their reference — chunk still lives (peer-b holds one).
+    let d1 = tokio::task::spawn_blocking({
+        let base_url = base_url.clone();
+        let hash = hash.clone();
+        move || delete_blob(&base_url, &hash, Some("peer-a"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(d1, 204, "peer-a delete should succeed");
+
+    // Chunk should still be downloadable.
+    let (get_status, _) = tokio::task::spawn_blocking({
+        let base_url = base_url.clone();
+        let hash = hash.clone();
+        move || get_blob(&base_url, &hash)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        get_status, 200,
+        "chunk should survive after only one reference is released"
+    );
+
+    // peer-b deletes their reference — now the chunk is gone.
+    let d2 = tokio::task::spawn_blocking({
+        let base_url = base_url.clone();
+        let hash = hash.clone();
+        move || delete_blob(&base_url, &hash, Some("peer-b"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(d2, 204, "peer-b delete should succeed");
+
+    let (final_status, _) = tokio::task::spawn_blocking({
+        let base_url = base_url.clone();
+        let hash = hash.clone();
+        move || get_blob(&base_url, &hash)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        final_status, 404,
+        "chunk should be gone after all references are released"
+    );
 
     shutdown_tx.send(()).ok();
 }
@@ -281,12 +345,13 @@ async fn blob_daily_quota_exceeded_returns_429() {
 }
 
 #[tokio::test]
-async fn blob_delete_removes_chunk() {
+async fn blob_delete_anonymous_removes_chunk() {
+    // Anonymous uploads have anon_refs=1; deleting without sender_id releases it.
     let (base_url, shutdown_tx) = start_relay(make_config(512 * 1024, 500 * 1024 * 1024)).await;
 
     let (hash, b64, _) = make_chunk(b"delete me");
 
-    // Upload
+    // Anonymous upload (no sender_id)
     tokio::task::spawn_blocking({
         let base_url = base_url.clone();
         let hash = hash.clone();
@@ -296,11 +361,11 @@ async fn blob_delete_removes_chunk() {
     .await
     .unwrap();
 
-    // Delete
+    // Anonymous delete (no sender_id)
     let del_status = tokio::task::spawn_blocking({
         let base_url = base_url.clone();
         let hash = hash.clone();
-        move || delete_blob(&base_url, &hash)
+        move || delete_blob(&base_url, &hash, None)
     })
     .await
     .unwrap();
@@ -326,7 +391,7 @@ async fn blob_delete_not_found_returns_404() {
     let missing = "b".repeat(64);
     let status = tokio::task::spawn_blocking({
         let base_url = base_url.clone();
-        move || delete_blob(&base_url, &missing)
+        move || delete_blob(&base_url, &missing, None)
     })
     .await
     .unwrap();

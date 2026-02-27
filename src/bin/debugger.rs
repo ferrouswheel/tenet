@@ -182,6 +182,7 @@ fn start_in_process_relay(rt: &tokio::runtime::Runtime) -> Result<SocketAddr, Bo
             qos: tenet::relay::RelayQosConfig::default(),
             blob_max_chunk_bytes: 512 * 1024,
             blob_daily_quota_bytes: 500 * 1024 * 1024,
+            blob_ttl: Duration::from_secs(30 * 24 * 3600),
         };
         let state = RelayState::new(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
