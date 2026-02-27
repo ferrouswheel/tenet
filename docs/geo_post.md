@@ -3,11 +3,23 @@
 ## Status
 
 - [ ] Plan written
-- [ ] `src/protocol.rs` — `GeoLocation`, `GeoPrecision`, new `MetaMessage` variants
+- [ ] `Cargo.toml` — add `geohash`, `country-boundaries`, `reverse_geocoder`, `iso3166-1` dependencies
+- [ ] `src/geo.rs` — new module: `GeoLocation`, `GeoPrecision`, country seed table, `resolve_geo()`
+- [ ] `src/protocol.rs` — `GeoMessageRequest` + `GeoMeshAvailable` MetaMessage variants
 - [ ] `src/storage.rs` — schema migration + geo queries
-- [ ] `src/message_handler.rs` — geo mesh protocol arms
-- [ ] `src/web_client/handlers/messages.rs` — `geo` field in POST + `geo_within` filter
-- [ ] `src/web_client/config.rs` — identity geo defaults + constants
+- [ ] `src/message_handler.rs` — geo mesh protocol arms; geo extraction on ingest
+- [ ] `src/identity.rs` — `[geo]` config section
+- [ ] `src/web_client/handlers/messages.rs` — `geo` field in POST, `geo_within` in GET
+- [ ] `src/web_client/handlers/settings.rs` — `GET/POST /api/settings/geo`
+- [ ] `src/web_client/config.rs` — geo constants
+- [ ] `src/web_client/sync.rs` — send `GeoMessageRequest` after sync
+- [ ] `src/bin/tenet-crypto.rs` — `geo set` / `geo show` subcommands
+- [ ] `src/simulation/config.rs` — `geo` field in peer/cohort config
+- [ ] `src/client.rs` (SimulationClient) — handle `GeoMessageRequest`/`GeoMeshAvailable`
+- [ ] `src/bin/debugger.rs` — `geo-query` and `set-geo` REPL commands
+- [ ] `android/tenet-ffi/src/types.rs` — `FfiGeoLocation`
+- [ ] `android/tenet-ffi/src/lib.rs` — `resolve_geo()`, `FfiMessage.geo`
+- [ ] `android/tenet-ffi/src/tenet_ffi.udl` — UniFFI interface update
 - [ ] Tests passing
 
 ---
@@ -33,6 +45,98 @@ to coarse granularity, and can be overridden per post.
 
 ---
 
+## Dependency Analysis
+
+Three new Rust crates are needed. All are offline — no external HTTP calls at
+runtime.
+
+### `geohash` (encode/decode)
+
+```toml
+geohash = "0.13"
+```
+
+Encodes `(lat, lon)` to a base-32 geohash string and decodes back to a
+bounding box. No dependencies. Used throughout `src/geo.rs` for all
+coordinate-to-geohash conversions.
+
+```rust
+use geohash::{encode, decode, Coord};
+let hash = encode(Coord { x: -122.419, y: 37.774 }, 5)?; // "9q8yy"
+let (coord, _, _) = decode("9q8yy")?;
+```
+
+### `country-boundaries` (offline lat/lon → country code)
+
+```toml
+country-boundaries = "0.7"
+```
+
+Given a `(lat, lon)`, returns the ISO 3166-1 alpha-2 country code and ISO
+3166-2 subdivision code. Data is derived from OpenStreetMap and embedded in the
+binary (~2 MB). Licensed ODbL — attribution required in any distribution that
+includes the dataset. Used in `src/geo.rs:resolve_geo()` to populate
+`geo_country` when a geohash-precision post is submitted.
+
+```rust
+use country_boundaries::{CountryBoundaries, LatLon};
+let boundaries = CountryBoundaries::from_reader(BOUNDARIES_DATA)?;
+let ids = boundaries.ids(LatLon::new(37.774, -122.419)?);
+// ids → ["US-CA", "US"]
+```
+
+The subdivision code (`"US-CA"`) maps to the region/state. Country code is
+the two-letter part before the hyphen.
+
+### `reverse_geocoder` (offline lat/lon → city + country)
+
+```toml
+reverse_geocoder = "3"
+```
+
+Finds the nearest populated place to a `(lat, lon)` using an embedded GeoNames
+dataset (~1 MB). Returns city name, country code, and admin region. Used in
+`src/geo.rs:resolve_geo()` to populate `geo_city` and `geo_region` for
+geohash-precision posts. Licensed MIT.
+
+```rust
+use reverse_geocoder::{ReverseGeocoder, Locations};
+let locations = Locations::from_memory();
+let geocoder = ReverseGeocoder::new(&locations);
+let result = geocoder.search((37.774, -122.419));
+// result.record: city="San Francisco", admin1="California", cc="US"
+```
+
+### `iso3166-1` (country code validation + seeded list)
+
+```toml
+iso3166-1 = "0.1"
+```
+
+Provides a complete static list of ISO 3166-1 alpha-2 country codes with full
+country names. Used for (1) validating `country_code` in incoming `GeoLocation`
+payloads, and (2) powering the country picker in all clients.
+
+```rust
+use iso3166_1::all;
+let countries = all(); // Vec<Country> — sorted, complete list
+let valid = iso3166_1::alpha2("US").is_some();
+```
+
+### Binary size impact
+
+| Crate | Embedded data | Approx size added |
+|-------|--------------|-------------------|
+| `geohash` | none | < 50 KB |
+| `country-boundaries` | OSM boundaries | ~2 MB |
+| `reverse_geocoder` | GeoNames cities | ~1 MB |
+| `iso3166-1` | country list | < 20 KB |
+
+The ~3 MB increase is acceptable for the relay and web-client binaries. For the
+Android FFI crate, both datasets are compiled in; the APK increase is similar.
+
+---
+
 ## Privacy Model
 
 Location precision is controlled at two levels:
@@ -46,59 +150,131 @@ A per-post setting always wins over the identity default.
 
 ### Precision Levels
 
-| Precision | Example representation | Typical radius | Geohash length |
-|-----------|------------------------|----------------|----------------|
+| Precision | Stored fields | Typical radius | Geohash length |
+|-----------|---------------|----------------|----------------|
 | `none` | — | — | — |
-| `country` | `"US"` | ~continent | n/a (country code) |
-| `region` | `"US/California"` | ~500 km | n/a (text) |
-| `city` | `"US/California/San Francisco"` | ~20 km | 4 chars |
-| `neighborhood` | geohash `"9q8y"` prefix | ~5 km | 5 chars |
-| `exact` | lat/lon + geohash | ~5 m | 9 chars |
+| `country` | `country_code` | ~continent | — |
+| `region` | `country_code`, `region` | ~500 km | — |
+| `city` | `country_code`, `region`, `city` | ~20 km | — |
+| `neighborhood` | all text + `geohash` (5 chars) | ~5 km | 5 |
+| `exact` | all text + `geohash` (9 chars) + `lat`/`lon` | ~5 m | 9 |
 
 `none` emits no location fields. Any post with `precision = none` is treated as
 global and excluded from geographic mesh responses.
 
-**Recommended default:** `city`. It allows local content discovery without
-exposing neighbourhood or street-level information.
+**Recommended default:** `city`. It enables local discovery without exposing
+neighbourhood or street-level information.
 
-**`exact` is discouraged** for social posts. It should only be used for
-content where precise location is the point (e.g., lost/found item). The UI
-SHOULD warn users when selecting `exact`.
+**`exact` is discouraged** for routine social posts and SHOULD trigger a UI
+warning. It should only be used when precise location is the content itself
+(e.g., a lost-and-found notice, a meet-up pin).
+
+### Hierarchical containment
+
+This is the core rule that makes cross-precision discovery work: **every
+geo-tagged post stores the complete place hierarchy regardless of precision.**
+
+When a post is submitted with neighborhood or exact precision, the server
+reverse-geocodes the coordinates to fill in `geo_country`, `geo_region`, and
+`geo_city` automatically. A peer querying for country `"US"` will therefore
+find posts at *any* precision level that fall within the US — country, region,
+city, neighborhood, and exact — because all of them carry `geo_country = "US"`.
+
+```
+Post precision   → stored fields
+─────────────────────────────────────────────────────────────
+country          → geo_country
+region           → geo_country, geo_region
+city             → geo_country, geo_region, geo_city
+neighborhood     → geo_country, geo_region, geo_city, geo_geohash
+exact            → geo_country, geo_region, geo_city, geo_geohash, geo_lat, geo_lon
+```
+
+Query matching (in `GeoMessageRequest`):
+
+| Query filter | SQL condition | Matches |
+|---|---|---|
+| `country_code = "US"` | `geo_country = 'US'` | all 5 precisions |
+| `country_code + region` | `geo_country = 'US' AND geo_region = 'California'` | region, city, neighborhood, exact |
+| `country_code + region + city` | `geo_country = 'US' AND geo_region = 'California' AND geo_city = 'San Francisco'` | city, neighborhood, exact |
+| `geohash_prefix = "9q8y"` | `geo_geohash LIKE '9q8y%'` | neighborhood, exact only |
+
+Geohash prefix queries and text-based queries are separate dimensions.
+A city-precision post has no geohash and will not be returned for a geohash
+query; a neighborhood-precision post has all text fields and *will* be returned
+for a city-level text query.
 
 ---
 
-## Data Model
+## `src/geo.rs` — New Module
 
-### `GeoLocation` struct (embedded in message payload)
+All geo logic lives in a new top-level module `src/geo.rs`, exported via
+`lib.rs`. This avoids scattering coordinate-handling code across modules.
+
+```rust
+pub mod geo {
+    pub struct GeoLocation { ... }
+    pub enum GeoPrecision { ... }
+
+    /// Resolve a lat/lon to a fully-populated GeoLocation at the given precision.
+    /// Uses embedded country-boundaries and reverse_geocoder datasets.
+    /// Returns an error if the coordinates are out of range or no match found.
+    pub fn resolve_geo(lat: f64, lon: f64, precision: GeoPrecision)
+        -> Result<GeoLocation, GeoError>;
+
+    /// Encode lat/lon to a geohash string at the given character length.
+    pub fn encode_geohash(lat: f64, lon: f64, len: usize)
+        -> Result<String, GeoError>;
+
+    /// Decode a geohash string to a bounding-box centre (lat, lon).
+    pub fn decode_geohash(hash: &str) -> Result<(f64, f64), GeoError>;
+
+    /// Validate that a country_code is a known ISO 3166-1 alpha-2 code.
+    pub fn is_valid_country_code(code: &str) -> bool;
+
+    /// Return the full seeded list of (alpha2, name) pairs, sorted by name.
+    pub fn country_list() -> &'static [(& 'static str, &'static str)];
+}
+```
+
+`resolve_geo()` does the heavy lifting:
+
+1. Validate lat ∈ [−90, 90], lon ∈ [−180, 180).
+2. Call `country-boundaries` to get country + subdivision codes.
+3. Call `reverse_geocoder` to get city and admin-region name.
+4. Call `geohash::encode` at the appropriate length for the requested precision.
+5. Assemble and return `GeoLocation` with all fields populated.
+
+### `GeoLocation` struct
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeoLocation {
-    /// Precision level — determines which fields are populated.
     pub precision: GeoPrecision,
 
-    /// ISO 3166-1 alpha-2 country code. Present for country, region, city.
+    /// ISO 3166-1 alpha-2 country code. Present for all precisions except none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
 
-    /// Region/state name (human-readable). Present for region, city.
+    /// Region/state name (human-readable). Present for region, city,
+    /// neighborhood, exact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
-    /// City name (human-readable). Present for city.
+    /// City name (human-readable). Present for city, neighborhood, exact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city: Option<String>,
 
-    /// Base-32 geohash string. Present for neighborhood, exact.
-    /// Length encodes precision: 5 ≈ 5 km, 9 ≈ 5 m.
+    /// Base-32 geohash string. Present for neighborhood (5 chars) and
+    /// exact (9 chars).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geohash: Option<String>,
 
-    /// Latitude in decimal degrees. Present only for exact.
+    /// Latitude in decimal degrees. Present only for exact precision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lat: Option<f64>,
 
-    /// Longitude in decimal degrees. Present only for exact.
+    /// Longitude in decimal degrees. Present only for exact precision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lon: Option<f64>,
 }
@@ -116,13 +292,13 @@ pub enum GeoPrecision {
 ```
 
 `GeoLocation` is embedded as an optional `"geo"` key inside the existing
-public-message JSON payload. No changes to `Envelope` or `Header` are
-required; the location data rides inside the payload that is already signed.
+public-message JSON payload. No changes to `Envelope` or `Header` are required;
+the location rides inside the signed payload.
 
 ```jsonc
-// Example: public post payload with city-level geo
+// City precision
 {
-  "body": "Farmers market is amazing today!",
+  "body": "Farmers market is packed today!",
   "geo": {
     "precision": "city",
     "country_code": "US",
@@ -130,14 +306,15 @@ required; the location data rides inside the payload that is already signed.
     "city": "San Francisco"
   }
 }
-```
 
-```jsonc
-// Example: neighborhood precision
+// Neighborhood precision (server filled country/region/city via resolve_geo)
 {
-  "body": "Rain starting now on the east side.",
+  "body": "Rain starting on the east side.",
   "geo": {
     "precision": "neighborhood",
+    "country_code": "US",
+    "region": "California",
+    "city": "San Francisco",
     "geohash": "9q8yy"
   }
 }
@@ -145,14 +322,15 @@ required; the location data rides inside the payload that is already signed.
 
 ### Validation rules
 
-- `country_code` MUST be a 2-character ISO 3166-1 alpha-2 string if present.
+- `country_code` MUST be a 2-character ISO 3166-1 alpha-2 code (validated
+  against the embedded country list).
 - `geohash` characters MUST be in the base-32 alphabet `[0-9b-hj-np-z]`.
-- For `neighborhood` precision, `geohash` MUST be ≥ 5 characters.
-- For `exact` precision, `geohash` MUST be ≥ 9 characters, and `lat`/`lon`
-  MUST be present and in range (lat ∈ [−90, 90], lon ∈ [−180, 180)).
+- For `neighborhood` precision, `geohash` MUST be exactly 5 characters.
+- For `exact` precision, `geohash` MUST be exactly 9 characters, and `lat`/`lon`
+  MUST be present and in range.
 - If `precision` is `none`, all other fields MUST be absent.
-- Receiver implementations MUST silently drop posts with invalid geo payloads
-  rather than failing the entire message.
+- Receivers MUST silently skip posts with invalid geo payloads rather than
+  failing the entire message.
 
 ---
 
@@ -164,19 +342,26 @@ A new `[geo]` section is added to each identity's `config.toml`:
 
 ```toml
 [geo]
-# Default geographic precision for public posts.
+# Default precision for public posts.
 # Options: none, country, region, city, neighborhood, exact
-# Default: "city" if omitted.
+# Default when section is absent: "city"
 default_precision = "city"
+
+# Home location — used to auto-fill geo when posting.
+# Leave empty for none/country precision.
+country_code = "US"
+region = "California"
+city = "San Francisco"
+# geohash and lat/lon derived server-side via resolve_geo() when needed
 ```
 
-The identity loader reads this section and falls back to `city` if absent.
-Writing the identity config does not require a restart — the web client reads
-the configured precision at send time.
+`src/identity.rs` gains a `GeoConfig` struct (parallel to how other config
+sections are handled) and falls back to sensible defaults if the section is
+absent.
 
 ### Per-post override
 
-The REST API `POST /api/messages/public` accepts an optional `geo` object:
+`POST /api/messages/public` accepts an optional `geo` object:
 
 ```jsonc
 {
@@ -190,45 +375,19 @@ The REST API `POST /api/messages/public` accepts an optional `geo` object:
 }
 ```
 
-If `geo` is absent, the server uses the identity's `default_precision`. If
-`default_precision` is `none` and no per-post `geo` is supplied, no geo
-metadata is attached.
+- If `geo` is **absent** → use identity `default_precision` + stored location.
+- If `geo` is **`null`** → attach no location for this post (explicit one-post opt-out).
+- If `geo` is **present** → validate and use as provided.
 
-If `"geo": null` is explicitly sent, no geo is attached regardless of the
-identity default (explicit opt-out for a single post).
-
-### Settings API
-
-```
-GET  /api/settings/geo
-POST /api/settings/geo
-```
-
-**GET response:**
-
-```json
-{
-  "default_precision": "city"
-}
-```
-
-**POST body:**
-
-```json
-{
-  "default_precision": "neighborhood"
-}
-```
-
-Updates `config.toml` on disk and returns the new settings.
+For neighborhood/exact precision, the client may provide either the full
+hierarchy or just `lat`/`lon`; the server calls `resolve_geo()` to fill any
+missing text fields and compute the geohash.
 
 ---
 
 ## Storage Schema
 
 ### Migration: `messages` table
-
-Add geo columns to the `messages` table (new migration version):
 
 ```sql
 ALTER TABLE messages ADD COLUMN geo_precision  TEXT;
@@ -240,31 +399,35 @@ ALTER TABLE messages ADD COLUMN geo_lat        REAL;
 ALTER TABLE messages ADD COLUMN geo_lon        REAL;
 ```
 
-All columns are nullable. Existing rows retain `NULL` in all geo columns
-(treated as `precision = none`).
+All columns nullable. Existing rows retain `NULL` (treated as `none`).
 
-An index on `geo_geohash` supports efficient prefix-scan queries:
+Indexes:
 
 ```sql
+-- Prefix-scan for geohash queries
 CREATE INDEX IF NOT EXISTS idx_messages_geo_geohash
     ON messages (geo_geohash)
     WHERE geo_geohash IS NOT NULL;
+
+-- Equality filter for text-based queries
+CREATE INDEX IF NOT EXISTS idx_messages_geo_country
+    ON messages (geo_country, geo_region, geo_city)
+    WHERE geo_country IS NOT NULL;
 ```
 
-### New queries in `storage.rs`
+### New storage queries
 
 ```rust
-/// List public message IDs since `since` whose geohash starts with
-/// `geohash_prefix`. Used for geographic mesh responses.
-pub fn list_public_message_ids_since_in_region(
+/// IDs of public messages since `since` whose geohash starts with `prefix`.
+pub fn list_public_message_ids_since_in_geohash_region(
     &self,
     since: u64,
     geohash_prefix: &str,
     limit: u32,
 ) -> Result<Vec<String>, StorageError>;
 
-/// List public message IDs since `since` for a country/region/city.
-/// Used when the requester specified text-based precision (no geohash).
+/// IDs of public messages since `since` matching the text-based region.
+/// Each provided field is ANDed; None means "any".
 pub fn list_public_message_ids_since_in_named_region(
     &self,
     since: u64,
@@ -275,8 +438,8 @@ pub fn list_public_message_ids_since_in_named_region(
 ) -> Result<Vec<String>, StorageError>;
 ```
 
-The existing `list_public_message_ids_since` (no geo filter) is unchanged and
-is used for global mesh requests.
+The existing `list_public_message_ids_since` is unchanged and used for global
+(non-geo) mesh requests.
 
 ---
 
@@ -284,31 +447,24 @@ is used for global mesh requests.
 
 ### New `MetaMessage` variants
 
-Two new variants extend the mesh catch-up protocol for geographic scoping:
-
 ```rust
-/// Geographic variant of MessageRequest.
 /// A asks B for public messages within a geographic region since a timestamp.
+/// Use either geohash_prefix OR the country/region/city text fields, not both.
 GeoMessageRequest {
     peer_id: String,
     since_timestamp: u64,
-    /// Geohash prefix for neighborhood/exact precision.
     #[serde(skip_serializing_if = "Option::is_none")]
     geohash_prefix: Option<String>,
-    /// ISO 3166-1 alpha-2. Used when precision is country/region/city.
     #[serde(skip_serializing_if = "Option::is_none")]
     country_code: Option<String>,
-    /// Region name. Used when precision is region/city.
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<String>,
-    /// City name. Used when precision is city.
     #[serde(skip_serializing_if = "Option::is_none")]
     city: Option<String>,
 },
 
-/// Response to GeoMessageRequest: IDs of available public messages in the
-/// requested region. The responder uses the same region filter as the
-/// request, echoes the filter back so the requester can validate.
+/// Response to GeoMessageRequest: matching public message IDs.
+/// Echoes the filter fields from the request.
 GeoMeshAvailable {
     peer_id: String,
     message_ids: Vec<String>,
@@ -324,109 +480,84 @@ GeoMeshAvailable {
 },
 ```
 
-After `GeoMeshAvailable`, the existing `MeshRequest` / `MeshDelivery` phases
-(phases 3 and 4) are reused unchanged. This keeps the new variants minimal.
+After `GeoMeshAvailable`, the existing `MeshRequest` / `MeshDelivery` phases 3
+and 4 are reused unchanged.
 
-### Extended four-phase flow
+### Extended flow
 
 ```
 A                                  B
 |                                  |
 |-- GeoMessageRequest (region) -->|   Phase 1-geo: Geographic query
-|<-- GeoMeshAvailable (ids) ------|   Phase 2-geo: Announce matching IDs
+|<-- GeoMeshAvailable (ids) ------|   Phase 2-geo: Matching IDs
 |                                  |
 | (dedup against local DB)         |
 |                                  |
-|-- MeshRequest (ids) ----------->|   Phase 3: Request unknowns (unchanged)
-|<-- MeshDelivery (envs) ---------|   Phase 4: Deliver batches (unchanged)
+|-- MeshRequest (ids) ----------->|   Phase 3: unchanged
+|<-- MeshDelivery (envs) ---------|   Phase 4: unchanged
 ```
 
-`GeoMessageRequest` and `GeoMeshAvailable` are parallel to the existing
-`MessageRequest` / `MeshAvailable` pair. A peer may issue both kinds of request
-to the same peer in the same sync cycle:
+A peer MAY send a global `MessageRequest` and a `GeoMessageRequest` to the same
+peer in the same sync cycle. Deduplication of IDs is applied across both before
+sending `MeshRequest`.
 
-- A global `MessageRequest` to catch up on all public messages.
-- One or more `GeoMessageRequest` targeting specific regions of interest.
+### Mesh query region derivation
 
-A peer that issued a `GeoMessageRequest` MUST NOT request the same IDs again
-in a concurrent global `MeshRequest` (deduplication applies across both).
+The region sent in `GeoMessageRequest` comes from the identity's `[geo]` config:
 
-### Responder behaviour
-
-When a peer receives `GeoMessageRequest`:
-
-1. Apply the same timestamp cap as for `MessageRequest`:
-   `since = max(since_timestamp, now - MAX_MESH_WINDOW_SECS)`.
-2. Query `list_public_message_ids_since_in_region` (geohash prefix) or
-   `list_public_message_ids_since_in_named_region` (country/region/city text).
-3. Respond with `GeoMeshAvailable` containing up to `MAX_MESH_IDS` IDs,
-   echoing back the same region filter fields.
-4. A peer with no messages matching the region responds with an empty
-   `message_ids` list rather than not responding.
-
-### Mesh query scoping
-
-A peer's `send_mesh_queries` function (called after each sync) sends:
-
-- One global `MessageRequest` per peer (existing, unchanged).
-- One `GeoMessageRequest` per peer for each region of interest configured
-  for this identity (see configuration above), if `default_precision != none`.
-
-The region sent in `GeoMessageRequest` is derived from the identity's
-`default_precision`:
-
-| `default_precision` | Fields sent |
-|---------------------|-------------|
+| `default_precision` | Fields sent in `GeoMessageRequest` |
+|---------------------|-------------------------------------|
+| `none` | — (no geo query sent) |
 | `country` | `country_code` |
 | `region` | `country_code`, `region` |
 | `city` | `country_code`, `region`, `city` |
-| `neighborhood` | `geohash_prefix` (5 chars) |
-| `exact` | `geohash_prefix` (5 chars, truncated for privacy) |
+| `neighborhood` | `geohash_prefix` (5 chars from stored geohash) |
+| `exact` | `geohash_prefix` (5 chars, truncated for query privacy) |
 
-When subscribing by geo, a peer only requests content that is *at least* as
-precise as the region filter. A message stored with `precision = country` will
-not appear in a `GeoMessageRequest` with `geohash_prefix` filter and vice
-versa.
+### Responder behaviour
+
+1. Cap `since_timestamp`: `since = max(since_timestamp, now - MAX_MESH_WINDOW_SECS)`.
+2. If `geohash_prefix` is set → call `list_public_message_ids_since_in_geohash_region`.
+3. Otherwise → call `list_public_message_ids_since_in_named_region`.
+4. Respond with `GeoMeshAvailable` (up to `MAX_MESH_IDS` IDs), echoing filter fields.
+5. Respond with empty `message_ids` if no match (do not skip the response).
 
 ---
 
-## `message_handler.rs` Changes
+## `src/message_handler.rs` Changes
 
 ### New `on_meta` arms
 
 ```rust
-MetaMessage::GeoMessageRequest { peer_id, since_timestamp, geohash_prefix,
-                                 country_code, region, city } => {
-    // 1. Cap since_timestamp to MAX_MESH_WINDOW_SECS.
-    // 2. Query matching message IDs (geohash OR named region branch).
-    // 3. Wrap in GeoMeshAvailable and return as MetaMessage envelope to sender.
+MetaMessage::GeoMessageRequest { peer_id, since_timestamp,
+                                 geohash_prefix, country_code, region, city } => {
+    // 1. Cap since_timestamp.
+    // 2. Query geohash or named-region storage function based on which is set.
+    // 3. Return GeoMeshAvailable envelope addressed to peer_id.
 }
 
-MetaMessage::GeoMeshAvailable { peer_id, message_ids, since_timestamp,
-                                geohash_prefix, country_code, region, city } => {
-    // 1. Dedup message_ids against local DB (has_message).
-    // 2. Send MeshRequest for unknowns (reuses existing path).
+MetaMessage::GeoMeshAvailable { peer_id, message_ids, .. } => {
+    // 1. Dedup message_ids against local DB.
+    // 2. If unknowns exist: send MeshRequest (reuses existing path).
 }
 ```
 
-`MeshRequest` and `MeshDelivery` handling requires no changes.
+### Geo extraction on ingest
 
-### `insert_message` update
-
-Extract `geo` from the payload JSON (if present) during `on_message` for
-`MessageKind::Public` and populate the new `geo_*` columns.
+In `on_message` for `MessageKind::Public`, extract `geo` from the payload JSON
+and write to the `geo_*` columns when inserting:
 
 ```rust
-if let Some(geo) = payload_json.get("geo") {
-    let loc: GeoLocation = serde_json::from_value(geo.clone())?;
-    // populate geo_precision, geo_country, geo_region, geo_city,
-    // geo_geohash, geo_lat, geo_lon
-}
+let geo: Option<GeoLocation> = payload_json
+    .get("geo")
+    .and_then(|v| serde_json::from_value(v.clone()).ok());
+// Validate and write geo_precision, geo_country, geo_region, geo_city,
+// geo_geohash, geo_lat, geo_lon into the insert statement.
 ```
 
 ---
 
-## Web Client Changes
+## Web Client Changes (`src/web_client/`)
 
 ### `POST /api/messages/public`
 
@@ -435,81 +566,360 @@ Extended request body:
 ```jsonc
 {
   "body": "Hello world",
-  "attachments": [...],     // unchanged
-  "geo": {                  // optional; null = explicit no-location
+  "attachments": [...],
+  // Optional. Absent = use identity default. null = no location.
+  "geo": {
     "precision": "city",
     "country_code": "US",
     "region": "California",
     "city": "San Francisco"
+    // OR for finer precision: provide lat/lon and server resolves rest
+    // "precision": "neighborhood",
+    // "lat": 37.7749,
+    // "lon": -122.4194
   }
 }
 ```
 
-Handler logic:
+Handler logic in `handlers/messages.rs`:
 
-1. If `geo` field is missing → use identity `default_precision` to build a
-   `GeoLocation` (populated from the identity's stored location fields, see below).
-2. If `geo` is `null` → omit geo from payload entirely.
-3. If `geo` is present → validate and use as-is.
-4. Attach `GeoLocation` as the `"geo"` key in the plaintext payload JSON.
+1. Parse optional `geo` field.
+2. If absent → load identity `GeoConfig`; build `GeoLocation` from stored fields.
+3. If `null` → no geo.
+4. If present and precision is neighborhood/exact and geohash is absent →
+   call `geo::resolve_geo(lat, lon, precision)` to fill all fields.
+5. Validate the final `GeoLocation` (country code, geohash length, etc.).
+6. Embed as `"geo"` key in plaintext payload JSON before building the envelope.
 
 ### `GET /api/messages`
 
-Add optional `geo_within` query parameter:
+New optional query parameter:
 
 ```
-GET /api/messages?kind=public&geo_within=9q8y
+GET /api/messages?kind=public&geo_within=9q8y     # geohash prefix
+GET /api/messages?kind=public&geo_country=US      # country filter
+GET /api/messages?kind=public&geo_country=US&geo_region=California&geo_city=San+Francisco
 ```
 
-`geo_within` is a geohash prefix. Messages are included if their `geo_geohash`
-starts with the prefix. Country/region/city text filtering is not exposed
-directly; callers use the geohash equivalent computed client-side.
+When any `geo_*` query param is present, call the appropriate storage query.
+Multiple text params are ANDed. `geo_within` (geohash) and text params are
+mutually exclusive; return 400 if both are provided.
 
-### Identity location store
+### `GET /api/geo/countries`
 
-To support auto-filling geo for posts, each identity stores its current
-location in `config.toml`:
-
-```toml
-[geo]
-default_precision = "city"
-country_code = "US"
-region = "California"
-city = "San Francisco"
-# geohash is computed automatically when needed
-```
-
-These fields are populated via `POST /api/settings/geo`:
+New endpoint that returns the seeded country list for client-side pickers:
 
 ```json
+[
+  { "alpha2": "AU", "name": "Australia" },
+  { "alpha2": "DE", "name": "Germany" },
+  { "alpha2": "US", "name": "United States of America" }
+]
+```
+
+Sourced from `geo::country_list()` (static, no DB query needed).
+
+### `POST /api/geo/resolve`
+
+Accepts coordinates and returns a fully-resolved `GeoLocation`. Lets clients
+(web UI, Android) delegate reverse-geocoding to the server:
+
+```jsonc
+// Request
+{ "lat": 37.7749, "lon": -122.4194, "precision": "neighborhood" }
+
+// Response
 {
-  "default_precision": "city",
+  "precision": "neighborhood",
   "country_code": "US",
   "region": "California",
-  "city": "San Francisco"
+  "city": "San Francisco",
+  "geohash": "9q8yy"
 }
 ```
 
-The server does not resolve addresses from coordinates. The client (web UI or
-mobile app) is responsible for geocoding (reverse-lookup lat/lon → place name)
-before calling the API.
+### `GET/POST /api/settings/geo`
+
+New handler in `handlers/settings.rs`:
+
+```
+GET /api/settings/geo
+→ { "default_precision": "city", "country_code": "US",
+    "region": "California", "city": "San Francisco" }
+
+POST /api/settings/geo
+← { "default_precision": "city", "country_code": "US",
+    "region": "California", "city": "San Francisco",
+    "lat": 37.7749, "lon": -122.4194 }   // lat/lon optional; triggers resolve_geo
+→ updated settings object
+```
+
+Writes the `[geo]` section of `config.toml` and returns the new state.
+If `lat`/`lon` are provided, calls `resolve_geo()` at the requested precision
+and stores the result; raw lat/lon are not persisted.
+
+### `src/web_client/sync.rs`
+
+After each successful sync, `send_mesh_queries` sends:
+
+- Existing global `MessageRequest` per peer (unchanged).
+- One `GeoMessageRequest` per peer if `default_precision != none`, using the
+  region derived from the identity's `[geo]` config.
 
 ---
 
-## Constants
+## CLI Changes (`src/bin/tenet-crypto.rs`)
 
-Add to `src/web_client/config.rs`:
+Two new subcommands under a `geo` group:
+
+### `tenet geo show`
+
+Prints the current identity's geo settings:
+
+```
+Default precision : city
+Country           : US
+Region            : California
+City              : San Francisco
+```
+
+### `tenet geo set`
+
+Configure the identity's geo defaults. Accepts either text fields or
+coordinates (which are resolved server-side):
+
+```bash
+# Text-based (city precision)
+tenet geo set --precision city --country US --region California --city "San Francisco"
+
+# Coordinate-based (neighborhood; server resolves name)
+tenet geo set --precision neighborhood --lat 37.7749 --lon -122.4194
+
+# Disable geo by default
+tenet geo set --precision none
+```
+
+### Per-post flag
+
+Existing `tenet post` command gains a `--geo` flag (overrides default):
+
+```bash
+tenet post "Hello from Portland" --geo city --country US --region Oregon --city Portland
+tenet post "Private message, no location" --no-geo
+```
+
+---
+
+## Android FFI Changes
+
+### `android/tenet-ffi/src/types.rs`
+
+New FFI-safe geo type:
 
 ```rust
-/// Maximum geohash prefix length accepted in GeoMessageRequest.
-pub const MAX_GEO_GEOHASH_PREFIX_LEN: usize = 9;
+#[derive(Debug, Clone)]
+pub struct FfiGeoLocation {
+    pub precision: String,        // "none"|"country"|"region"|"city"|"neighborhood"|"exact"
+    pub country_code: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub geohash: Option<String>,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+}
+```
 
-/// Geohash prefix length used when subscribing at "neighborhood" precision.
-pub const NEIGHBORHOOD_GEOHASH_PREFIX_LEN: usize = 5;
+`FfiMessage` gains:
 
-/// Geohash prefix length used when subscribing for "exact" precision
-/// (truncated to neighborhood granularity for query privacy).
-pub const EXACT_QUERY_GEOHASH_PREFIX_LEN: usize = 5;
+```rust
+pub struct FfiMessage {
+    // ... existing fields ...
+    pub geo: Option<FfiGeoLocation>,
+}
+```
+
+### `android/tenet-ffi/src/lib.rs`
+
+New methods on `TenetClient`:
+
+```rust
+/// Resolve lat/lon to a GeoLocation at the given precision.
+/// Performs offline reverse geocoding. Safe to call on IO thread.
+fn resolve_geo(
+    &self,
+    lat: f64,
+    lon: f64,
+    precision: String,
+) -> Result<FfiGeoLocation, TenetError>;
+
+/// Get current geo settings for this identity.
+fn get_geo_settings(&self) -> Result<FfiGeoSettings, TenetError>;
+
+/// Update geo settings. lat/lon optional; if provided, resolve_geo is called.
+fn set_geo_settings(
+    &self,
+    settings: FfiGeoSettings,
+) -> Result<FfiGeoSettings, TenetError>;
+
+/// Return the seeded country list: vec of (alpha2, name) pairs.
+fn list_countries(&self) -> Vec<FfiCountry>;
+```
+
+`send_public_message()` gains an optional `geo: Option<FfiGeoLocation>` param.
+
+### `android/tenet-ffi/src/tenet_ffi.udl`
+
+```
+dictionary FfiGeoLocation {
+    string precision;
+    string? country_code;
+    string? region;
+    string? city;
+    string? geohash;
+    double? lat;
+    double? lon;
+};
+
+dictionary FfiGeoSettings {
+    string default_precision;
+    string? country_code;
+    string? region;
+    string? city;
+};
+
+dictionary FfiCountry {
+    string alpha2;
+    string name;
+};
+```
+
+Add `FfiGeoLocation? geo` to the existing `FfiMessage` dictionary.
+
+### Android UI (`app/src/main/java/com/example/tenet/`)
+
+- **`ui/compose/`**: Add a location button to the compose screen. Tapping it
+  calls the Android Fused Location Provider to get lat/lon, then calls
+  `resolve_geo()` via the FFI. Shows a chip displaying the resolved place name
+  with a precision selector. A second tap opens a precision picker or removes
+  the location.
+- **`ui/settings/`**: New `GeoSettingsScreen` with country/region/city pickers
+  (backed by `list_countries()`) and a precision selector.
+- **`ui/timeline/`**: Geo filter chip on the timeline header. Selecting a
+  region calls `list_messages` with geo filter params.
+
+---
+
+## Simulation Changes
+
+### `src/simulation/config.rs`
+
+Add an optional `geo` field to cohort and node configuration:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimGeoConfig {
+    /// Geohash of the peer's simulated location (5 chars = neighborhood).
+    pub geohash: String,
+    /// ISO 3166-1 alpha-2 country code for the simulated location.
+    pub country_code: String,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    /// Precision used when posting.
+    #[serde(default = "default_precision")]
+    pub post_precision: String, // "city" | "neighborhood" | etc.
+    /// Precision used when sending GeoMessageRequest.
+    #[serde(default = "default_precision")]
+    pub query_precision: String,
+}
+```
+
+`OnlineCohortDefinition` variants gain `geo: Option<SimGeoConfig>`.
+Individual node overrides can be added in an `overrides` map.
+
+Example scenario snippet:
+
+```toml
+[[cohorts]]
+name = "sf_locals"
+node_ids = ["alice", "bob", "carol"]
+
+[cohorts.geo]
+geohash = "9q8yy"
+country_code = "US"
+region = "California"
+city = "San Francisco"
+post_precision = "neighborhood"
+query_precision = "city"
+
+[[cohorts]]
+name = "london_peers"
+node_ids = ["dave", "eve"]
+
+[cohorts.geo]
+geohash = "gcpvu"
+country_code = "GB"
+region = "England"
+city = "London"
+post_precision = "city"
+query_precision = "country"
+```
+
+### `src/client.rs` (SimulationClient)
+
+`SimulationClient` already implements a gossip path for `MessageRequest` /
+`MeshAvailable` / `MeshRequest` / `MeshDelivery` using its
+`public_message_cache`. Extend with:
+
+- `geo_config: Option<SimGeoConfig>` field on `SimulationClient`.
+- In `handle_message_request`-style logic, add a branch for `GeoMessageRequest`
+  that filters the `public_message_cache` by the stored `geo_*` fields of each
+  cached message.
+- `GeoMeshAvailable` handling: mirrors `MeshAvailable` but filters to
+  the geo-matching subset.
+- When building a public message, attach `GeoLocation` from `geo_config` at the
+  configured `post_precision`.
+
+This enables simulation scenarios that test whether geo-filtered mesh
+distribution correctly confines local messages to local peers.
+
+---
+
+## Debugger Changes (`src/bin/debugger.rs`)
+
+Two new REPL commands, following the pattern of `mesh-query <peer-a> <peer-b>`:
+
+### `geo-query <peer-a> <peer-b> <region>`
+
+Drives the geo-scoped four-phase mesh exchange interactively and prints each
+step:
+
+```
+> geo-query alice bob city:US/California/San Francisco
+
+Phase 1: alice → bob  GeoMessageRequest { since=1709000000, country="US", region="California", city="San Francisco" }
+Phase 2: bob → alice  GeoMeshAvailable  { 12 IDs }
+  Dedup: alice has 9, requesting 3
+Phase 3: alice → bob  MeshRequest       { 3 IDs }
+Phase 4: bob → alice  MeshDelivery      { 3 envelopes }
+  Stored 3 new messages for alice.
+```
+
+`<region>` accepts:
+- `country:<code>` — e.g., `country:US`
+- `region:<code>/<region>` — e.g., `region:US/California`
+- `city:<code>/<region>/<city>` — e.g., `city:US/California/San Francisco`
+- `geohash:<prefix>` — e.g., `geohash:9q8y`
+
+### `set-geo <peer> <precision> [<lat> <lon>]`
+
+Sets a simulated peer's location in the debugger session:
+
+```
+> set-geo alice neighborhood 37.7749 -122.4194
+alice geo set: neighborhood / US / California / San Francisco / 9q8yy
+
+> set-geo bob city US California London
+Error: "London" is not a city in California. Use lat/lon or check spelling.
 ```
 
 ---
@@ -518,29 +928,40 @@ pub const EXACT_QUERY_GEOHASH_PREFIX_LEN: usize = 5;
 
 | File | Change |
 |------|--------|
-| `src/protocol.rs` | `GeoLocation` struct, `GeoPrecision` enum, `GeoMessageRequest` + `GeoMeshAvailable` MetaMessage variants |
-| `src/storage.rs` | 7 new geo columns + index; `list_public_message_ids_since_in_region`; `list_public_message_ids_since_in_named_region`; geo extraction in `insert_message` |
-| `src/message_handler.rs` | `GeoMessageRequest` + `GeoMeshAvailable` arms in `on_meta`; geo extraction in `on_message` for public kind |
-| `src/web_client/handlers/messages.rs` | Accept `geo` in POST; `geo_within` query param in GET |
-| `src/web_client/handlers/settings.rs` | New `GET/POST /api/settings/geo` handlers |
-| `src/web_client/config.rs` | 3 new geo constants |
-| `src/web_client/sync.rs` | Send `GeoMessageRequest` per peer when `default_precision != none` |
-| `config.toml` (per-identity) | `[geo]` section with `default_precision` + location fields |
+| `Cargo.toml` | Add `geohash`, `country-boundaries`, `reverse_geocoder`, `iso3166-1` |
+| `src/geo.rs` | New module: `GeoLocation`, `GeoPrecision`, `resolve_geo()`, `encode_geohash()`, `is_valid_country_code()`, `country_list()` |
+| `src/lib.rs` | Export `pub mod geo` |
+| `src/protocol.rs` | `GeoMessageRequest` + `GeoMeshAvailable` MetaMessage variants |
+| `src/storage.rs` | 7 new geo columns + 2 indexes; `list_public_message_ids_since_in_geohash_region`; `list_public_message_ids_since_in_named_region`; geo fields in `insert_message` |
+| `src/message_handler.rs` | `GeoMessageRequest` + `GeoMeshAvailable` arms; geo extraction on ingest |
+| `src/identity.rs` | `GeoConfig` struct; read/write `[geo]` section of `config.toml` |
+| `src/web_client/handlers/messages.rs` | `geo` field in POST; `geo_within`/`geo_country`/`geo_region`/`geo_city` params in GET |
+| `src/web_client/handlers/settings.rs` | `GET/POST /api/settings/geo` |
+| `src/web_client/router.rs` | Register `/api/settings/geo`, `/api/geo/countries`, `/api/geo/resolve` routes |
+| `src/web_client/config.rs` | Geo constants (`MAX_GEO_GEOHASH_PREFIX_LEN`, etc.) |
+| `src/web_client/sync.rs` | Send `GeoMessageRequest` after sync when `default_precision != none` |
+| `src/bin/tenet-crypto.rs` | `geo show` + `geo set` subcommands; `--geo`/`--no-geo` flag on `post` |
+| `src/simulation/config.rs` | `SimGeoConfig`; `geo` field on cohort config |
+| `src/client.rs` | `SimulationClient` geo field; `GeoMessageRequest`/`GeoMeshAvailable` handling; geo attachment in public post builder |
+| `src/bin/debugger.rs` | `geo-query` + `set-geo` REPL commands |
+| `android/tenet-ffi/src/types.rs` | `FfiGeoLocation`, `FfiGeoSettings`, `FfiCountry`; `FfiMessage.geo` |
+| `android/tenet-ffi/src/lib.rs` | `resolve_geo()`, `get_geo_settings()`, `set_geo_settings()`, `list_countries()`; geo param on `send_public_message()` |
+| `android/tenet-ffi/src/tenet_ffi.udl` | UDL entries for all new types + methods |
 
 ---
 
 ## Out of Scope (for now)
 
-- **Geocoding / reverse geocoding**: The server does not call external services
-  to convert coordinates to place names. This is a client responsibility.
-- **Region subscription management**: Only a single home region is supported
-  per identity. Multiple subscriptions (e.g., home city + work city) are future
-  work.
-- **Relay-side geo filtering**: The relay is untrusted and geo filtering happens
-  client-side. Relay-side indexing is out of scope.
-- **Simulation harness**: Geo-tagged messages and geographic mesh queries are
-  not wired into the simulation scenarios.
-- **Android FFI**: `GeoLocation` type will need to be exposed via UniFFI in
-  `android/tenet-ffi/src/types.rs`. Tracked as separate work.
-- **UI map view**: A geographic map view of nearby posts in the web client is a
-  UX feature, not a protocol feature. Tracked separately.
+- **Forward geocoding** (address/place-name → coordinates): remains a client
+  responsibility. The `POST /api/geo/resolve` endpoint only does reverse
+  geocoding (coordinates → place name).
+- **Multiple region subscriptions**: only a single home region per identity.
+  Subscribing to multiple regions (home + work, travel mode) is future work.
+- **Relay-side geo filtering**: the relay is untrusted and does no geo
+  indexing. All filtering happens on the receiving client.
+- **UI map view**: a geographic map of nearby posts in the web SPA is a UX
+  feature tracked separately.
+- **ODbL attribution UI**: the `country-boundaries` dataset requires ODbL
+  attribution in any distributed binary. The "About" screen of each client
+  must include the attribution text. Implementation tracked separately from the
+  protocol work.
