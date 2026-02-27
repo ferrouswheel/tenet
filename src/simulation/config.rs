@@ -439,6 +439,9 @@ impl RelayConfigToml {
             log_sink: None,
             pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             qos: crate::relay::RelayQosConfig::default(),
+            blob_max_chunk_bytes: 512 * 1024,
+            blob_daily_quota_bytes: 500 * 1024 * 1024,
+            blob_ttl: Duration::from_secs(30 * 24 * 3600),
         }
     }
 }

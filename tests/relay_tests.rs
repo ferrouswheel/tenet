@@ -109,6 +109,9 @@ async fn relay_expires_messages_after_ttl() {
         log_sink: None,
         pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         qos: tenet::relay::RelayQosConfig::default(),
+        blob_max_chunk_bytes: 512 * 1024,
+        blob_daily_quota_bytes: 500 * 1024 * 1024,
+        blob_ttl: Duration::from_secs(30 * 24 * 3600),
     })
     .await;
 
@@ -171,6 +174,9 @@ async fn relay_deduplicates_by_message_id() {
         log_sink: None,
         pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         qos: tenet::relay::RelayQosConfig::default(),
+        blob_max_chunk_bytes: 512 * 1024,
+        blob_daily_quota_bytes: 500 * 1024 * 1024,
+        blob_ttl: Duration::from_secs(30 * 24 * 3600),
     })
     .await;
 
@@ -234,6 +240,9 @@ async fn node_can_send_and_receive_through_relay() {
         log_sink: None,
         pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         qos: tenet::relay::RelayQosConfig::default(),
+        blob_max_chunk_bytes: 512 * 1024,
+        blob_daily_quota_bytes: 500 * 1024 * 1024,
+        blob_ttl: Duration::from_secs(30 * 24 * 3600),
     })
     .await;
 
@@ -326,6 +335,9 @@ fn test_relay_config() -> RelayConfig {
         log_sink: None,
         pause_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         qos: tenet::relay::RelayQosConfig::default(),
+        blob_max_chunk_bytes: 512 * 1024,
+        blob_daily_quota_bytes: 500 * 1024 * 1024,
+        blob_ttl: Duration::from_secs(30 * 24 * 3600),
     }
 }
 

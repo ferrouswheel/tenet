@@ -17,8 +17,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .card .label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin-bottom:4px}
 .card .value{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;color:#111}
 .card .value.hi{color:#2563eb}
+.card .value.warn{color:#d97706}
 .box{background:#fff;border:1px solid #e5e5e5;border-radius:6px;margin-bottom:20px;overflow:hidden}
-.box-title{padding:10px 16px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#666;background:#fafafa;border-bottom:1px solid #e5e5e5}
+.box-title{padding:10px 16px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#666;background:#fafafa;border-bottom:1px solid #e5e5e5;display:flex;align-items:center;justify-content:space-between}
+.box-title .count{font-weight:400;color:#999}
 table{width:100%;border-collapse:collapse}
 th{padding:8px 16px;text-align:left;font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:#999;background:#fafafa;border-bottom:1px solid #f0f0f0;white-space:nowrap}
 td{padding:9px 16px;font-size:13px;border-top:1px solid #f5f5f5;vertical-align:middle}
@@ -27,6 +29,7 @@ tr:hover td{background:#fafafa}
 .muted{color:#999}
 .bar-wrap{width:60px;height:4px;background:#eee;border-radius:2px;display:inline-block;vertical-align:middle;margin-left:8px}
 .bar-fill{height:100%;background:#2563eb;border-radius:2px}
+.bar-fill.warn{background:#d97706}
 .lat-row{padding:14px 16px;display:flex;gap:28px;align-items:center}
 .lat-item label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#999;margin-bottom:2px}
 .lat-item .n{font-size:20px;font-weight:600}
@@ -40,9 +43,13 @@ tr:hover td{background:#fafafa}
 .link-icon{font-size:13px;color:#2563eb;text-decoration:none;margin-left:6px}
 .link-icon:hover{text-decoration:underline}
 .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;background:#f0f4ff;color:#2563eb;font-weight:500}
+.badge.warn{background:#fef3c7;color:#92400e}
+.badge.ok{background:#dcfce7;color:#166534}
 .empty{padding:24px;text-align:center;color:#bbb;font-size:13px}
 .footer{text-align:center;color:#bbb;font-size:12px;margin-top:16px;margin-bottom:32px}
 .sender-row{font-size:12px;line-height:1.6}
+.uploader-list{display:flex;flex-wrap:wrap;gap:4px}
+.expiry-soon{color:#d97706;font-weight:500}
 @media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr)}.lat-row{flex-wrap:wrap}}
 </style>
 </head>
@@ -55,8 +62,14 @@ tr:hover td{background:#fafafa}
   <div class="cards">
     <div class="card"><div class="label">Inboxes</div><div class="value" id="c-inboxes">&#x2014;</div></div>
     <div class="card"><div class="label">Queued</div><div class="value hi" id="c-queued">&#x2014;</div></div>
+    <div class="card"><div class="label">Blobs</div><div class="value" id="c-blobs">&#x2014;</div></div>
+    <div class="card"><div class="label">Blob Storage</div><div class="value" id="c-blob-bytes">&#x2014;</div></div>
+  </div>
+  <div class="cards">
     <div class="card"><div class="label">WebSockets</div><div class="value" id="c-ws">&#x2014;</div></div>
     <div class="card"><div class="label">Total Stored</div><div class="value" id="c-stored">&#x2014;</div></div>
+    <div class="card"><div class="label">Total Delivered</div><div class="value" id="c-delivered">&#x2014;</div></div>
+    <div class="card"><div class="label">Uptime</div><div class="value" id="c-uptime">&#x2014;</div></div>
   </div>
   <div class="box">
     <div class="box-title">Connected Clients</div>
@@ -65,6 +78,14 @@ tr:hover td{background:#fafafa}
   <div class="box">
     <div class="box-title">Inboxes</div>
     <div id="inboxes-body"></div>
+  </div>
+  <div class="box">
+    <div class="box-title"><span>Blob Store</span><span class="count" id="blob-store-count"></span></div>
+    <div id="blobs-body"></div>
+  </div>
+  <div class="box">
+    <div class="box-title">Blob Upload Quota (today)</div>
+    <div id="blob-quota-body"></div>
   </div>
   <div class="box">
     <div class="box-title">Delivery Latency</div>
@@ -76,9 +97,12 @@ tr:hover td{background:#fafafa}
 function fmtBytes(b){return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(2)+'MB'}
 function fmtDur(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+pad(s%60)+'s';return Math.floor(s/3600)+'h '+pad(Math.floor((s%3600)/60))+'m'}
 function fmtMs(ms){if(ms<1000)return ms+'ms';const s=Math.floor(ms/1000);if(s<60)return(ms/1000).toFixed(1)+'s';if(s<3600)return Math.floor(s/60)+'m '+pad(s%60)+'s';return Math.floor(s/3600)+'h '+pad(Math.floor((s%3600)/60))+'m'}
+function fmtEpoch(ts){return new Date(ts*1000).toLocaleString()}
 function pad(n){return String(n).padStart(2,'0')}
 function fmtPeer(id){return id.length>20?id.slice(0,8)+'\u2026'+id.slice(-8):id}
+function fmtHash(h){return h.slice(0,8)+'\u2026'+h.slice(-8)}
 function set(id,v){const el=document.getElementById(id);if(el)el.textContent=v}
+function setHtml(id,v){const el=document.getElementById(id);if(el)el.innerHTML=v}
 function rateCell(m,h,d){
   return '<div class="del">'+
     '<span><b>'+m+'</b>/min</span>'+
@@ -86,14 +110,27 @@ function rateCell(m,h,d){
     '<span><b>'+d+'</b>/day</span>'+
   '</div>'
 }
+function quotaBar(used,total){
+  const pct=total>0?Math.min(100,Math.round(used/total*100)):0;
+  const cls=pct>=90?'warn':'';
+  return fmtBytes(used)+' / '+fmtBytes(total)+
+    ' <span class="bar-wrap"><div class="bar-fill '+cls+'" style="width:'+pct+'%"></div></span>'+
+    ' <span class="muted">('+pct+'%)</span>'
+}
 async function refresh(){
   let d;
   try{d=await fetch('/debug/stats').then(r=>r.json())}catch(e){set('footer','fetch failed \u2013 retrying');return}
-  set('uptime','up '+fmtDur(d.uptime_secs||0));
+
+  const uptime=fmtDur(d.uptime_secs||0);
+  set('uptime','up '+uptime);
+  set('c-uptime',uptime);
   set('c-inboxes',d.total_inboxes||0);
   set('c-queued',d.total_queued||0);
+  set('c-blobs',d.total_blobs||0);
+  set('c-blob-bytes',fmtBytes(d.total_blob_bytes||0));
   set('c-ws',d.ws_connections||0);
   set('c-stored',d.total_stored||0);
+  set('c-delivered',d.total_delivered||0);
 
   // Connected clients
   const clients=d.ws_clients||[];
@@ -136,6 +173,62 @@ async function refresh(){
         '<td class="muted">'+fmtDur(i.last_seen_secs)+' ago</td>'+
         '<td>'+rateCell(i.delivered_1m||0,i.delivered_1h||0,i.delivered_24h||0)+'</td>'+
         '<td>'+senderCell+'</td>'+
+        '</tr>';
+    }).join('')+'</tbody></table>'
+  }
+
+  // Blob store
+  const blobs=d.blobs||[];
+  const bb=document.getElementById('blobs-body');
+  const bcount=document.getElementById('blob-store-count');
+  if(bcount)bcount.textContent=blobs.length?blobs.length+' chunk'+(blobs.length===1?'':'s'):'';
+  if(!blobs.length){bb.innerHTML='<div class="empty">No blobs stored</div>'}
+  else{
+    const now=Math.floor(Date.now()/1000);
+    bb.innerHTML='<table><thead><tr>'+
+      '<th>Chunk Hash</th><th>Size</th><th>Refs</th><th>Uploaders</th><th>Uploaded</th><th>Expires</th>'+
+      '</tr></thead><tbody>'+
+    blobs.map(b=>{
+      const uploaders=b.uploaders||[];
+      const totalRefs=uploaders.length+(b.anon_refs||0);
+      const uploaderHtml=uploaders.length===0&&!b.anon_refs
+        ?'<span class="muted">\u2014</span>'
+        :'<div class="uploader-list">'+
+          uploaders.slice(0,3).map(u=>'<span class="badge mono">'+fmtPeer(u)+'</span>').join('')+
+          (uploaders.length>3?'<span class="muted">+'+(uploaders.length-3)+'</span>':'')+
+          (b.anon_refs?'<span class="badge">'+b.anon_refs+' anon</span>':'')+
+        '</div>';
+      const expiresIn=b.expires_in_secs||0;
+      const expirySoon=expiresIn<86400; // less than 1 day
+      const expiryHtml=expiresIn===0
+        ?'<span class="muted">expired</span>'
+        :'<span class="'+(expirySoon?'expiry-soon muted':'muted')+'">'+fmtDur(expiresIn)+' ('+fmtEpoch(b.expires_epoch)+')</span>';
+      return '<tr>'+
+        '<td class="mono">'+fmtHash(b.chunk_hash)+'</td>'+
+        '<td>'+fmtBytes(b.size_bytes)+'</td>'+
+        '<td><span class="badge '+(totalRefs>1?'ok':'')+'">'+totalRefs+'</span></td>'+
+        '<td>'+uploaderHtml+'</td>'+
+        '<td class="muted">'+fmtEpoch(b.uploaded_epoch)+'</td>'+
+        '<td>'+expiryHtml+'</td>'+
+        '</tr>';
+    }).join('')+'</tbody></table>'
+  }
+
+  // Blob upload quota
+  const quotas=d.blob_quotas||[];
+  const qb=document.getElementById('blob-quota-body');
+  if(!quotas.length){qb.innerHTML='<div class="empty">No blob uploads today</div>'}
+  else{
+    qb.innerHTML='<table><thead><tr>'+
+      '<th>Sender</th><th>Used Today</th><th>Quota</th>'+
+      '</tr></thead><tbody>'+
+    quotas.map(q=>{
+      const pct=q.quota_bytes>0?Math.min(100,Math.round(q.bytes_today/q.quota_bytes*100)):0;
+      const cls=pct>=90?'warn':'';
+      return '<tr>'+
+        '<td class="mono">'+fmtPeer(q.sender_id)+'</td>'+
+        '<td>'+quotaBar(q.bytes_today,q.quota_bytes)+'</td>'+
+        '<td class="muted">'+fmtBytes(q.quota_bytes)+'/day'+(pct>=90?' <span class="badge warn">'+pct+'%</span>':'')+'</td>'+
         '</tr>';
     }).join('')+'</tbody></table>'
   }

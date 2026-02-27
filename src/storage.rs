@@ -212,6 +212,27 @@ pub struct MessageAttachmentRow {
     pub position: u32,
 }
 
+/// Metadata for a relay-blob attachment (Attachment v2, Option D Phase 1).
+///
+/// Stores the symmetric blob key and ordered chunk hashes for a file that was
+/// split and uploaded to the relay blob endpoint.  The `content_hash` matches
+/// the `AttachmentRef.content_id` stored in the message payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobManifestRow {
+    /// SHA-256 of the complete plaintext file, base64 URL-safe no-pad.
+    pub content_hash: String,
+    /// Base64 URL-safe no-pad encoded 32-byte symmetric blob key.
+    pub blob_key: String,
+    /// Base URL of the relay blob endpoint (e.g. `https://relay.example.com`).
+    pub relay_url: String,
+    /// JSON-encoded ordered list of SHA-256 hex hashes of **encrypted** chunks.
+    pub chunk_hashes: Vec<String>,
+    /// Total plaintext size in bytes.
+    pub total_size: u64,
+    /// Unix timestamp (seconds) when the manifest was created.
+    pub created_at: u64,
+}
+
 /// Conversation summary for the conversations list view (Phase 5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
@@ -500,6 +521,16 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_notifications_unread
                 ON notifications(read, created_at);
+
+            -- Blob manifests (Attachment v2, Option D Phase 1)
+            CREATE TABLE IF NOT EXISTS blob_manifests (
+                content_hash    TEXT PRIMARY KEY,
+                blob_key        TEXT NOT NULL,
+                relay_url       TEXT NOT NULL,
+                chunk_hashes    TEXT NOT NULL,
+                total_size      INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL
+            );
             ",
         )?;
 
@@ -1770,6 +1801,67 @@ impl Storage {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Blob manifests (Attachment v2, Option D Phase 1)
+    // -----------------------------------------------------------------------
+
+    /// Store a blob manifest.  Silently ignores duplicate `content_hash` entries.
+    pub fn insert_blob_manifest(&self, row: &BlobManifestRow) -> Result<(), StorageError> {
+        let chunk_hashes_json =
+            serde_json::to_string(&row.chunk_hashes).map_err(StorageError::Serde)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blob_manifests
+             (content_hash, blob_key, relay_url, chunk_hashes, total_size, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.content_hash,
+                row.blob_key,
+                row.relay_url,
+                chunk_hashes_json,
+                row.total_size as i64,
+                row.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a blob manifest by content hash.  Returns `None` if not found.
+    pub fn get_blob_manifest(
+        &self,
+        content_hash: &str,
+    ) -> Result<Option<BlobManifestRow>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, blob_key, relay_url, chunk_hashes, total_size, created_at
+             FROM blob_manifests WHERE content_hash = ?1",
+        )?;
+        stmt.query_row(params![content_hash], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? as u64,
+                row.get::<_, i64>(5)? as u64,
+            ))
+        })
+        .optional()?
+        .map(
+            |(content_hash, blob_key, relay_url, chunk_hashes_json, total_size, created_at)| {
+                let chunk_hashes: Vec<String> =
+                    serde_json::from_str(&chunk_hashes_json).unwrap_or_default();
+                Ok(BlobManifestRow {
+                    content_hash,
+                    blob_key,
+                    relay_url,
+                    chunk_hashes,
+                    total_size,
+                    created_at,
+                })
+            },
+        )
+        .transpose()
     }
 
     // -----------------------------------------------------------------------

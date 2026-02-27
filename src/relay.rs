@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::DefaultBodyLimit;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -16,6 +17,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -78,6 +81,17 @@ pub struct RelayConfig {
     pub pause_flag: Arc<AtomicBool>,
     /// QoS configuration. Use `RelayQosConfig::default()` for standard limits.
     pub qos: RelayQosConfig,
+    /// Maximum allowed size (bytes) of a single base64-encoded encrypted chunk
+    /// in a `POST /blobs` request body.  Default: 512 KiB.
+    pub blob_max_chunk_bytes: usize,
+    /// Maximum bytes a single sender may upload via `POST /blobs` per calendar
+    /// day (UTC).  Default: 500 MiB.
+    pub blob_daily_quota_bytes: u64,
+    /// How long blob chunks are retained after their first upload.
+    /// Independent of envelope TTL so recipients that come online late can
+    /// still fetch chunks after the referencing envelope has expired.
+    /// Default: 30 days.
+    pub blob_ttl: Duration,
 }
 
 const WS_BROADCAST_CAPACITY: usize = 128;
@@ -114,6 +128,28 @@ struct RelayStateInner {
     directed_last_seen: HashMap<(String, String), Instant>,
     // QoS: set of (min, max) peer-id pairs where bidirectionality has been observed.
     bidirectional_pairs: HashSet<(String, String)>,
+    // Blob store (Option D Phase 1): content-addressed encrypted chunks.
+    // Key: SHA-256 hex of the encrypted chunk.
+    blobs: HashMap<String, BlobEntry>,
+    // Per-sender daily upload quota tracking.
+    // Key: sender_id.  Value: (UTC epoch day, bytes uploaded that day).
+    blob_daily_upload: HashMap<String, (u64, u64)>,
+}
+
+/// A single encrypted chunk stored by the relay blob endpoint.
+struct BlobEntry {
+    /// Raw encrypted chunk bytes.
+    data: Vec<u8>,
+    /// Peer IDs that have uploaded this chunk.  Each uploader holds one
+    /// reference; the chunk is only physically deleted when this set empties.
+    uploaders: HashSet<String>,
+    /// Count of uploads submitted without a `sender_id`.  Anonymous uploads
+    /// each hold one reference; decremented on anonymous delete requests.
+    anon_refs: u64,
+    /// Unix timestamp (seconds) of first upload (for dashboard display).
+    uploaded_epoch: u64,
+    /// When this chunk expires (wall-clock).
+    expires_at: Instant,
 }
 
 struct WsClientInfo {
@@ -200,6 +236,11 @@ struct BatchStoreResult {
     detail: Option<String>,
 }
 
+/// Maximum HTTP body size for `POST /blobs` requests.
+/// Sized to comfortably hold a base64-encoded 256 KiB encrypted chunk
+/// plus JSON framing (≈ 350 KiB) with margin.
+const BLOB_UPLOAD_BODY_LIMIT: usize = 512 * 1024;
+
 pub fn app(state: RelayState) -> Router {
     Router::new()
         .route("/", get(index_handler))
@@ -210,6 +251,12 @@ pub fn app(state: RelayState) -> Router {
         .route("/inbox/batch", post(fetch_inbox_batch))
         .route("/ws/:recipient_id", get(ws_handler))
         .route("/debug/stats", get(debug_stats))
+        // Blob endpoints (Option D Phase 1)
+        .route(
+            "/blobs",
+            post(upload_blob).layer(DefaultBodyLimit::max(BLOB_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/blobs/:chunk_hash", get(download_blob).delete(delete_blob))
         .with_state(state)
 }
 
@@ -234,6 +281,8 @@ impl RelayState {
                 sender_inbox_usage: HashMap::new(),
                 directed_last_seen: HashMap::new(),
                 bidirectional_pairs: HashSet::new(),
+                blobs: HashMap::new(),
+                blob_daily_upload: HashMap::new(),
             })),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
@@ -321,6 +370,33 @@ struct InboxInfo {
     delivered_24h: usize,
     /// Per-sender usage currently queued in this inbox, sorted by bytes descending.
     senders: Vec<InboxSenderInfo>,
+}
+
+/// Dashboard representation of a stored blob chunk.
+#[derive(Serialize)]
+struct BlobInfo {
+    chunk_hash: String,
+    size_bytes: usize,
+    /// Named peer IDs holding a reference to this chunk.
+    uploaders: Vec<String>,
+    /// Number of anonymous (no sender_id) references.
+    anon_refs: u64,
+    /// Unix timestamp (seconds) when the chunk was first uploaded.
+    uploaded_epoch: u64,
+    /// Unix timestamp (seconds) when the chunk expires.
+    expires_epoch: u64,
+    /// Seconds remaining until expiry (0 if already expired).
+    expires_in_secs: u64,
+}
+
+/// Dashboard representation of a sender's blob upload quota.
+#[derive(Serialize)]
+struct BlobQuotaInfo {
+    sender_id: String,
+    bytes_today: u64,
+    quota_bytes: u64,
+    /// UTC epoch day (days since 1970-01-01) the counter applies to.
+    day: u64,
 }
 
 #[derive(Serialize)]
@@ -452,6 +528,54 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
     let uptime_secs = state.start_time.elapsed().as_secs();
     let ws_connections = state.ws_connections.load(Ordering::Relaxed);
 
+    // Blob store stats
+    let blob_ttl_secs = state.config.blob_ttl.as_secs();
+    let mut blobs: Vec<BlobInfo> = inner
+        .blobs
+        .iter()
+        .map(|(hash, entry)| {
+            let expires_epoch = entry.uploaded_epoch.saturating_add(blob_ttl_secs);
+            let expires_in_secs = expires_epoch.saturating_sub(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            let mut uploaders: Vec<String> = entry.uploaders.iter().cloned().collect();
+            uploaders.sort();
+            BlobInfo {
+                chunk_hash: hash.clone(),
+                size_bytes: entry.data.len(),
+                uploaders,
+                anon_refs: entry.anon_refs,
+                uploaded_epoch: entry.uploaded_epoch,
+                expires_epoch,
+                expires_in_secs,
+            }
+        })
+        .collect();
+    blobs.sort_by(|a, b| b.uploaded_epoch.cmp(&a.uploaded_epoch));
+    let total_blob_bytes: usize = inner.blobs.values().map(|e| e.data.len()).sum();
+
+    // Blob upload quota stats (show all senders with any recorded quota)
+    let today = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86400;
+    let mut blob_quotas: Vec<BlobQuotaInfo> = inner
+        .blob_daily_upload
+        .iter()
+        .filter(|(_, (day, _))| *day == today) // only show today's active senders
+        .map(|(sender_id, (day, bytes))| BlobQuotaInfo {
+            sender_id: sender_id.clone(),
+            bytes_today: *bytes,
+            quota_bytes: state.config.blob_daily_quota_bytes,
+            day: *day,
+        })
+        .collect();
+    blob_quotas.sort_by(|a, b| b.bytes_today.cmp(&a.bytes_today));
+
     let qos = &state.config.qos;
     Json(serde_json::json!({
         // Legacy fields
@@ -469,10 +593,18 @@ async fn debug_stats(State(state): State<RelayState>) -> impl IntoResponse {
         "ws_clients": ws_clients,
         "inboxes": inboxes,
         "latency_ms": latency,
+        // Blob store
+        "total_blobs": blobs.len(),
+        "total_blob_bytes": total_blob_bytes,
+        "blobs": blobs,
+        "blob_quotas": blob_quotas,
         "config": {
             "ttl_secs": state.config.ttl.as_secs(),
             "max_messages": state.config.max_messages,
             "max_bytes": state.config.max_bytes,
+            "blob_ttl_secs": blob_ttl_secs,
+            "blob_max_chunk_bytes": state.config.blob_max_chunk_bytes,
+            "blob_daily_quota_bytes": state.config.blob_daily_quota_bytes,
             "qos": {
                 "tier1": { "max_envelopes": qos.tier1.max_envelopes, "max_bytes": qos.tier1.max_bytes },
                 "tier2": { "max_envelopes": qos.tier2.max_envelopes, "max_bytes": qos.tier2.max_bytes },
@@ -1526,4 +1658,238 @@ fn count_recent_peers(inner: &RelayStateInner, now: Instant, window: Duration) -
         .values()
         .filter(|last_seen| now.duration_since(**last_seen) <= window)
         .count()
+}
+
+// ---------------------------------------------------------------------------
+// Blob endpoints (Option D Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /blobs`.
+#[derive(Deserialize)]
+struct UploadBlobRequest {
+    /// SHA-256 hex of the **encrypted** chunk used as the storage key.
+    chunk_hash: String,
+    /// Base64 URL-safe no-pad encoded encrypted chunk bytes.
+    data_b64: String,
+    /// Optional sender identity for quota tracking.
+    sender_id: Option<String>,
+}
+
+/// Upload a single encrypted chunk to the relay blob store.
+///
+/// If the chunk is new, it is stored and `201 Created` is returned.  If the
+/// same chunk was already uploaded by another peer (identified by `sender_id`),
+/// the caller is added as an additional reference holder so that a delete by
+/// the other peer does not evict the chunk prematurely.  In that case `200 OK`
+/// is returned (the chunk was not newly created).
+///
+/// Returns `400 Bad Request` on validation failure, `413 Payload Too Large` if
+/// the chunk exceeds the configured limit, or `429 Too Many Requests` if the
+/// sender has exhausted their daily quota.
+async fn upload_blob(
+    State(state): State<RelayState>,
+    Json(req): Json<UploadBlobRequest>,
+) -> impl IntoResponse {
+    // Validate chunk_hash: must be exactly 64 lowercase hex characters.
+    if req.chunk_hash.len() != 64 || !req.chunk_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid chunk_hash: expected 64 hex characters",
+        )
+            .into_response();
+    }
+
+    // Decode the base64-encoded encrypted chunk.
+    let data = match URL_SAFE_NO_PAD.decode(&req.data_b64) {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid base64 in data_b64").into_response(),
+    };
+
+    // Self-authenticate: verify declared hash matches content.
+    let actual_hash = hex::encode(Sha256::digest(&data));
+    if actual_hash != req.chunk_hash {
+        return (
+            StatusCode::BAD_REQUEST,
+            "chunk_hash does not match SHA-256 of data",
+        )
+            .into_response();
+    }
+
+    // Enforce per-chunk size limit before acquiring the lock.
+    if data.len() > state.config.blob_max_chunk_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "chunk exceeds maximum allowed size",
+        )
+            .into_response();
+    }
+
+    let mut inner = match lock_with_retry(&state).await {
+        Ok(inner) => inner,
+        Err(status) => return (status, "relay busy").into_response(),
+    };
+
+    // If chunk already exists: add a reference for this sender and return 200.
+    // This means two different peers can both "hold" the same chunk, and
+    // neither can evict the other's content via DELETE.
+    if let Some(entry) = inner.blobs.get_mut(&req.chunk_hash) {
+        match &req.sender_id {
+            Some(sid) => {
+                entry.uploaders.insert(sid.clone());
+            }
+            None => {
+                entry.anon_refs += 1;
+            }
+        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "exists", "chunk_hash": req.chunk_hash})),
+        )
+            .into_response();
+    }
+
+    // New chunk: enforce per-sender daily upload quota before storing.
+    if let Some(ref sender_id) = req.sender_id {
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 86400;
+        let entry = inner
+            .blob_daily_upload
+            .entry(sender_id.clone())
+            .or_insert((today, 0));
+        // Reset counter when the calendar day rolls over.
+        if entry.0 != today {
+            *entry = (today, 0);
+        }
+        if entry.1 + data.len() as u64 > state.config.blob_daily_quota_bytes {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "daily blob upload quota exceeded",
+            )
+                .into_response();
+        }
+        entry.1 += data.len() as u64;
+    }
+
+    let now = Instant::now();
+    let uploaded_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = now + state.config.blob_ttl;
+
+    let mut uploaders = HashSet::new();
+    let mut anon_refs = 0u64;
+    match &req.sender_id {
+        Some(sid) => {
+            uploaders.insert(sid.clone());
+        }
+        None => {
+            anon_refs = 1;
+        }
+    }
+
+    inner.blobs.insert(
+        req.chunk_hash.clone(),
+        BlobEntry {
+            data,
+            uploaders,
+            anon_refs,
+            uploaded_epoch,
+            expires_at,
+        },
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"chunk_hash": req.chunk_hash})),
+    )
+        .into_response()
+}
+
+/// Download a single encrypted chunk by its SHA-256 hex hash.
+///
+/// No authentication required — content is opaque ciphertext, and the hash
+/// is self-authenticating.  Returns `200 OK` with raw bytes, `404 Not Found`
+/// if absent, or `404` if the chunk has expired.
+async fn download_blob(
+    State(state): State<RelayState>,
+    Path(chunk_hash): Path<String>,
+) -> impl IntoResponse {
+    // Clone the data under the lock, then release before building the response.
+    let data = {
+        let inner = match lock_with_retry(&state).await {
+            Ok(inner) => inner,
+            Err(status) => return (status, "relay busy").into_response(),
+        };
+        let now = Instant::now();
+        match inner.blobs.get(&chunk_hash) {
+            Some(entry) if entry.expires_at > now => entry.data.clone(),
+            Some(_) => return (StatusCode::NOT_FOUND, "chunk expired").into_response(),
+            None => return (StatusCode::NOT_FOUND, "chunk not found").into_response(),
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        data,
+    )
+        .into_response()
+}
+
+/// Release one reference to a stored chunk.
+///
+/// Pass `?sender_id=<id>` to release a named uploader's reference.  Omit the
+/// parameter to release one anonymous reference.  The chunk is physically
+/// deleted only when **all** references (named and anonymous) are gone.
+///
+/// Returns `204 No Content` when the reference was released, or `404` if the
+/// chunk does not exist or the caller holds no reference to it.
+async fn delete_blob(
+    State(state): State<RelayState>,
+    Path(chunk_hash): Path<String>,
+    Query(params): Query<DeleteBlobParams>,
+) -> impl IntoResponse {
+    let mut inner = match lock_with_retry(&state).await {
+        Ok(inner) => inner,
+        Err(status) => return (status, "relay busy").into_response(),
+    };
+
+    let entry = match inner.blobs.get_mut(&chunk_hash) {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "chunk not found").into_response(),
+    };
+
+    // Release the caller's reference.
+    let had_ref = match &params.sender_id {
+        Some(sid) => entry.uploaders.remove(sid),
+        None => {
+            if entry.anon_refs > 0 {
+                entry.anon_refs -= 1;
+                true
+            } else {
+                false
+            }
+        }
+    };
+
+    if !had_ref {
+        return (StatusCode::NOT_FOUND, "no reference held by this sender").into_response();
+    }
+
+    // Physically remove the chunk only when all references are gone.
+    if entry.uploaders.is_empty() && entry.anon_refs == 0 {
+        inner.blobs.remove(&chunk_hash);
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Query parameters for `DELETE /blobs/:hash`.
+#[derive(Deserialize)]
+struct DeleteBlobParams {
+    sender_id: Option<String>,
 }

@@ -40,6 +40,9 @@ async fn main() {
                 7 * 24 * 3600,
             )),
         },
+        blob_max_chunk_bytes: env_usize("TENET_BLOB_MAX_CHUNK_BYTES", 512 * 1024),
+        blob_daily_quota_bytes: env_u64("TENET_BLOB_DAILY_QUOTA_BYTES", 500 * 1024 * 1024),
+        blob_ttl: Duration::from_secs(env_u64("TENET_BLOB_TTL_SECS", 30 * 24 * 3600)),
     };
 
     let state = RelayState::new(config);
