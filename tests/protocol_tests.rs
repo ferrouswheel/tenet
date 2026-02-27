@@ -17,6 +17,7 @@ fn envelope_roundtrips_via_json() {
             size: 128,
             filename: None,
             data: None,
+            transport: None,
         }],
     };
 

@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::DefaultBodyLimit;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -16,6 +17,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -78,6 +81,12 @@ pub struct RelayConfig {
     pub pause_flag: Arc<AtomicBool>,
     /// QoS configuration. Use `RelayQosConfig::default()` for standard limits.
     pub qos: RelayQosConfig,
+    /// Maximum allowed size (bytes) of a single base64-encoded encrypted chunk
+    /// in a `POST /blobs` request body.  Default: 512 KiB.
+    pub blob_max_chunk_bytes: usize,
+    /// Maximum bytes a single sender may upload via `POST /blobs` per calendar
+    /// day (UTC).  Default: 500 MiB.
+    pub blob_daily_quota_bytes: u64,
 }
 
 const WS_BROADCAST_CAPACITY: usize = 128;
@@ -114,6 +123,21 @@ struct RelayStateInner {
     directed_last_seen: HashMap<(String, String), Instant>,
     // QoS: set of (min, max) peer-id pairs where bidirectionality has been observed.
     bidirectional_pairs: HashSet<(String, String)>,
+    // Blob store (Option D Phase 1): content-addressed encrypted chunks.
+    // Key: SHA-256 hex of the encrypted chunk.
+    blobs: HashMap<String, BlobEntry>,
+    // Per-sender daily upload quota tracking.
+    // Key: sender_id.  Value: (UTC epoch day, bytes uploaded that day).
+    blob_daily_upload: HashMap<String, (u64, u64)>,
+}
+
+/// A single encrypted chunk stored by the relay blob endpoint.
+struct BlobEntry {
+    /// Raw encrypted chunk bytes.
+    data: Vec<u8>,
+    /// Uploader peer ID (reserved for future authorised DELETE enforcement).
+    #[allow(dead_code)]
+    uploader_id: Option<String>,
 }
 
 struct WsClientInfo {
@@ -200,6 +224,11 @@ struct BatchStoreResult {
     detail: Option<String>,
 }
 
+/// Maximum HTTP body size for `POST /blobs` requests.
+/// Sized to comfortably hold a base64-encoded 256 KiB encrypted chunk
+/// plus JSON framing (≈ 350 KiB) with margin.
+const BLOB_UPLOAD_BODY_LIMIT: usize = 512 * 1024;
+
 pub fn app(state: RelayState) -> Router {
     Router::new()
         .route("/", get(index_handler))
@@ -210,6 +239,12 @@ pub fn app(state: RelayState) -> Router {
         .route("/inbox/batch", post(fetch_inbox_batch))
         .route("/ws/:recipient_id", get(ws_handler))
         .route("/debug/stats", get(debug_stats))
+        // Blob endpoints (Option D Phase 1)
+        .route(
+            "/blobs",
+            post(upload_blob).layer(DefaultBodyLimit::max(BLOB_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/blobs/:chunk_hash", get(download_blob).delete(delete_blob))
         .with_state(state)
 }
 
@@ -234,6 +269,8 @@ impl RelayState {
                 sender_inbox_usage: HashMap::new(),
                 directed_last_seen: HashMap::new(),
                 bidirectional_pairs: HashSet::new(),
+                blobs: HashMap::new(),
+                blob_daily_upload: HashMap::new(),
             })),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
@@ -1526,4 +1563,162 @@ fn count_recent_peers(inner: &RelayStateInner, now: Instant, window: Duration) -
         .values()
         .filter(|last_seen| now.duration_since(**last_seen) <= window)
         .count()
+}
+
+// ---------------------------------------------------------------------------
+// Blob endpoints (Option D Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /blobs`.
+#[derive(Deserialize)]
+struct UploadBlobRequest {
+    /// SHA-256 hex of the **encrypted** chunk used as the storage key.
+    chunk_hash: String,
+    /// Base64 URL-safe no-pad encoded encrypted chunk bytes.
+    data_b64: String,
+    /// Optional sender identity for quota tracking.
+    sender_id: Option<String>,
+}
+
+/// Upload a single encrypted chunk to the relay blob store.
+///
+/// Returns `201 Created` on success, `409 Conflict` if the chunk already
+/// exists, `400 Bad Request` on validation failure, or `413 Payload Too Large`
+/// / `429 Too Many Requests` for quota violations.
+async fn upload_blob(
+    State(state): State<RelayState>,
+    Json(req): Json<UploadBlobRequest>,
+) -> impl IntoResponse {
+    // Validate chunk_hash: must be exactly 64 lowercase hex characters.
+    if req.chunk_hash.len() != 64 || !req.chunk_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid chunk_hash: expected 64 hex characters",
+        )
+            .into_response();
+    }
+
+    // Decode the base64-encoded encrypted chunk.
+    let data = match URL_SAFE_NO_PAD.decode(&req.data_b64) {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid base64 in data_b64").into_response(),
+    };
+
+    // Self-authenticate: verify declared hash matches content.
+    let actual_hash = hex::encode(Sha256::digest(&data));
+    if actual_hash != req.chunk_hash {
+        return (
+            StatusCode::BAD_REQUEST,
+            "chunk_hash does not match SHA-256 of data",
+        )
+            .into_response();
+    }
+
+    // Enforce per-chunk size limit before acquiring the lock.
+    if data.len() > state.config.blob_max_chunk_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "chunk exceeds maximum allowed size",
+        )
+            .into_response();
+    }
+
+    let mut inner = match lock_with_retry(&state).await {
+        Ok(inner) => inner,
+        Err(status) => return (status, "relay busy").into_response(),
+    };
+
+    // Deduplicate: if already stored, return 409 Conflict.
+    if inner.blobs.contains_key(&req.chunk_hash) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"status": "exists", "chunk_hash": req.chunk_hash})),
+        )
+            .into_response();
+    }
+
+    // Enforce per-sender daily upload quota.
+    if let Some(ref sender_id) = req.sender_id {
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 86400;
+        let entry = inner
+            .blob_daily_upload
+            .entry(sender_id.clone())
+            .or_insert((today, 0));
+        // Reset counter when the calendar day rolls over.
+        if entry.0 != today {
+            *entry = (today, 0);
+        }
+        if entry.1 + data.len() as u64 > state.config.blob_daily_quota_bytes {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "daily blob upload quota exceeded",
+            )
+                .into_response();
+        }
+        entry.1 += data.len() as u64;
+    }
+
+    inner.blobs.insert(
+        req.chunk_hash.clone(),
+        BlobEntry {
+            data,
+            uploader_id: req.sender_id,
+        },
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"chunk_hash": req.chunk_hash})),
+    )
+        .into_response()
+}
+
+/// Download a single encrypted chunk by its SHA-256 hex hash.
+///
+/// No authentication required — content is opaque ciphertext, and the hash
+/// is self-authenticating.  Returns `200 OK` with raw bytes or `404 Not Found`.
+async fn download_blob(
+    State(state): State<RelayState>,
+    Path(chunk_hash): Path<String>,
+) -> impl IntoResponse {
+    // Clone the data under the lock, then release before building the response.
+    let data = {
+        let inner = match lock_with_retry(&state).await {
+            Ok(inner) => inner,
+            Err(status) => return (status, "relay busy").into_response(),
+        };
+        match inner.blobs.get(&chunk_hash) {
+            Some(entry) => entry.data.clone(),
+            None => return (StatusCode::NOT_FOUND, "chunk not found").into_response(),
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        data,
+    )
+        .into_response()
+}
+
+/// Delete a stored chunk by its SHA-256 hex hash.
+///
+/// Returns `204 No Content` on success or `404 Not Found` if absent.
+async fn delete_blob(
+    State(state): State<RelayState>,
+    Path(chunk_hash): Path<String>,
+) -> impl IntoResponse {
+    let mut inner = match lock_with_retry(&state).await {
+        Ok(inner) => inner,
+        Err(status) => return (status, "relay busy").into_response(),
+    };
+    if inner.blobs.remove(&chunk_hash).is_some() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "chunk not found").into_response()
+    }
 }

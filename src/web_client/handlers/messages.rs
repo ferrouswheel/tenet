@@ -10,7 +10,7 @@ use base64::Engine as _;
 
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_group_message_payload,
-    build_plaintext_payload, AttachmentRef, ContentId, MessageKind,
+    build_plaintext_payload, AttachmentRef, AttachmentTransport, ContentId, MessageKind,
 };
 use crate::relay_transport::post_envelope;
 use crate::storage::MessageRow;
@@ -535,7 +535,14 @@ pub async fn mark_read_handler(
     }
 }
 
-/// Fetch attachment blobs from storage and build `AttachmentRef`s with inline data.
+/// Fetch attachment blobs from storage and build `AttachmentRef`s.
+///
+/// For `Inline` attachments (< 256 KiB), the plaintext data is base64-encoded
+/// and embedded in the returned `AttachmentRef`.
+///
+/// For `RelayBlob` attachments, the blob manifest is read from the database
+/// and the `transport` field is populated with chunk hashes and the blob key;
+/// no inline data is embedded.
 fn build_attachment_refs(
     storage: &crate::storage::Storage,
     attachments: &[SendAttachmentRef],
@@ -544,14 +551,34 @@ fn build_attachment_refs(
         .iter()
         .filter_map(|att| {
             let row = storage.get_attachment(&att.content_hash).ok()??;
-            let data_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&row.data);
-            Some(AttachmentRef {
-                content_id: ContentId(row.content_hash),
-                content_type: row.content_type,
-                size: row.size_bytes,
-                filename: att.filename.clone(),
-                data: Some(data_b64),
-            })
+
+            // Check whether a blob manifest exists for this attachment.
+            if let Ok(Some(manifest)) = storage.get_blob_manifest(&att.content_hash) {
+                // RelayBlob transport: embed chunk hashes + blob key; no inline data.
+                Some(AttachmentRef {
+                    content_id: ContentId(row.content_hash),
+                    content_type: row.content_type,
+                    size: row.size_bytes,
+                    filename: att.filename.clone(),
+                    data: None,
+                    transport: Some(AttachmentTransport::RelayBlob {
+                        relay_url: manifest.relay_url,
+                        chunk_hashes: manifest.chunk_hashes,
+                        blob_key: manifest.blob_key,
+                    }),
+                })
+            } else {
+                // Inline transport (v1): embed plaintext data as base64.
+                let data_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&row.data);
+                Some(AttachmentRef {
+                    content_id: ContentId(row.content_hash),
+                    content_type: row.content_type,
+                    size: row.size_bytes,
+                    filename: att.filename.clone(),
+                    data: Some(data_b64),
+                    transport: None, // None == Inline for backwards compatibility
+                })
+            }
         })
         .collect()
 }

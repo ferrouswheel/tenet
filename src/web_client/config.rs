@@ -15,7 +15,17 @@ pub(crate) const WEB_HPKE_INFO: &[u8] = b"tenet-web";
 pub(crate) const WEB_PAYLOAD_AAD: &[u8] = b"tenet-web";
 pub(crate) const WS_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const MAX_WS_CONNECTIONS: usize = 8;
-pub(crate) const MAX_ATTACHMENT_SIZE: u64 = 10 * 1024 * 1024; // 10 MB per attachment
+/// Files smaller than this threshold are inlined inside the HPKE-encrypted
+/// envelope payload (v1 / `Inline` tier).  Files at or above this size are
+/// split into chunks and uploaded to the relay blob endpoint (`RelayBlob` tier).
+pub(crate) const INLINE_THRESHOLD: u64 = 256 * 1024; // 256 KiB
+
+/// Target size (bytes) of each plaintext chunk for the `RelayBlob` tier.
+pub(crate) const CHUNK_SIZE: usize = 256 * 1024; // 256 KiB plaintext per chunk
+
+/// Maximum total attachment size accepted by `POST /api/attachments`.
+/// Raised to accommodate `RelayBlob` tier uploads.
+pub(crate) const MAX_ATTACHMENT_SIZE: u64 = 50 * 1024 * 1024; // 50 MiB
 
 /// Web server for the Tenet peer-to-peer social network.
 ///

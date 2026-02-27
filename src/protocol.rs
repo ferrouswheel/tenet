@@ -285,6 +285,45 @@ impl Header {
     }
 }
 
+/// How an attachment's binary data is transported.
+///
+/// Defaults to `Inline` for backwards compatibility.  Larger files use
+/// `RelayBlob` (Phase 1) or `PeerSeeded` (Phase 2, future).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AttachmentTransport {
+    /// v1 behaviour — data is base64-encoded inside the HPKE-encrypted payload.
+    Inline,
+    /// Chunked blob stored on a relay (Option D Phase 1).
+    ///
+    /// Each chunk is independently encrypted with ChaCha20Poly1305 using
+    /// `blob_key` and a per-chunk nonce derived as
+    /// `SHA-256(blob_key || chunk_index_le64)[:12]`.
+    /// `chunk_hashes` contains the SHA-256 (hex) of each **encrypted** chunk
+    /// in order.  Recipients verify the hash before decrypting.
+    RelayBlob {
+        /// Base URL of the relay blob endpoint (e.g. `https://relay.example.com`).
+        relay_url: String,
+        /// SHA-256 hex hashes of the **encrypted** chunks, in order.
+        chunk_hashes: Vec<String>,
+        /// Base64 URL-safe no-pad encoded 32-byte symmetric blob key.
+        blob_key: String,
+    },
+    /// Peer-seeded chunk exchange (Option D Phase 2, future).
+    PeerSeeded {
+        /// Root SHA-256 hash of the complete blob (hex).
+        blob_id: String,
+        /// SHA-256 hex hashes of the **encrypted** chunks, in order.
+        chunk_hashes: Vec<String>,
+        /// Peer IDs known to hold the blob.
+        seeders: Vec<String>,
+        /// Relay blob URL as fallback when no seeder is reachable.
+        relay_fallback: String,
+        /// Base64 URL-safe no-pad encoded 32-byte symmetric blob key.
+        blob_key: String,
+    },
+}
+
 /// Optional references to binary attachments stored by content hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -296,9 +335,13 @@ pub struct AttachmentRef {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filename: Option<String>,
     /// Binary attachment data, base64 URL-safe no-pad encoded.
-    /// Populated by the sender so the recipient can store it locally.
+    /// Populated for `Inline` transport; absent for `RelayBlob` / `PeerSeeded`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub data: Option<String>,
+    /// Transport mechanism.  `None` is equivalent to `Inline` for backwards
+    /// compatibility with v1 senders.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transport: Option<AttachmentTransport>,
 }
 
 /// Encrypted user data with optional attachment references.
