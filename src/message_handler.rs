@@ -22,11 +22,11 @@ use crate::client::{ClientMessage, MessageHandler};
 
 use crate::crypto::{generate_content_key, StoredKeypair, NONCE_SIZE};
 use crate::protocol::{
-    build_encrypted_payload, build_envelope_from_payload, build_meta_payload, Envelope,
-    MessageKind, MetaMessage,
+    build_encrypted_payload, build_envelope_from_payload, build_meta_payload, AttachmentTransport,
+    Envelope, MessageKind, MetaMessage,
 };
 use crate::storage::{
-    AttachmentRow, FriendRequestRow, GroupInviteRow, GroupMemberRow, GroupRow,
+    AttachmentRow, BlobManifestRow, FriendRequestRow, GroupInviteRow, GroupMemberRow, GroupRow,
     MessageAttachmentRow, MessageRow, NotificationRow, PeerRow, ProfileRow, ReactionRow, Storage,
 };
 
@@ -171,6 +171,97 @@ impl StorageMessageHandler {
                 "mesh backfill (peer add): deleted messages from {} — invalid signatures",
                 crate::logging::peer_id(sender_id),
             );
+        }
+    }
+
+    /// Rebuild `message_attachments` and relay-blob metadata for already-stored
+    /// public messages from their `raw_envelope` payloads.
+    ///
+    /// This repairs older databases created before attachment-reference
+    /// persistence for non-inline transports was implemented.
+    pub fn backfill_public_attachments_for_storage(storage: &Storage) {
+        const PAGE: u32 = 500;
+        let mut before: Option<u64> = None;
+        let now = now_secs();
+
+        loop {
+            let rows = match storage.list_messages(Some("public"), None, before, PAGE) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            if rows.is_empty() {
+                break;
+            }
+
+            for row in &rows {
+                let Some(raw) = row.raw_envelope.as_deref() else {
+                    continue;
+                };
+                let Ok(envelope) = serde_json::from_str::<Envelope>(raw) else {
+                    continue;
+                };
+                for (i, att_ref) in envelope.payload.attachments.iter().enumerate() {
+                    let mut attachment_ready = false;
+                    if let Some(ref data_b64) = att_ref.data {
+                        if let Ok(data) =
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64)
+                        {
+                            if storage
+                                .insert_attachment(&AttachmentRow {
+                                    content_hash: att_ref.content_id.0.clone(),
+                                    content_type: att_ref.content_type.clone(),
+                                    size_bytes: att_ref.size,
+                                    data,
+                                    created_at: now,
+                                })
+                                .is_ok()
+                            {
+                                attachment_ready = true;
+                            }
+                        }
+                    } else if let Some(AttachmentTransport::RelayBlob {
+                        relay_url,
+                        chunk_hashes,
+                        blob_key,
+                    }) = &att_ref.transport
+                    {
+                        let att_ok = storage
+                            .insert_attachment(&AttachmentRow {
+                                content_hash: att_ref.content_id.0.clone(),
+                                content_type: att_ref.content_type.clone(),
+                                size_bytes: att_ref.size,
+                                data: Vec::new(),
+                                created_at: now,
+                            })
+                            .is_ok();
+                        let manifest_ok = storage
+                            .upsert_blob_manifest(&BlobManifestRow {
+                                content_hash: att_ref.content_id.0.clone(),
+                                blob_key: blob_key.clone(),
+                                relay_url: relay_url.clone(),
+                                chunk_hashes: chunk_hashes.clone(),
+                                total_size: att_ref.size,
+                                created_at: now,
+                            })
+                            .is_ok();
+                        attachment_ready = att_ok && manifest_ok;
+                    }
+
+                    if attachment_ready {
+                        let _ = storage.insert_message_attachment(&MessageAttachmentRow {
+                            message_id: row.message_id.clone(),
+                            content_hash: att_ref.content_id.0.clone(),
+                            filename: att_ref.filename.clone(),
+                            position: i as u32,
+                        });
+                    }
+                }
+            }
+
+            before = rows.last().map(|r| r.timestamp);
+            if rows.len() < PAGE as usize {
+                break;
+            }
         }
     }
 
@@ -1031,33 +1122,70 @@ impl MessageHandler for StorageMessageHandler {
             signature_verified,
         };
 
-        if self.storage.insert_message(&row).is_ok() {
-            // Store any inline attachment data so it can be served locally.
-            for (i, att_ref) in envelope.payload.attachments.iter().enumerate() {
-                if let Some(ref data_b64) = att_ref.data {
-                    if let Ok(data) =
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64)
-                    {
-                        let att_row = AttachmentRow {
-                            content_hash: att_ref.content_id.0.clone(),
-                            content_type: att_ref.content_type.clone(),
-                            size_bytes: att_ref.size,
-                            data,
-                            created_at: now,
-                        };
-                        let _ = self.storage.insert_attachment(&att_row);
-                        let _ = self
-                            .storage
-                            .insert_message_attachment(&MessageAttachmentRow {
-                                message_id: message.message_id.clone(),
-                                content_hash: att_ref.content_id.0.clone(),
-                                filename: att_ref.filename.clone(),
-                                position: i as u32,
-                            });
+        let message_inserted = self.storage.insert_message(&row).is_ok();
+        // Persist attachment references idempotently even when the message was
+        // already present (e.g. re-syncing older messages after upgrading).
+        for (i, att_ref) in envelope.payload.attachments.iter().enumerate() {
+            let mut attachment_ready = false;
+            if let Some(ref data_b64) = att_ref.data {
+                if let Ok(data) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data_b64)
+                {
+                    let att_row = AttachmentRow {
+                        content_hash: att_ref.content_id.0.clone(),
+                        content_type: att_ref.content_type.clone(),
+                        size_bytes: att_ref.size,
+                        data,
+                        created_at: now,
+                    };
+                    if self.storage.insert_attachment(&att_row).is_ok() {
+                        attachment_ready = true;
                     }
                 }
+            } else if let Some(AttachmentTransport::RelayBlob {
+                relay_url,
+                chunk_hashes,
+                blob_key,
+            }) = &att_ref.transport
+            {
+                // Persist metadata for relay-backed attachments so the web API
+                // can lazily fetch/decrypt bytes when requested.
+                let att_ok = self
+                    .storage
+                    .insert_attachment(&AttachmentRow {
+                        content_hash: att_ref.content_id.0.clone(),
+                        content_type: att_ref.content_type.clone(),
+                        size_bytes: att_ref.size,
+                        data: Vec::new(),
+                        created_at: now,
+                    })
+                    .is_ok();
+                let manifest_ok = self
+                    .storage
+                    .upsert_blob_manifest(&BlobManifestRow {
+                        content_hash: att_ref.content_id.0.clone(),
+                        blob_key: blob_key.clone(),
+                        relay_url: relay_url.clone(),
+                        chunk_hashes: chunk_hashes.clone(),
+                        total_size: att_ref.size,
+                        created_at: now,
+                    })
+                    .is_ok();
+                attachment_ready = att_ok && manifest_ok;
             }
 
+            if attachment_ready {
+                let _ = self
+                    .storage
+                    .insert_message_attachment(&MessageAttachmentRow {
+                        message_id: message.message_id.clone(),
+                        content_hash: att_ref.content_id.0.clone(),
+                        filename: att_ref.filename.clone(),
+                        position: i as u32,
+                    });
+            }
+        }
+
+        if message_inserted {
             // Create notification for direct messages and replies to our own messages.
             let notification_type = if row.reply_to.is_some() {
                 if let Some(ref parent_id) = row.reply_to {

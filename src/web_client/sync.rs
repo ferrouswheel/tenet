@@ -189,6 +189,14 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
 
     let total_fetched = outcome_small.fetched + outcome_large.fetched;
     if total_fetched == 0 {
+        // Keep attachment references healthy for older databases created before
+        // relay-blob refs were persisted on receive.
+        {
+            let st = state.lock().await;
+            crate::message_handler::StorageMessageHandler::backfill_public_attachments_for_storage(
+                &st.storage,
+            );
+        }
         return Ok(());
     }
 
@@ -207,6 +215,9 @@ pub async fn sync_once(state: &SharedState) -> Result<(), String> {
     {
         let st = state.lock().await;
         let _ = st.storage.update_relay_last_sync(&relay_url, now);
+        crate::message_handler::StorageMessageHandler::backfill_public_attachments_for_storage(
+            &st.storage,
+        );
     }
 
     Ok(())

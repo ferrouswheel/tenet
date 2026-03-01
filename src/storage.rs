@@ -1719,6 +1719,34 @@ impl Storage {
         Ok(())
     }
 
+    /// Insert or replace an attachment's metadata and file bytes.
+    ///
+    /// Unlike `insert_attachment`, this always writes the file and updates
+    /// the database row when the content hash already exists.
+    pub fn upsert_attachment(&self, row: &AttachmentRow) -> Result<(), StorageError> {
+        let path = self.attachment_path(&row.content_hash, &row.content_type);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &row.data)?;
+        self.conn.execute(
+            "INSERT INTO attachments
+             (content_hash, content_type, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(content_hash) DO UPDATE SET
+                 content_type = excluded.content_type,
+                 size_bytes = excluded.size_bytes,
+                 created_at = excluded.created_at",
+            params![
+                row.content_hash,
+                row.content_type,
+                row.size_bytes as i64,
+                row.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Retrieve an attachment by its content hash. Returns `None` if not
     /// found in the database or if the file is missing from disk.
     pub fn get_attachment(
@@ -1815,6 +1843,32 @@ impl Storage {
             "INSERT OR IGNORE INTO blob_manifests
              (content_hash, blob_key, relay_url, chunk_hashes, total_size, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.content_hash,
+                row.blob_key,
+                row.relay_url,
+                chunk_hashes_json,
+                row.total_size as i64,
+                row.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or replace a blob manifest for `content_hash`.
+    pub fn upsert_blob_manifest(&self, row: &BlobManifestRow) -> Result<(), StorageError> {
+        let chunk_hashes_json =
+            serde_json::to_string(&row.chunk_hashes).map_err(StorageError::Serde)?;
+        self.conn.execute(
+            "INSERT INTO blob_manifests
+             (content_hash, blob_key, relay_url, chunk_hashes, total_size, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(content_hash) DO UPDATE SET
+                 blob_key = excluded.blob_key,
+                 relay_url = excluded.relay_url,
+                 chunk_hashes = excluded.chunk_hashes,
+                 total_size = excluded.total_size,
+                 created_at = excluded.created_at",
             params![
                 row.content_hash,
                 row.blob_key,
