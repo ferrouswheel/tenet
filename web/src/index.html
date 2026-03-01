@@ -126,6 +126,20 @@
                         <option value="public">Public</option>
                     </select>
                     <select id="compose-group-id" style="display:none;"></select>
+                    <select id="compose-geo-mode" title="Location metadata mode">
+                        <option value="none">Geo: none</option>
+                        <option value="country">Geo: country</option>
+                        <option value="region">Geo: region</option>
+                        <option value="city">Geo: city</option>
+                        <option value="neighborhood">Geo: neighborhood</option>
+                        <option value="exact">Geo: exact</option>
+                    </select>
+                    <input id="compose-geo-country" type="text" placeholder="Country (US)" style="display:none;max-width:120px;" />
+                    <input id="compose-geo-region" type="text" placeholder="Region" style="display:none;max-width:180px;" />
+                    <input id="compose-geo-city" type="text" placeholder="City" style="display:none;max-width:180px;" />
+                    <input id="compose-geo-geohash" type="text" placeholder="Geohash" style="display:none;max-width:140px;" />
+                    <input id="compose-geo-lat" type="number" step="any" placeholder="Lat" style="display:none;max-width:120px;" />
+                    <input id="compose-geo-lon" type="number" step="any" placeholder="Lon" style="display:none;max-width:120px;" />
                     <button id="compose-send" onclick="sendMessage()">Send</button>
                 </div>
             </div>

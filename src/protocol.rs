@@ -375,6 +375,20 @@ pub enum MetaMessage {
         peer_id: String,
         since_timestamp: u64,
     },
+    /// Geographic variant of mesh discovery. Uses either geohash prefix OR
+    /// country/region/city text filters.
+    GeoMessageRequest {
+        peer_id: String,
+        since_timestamp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        geohash_prefix: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        country_code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        city: Option<String>,
+    },
     FriendRequest {
         peer_id: String,
         signing_public_key: String,
@@ -410,6 +424,20 @@ pub enum MetaMessage {
         peer_id: String,
         message_ids: Vec<String>,
         since_timestamp: u64,
+    },
+    /// Response to `GeoMessageRequest`.
+    GeoMeshAvailable {
+        peer_id: String,
+        message_ids: Vec<String>,
+        since_timestamp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        geohash_prefix: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        country_code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        city: Option<String>,
     },
     /// Request specific public messages by ID after deduplication.
     MeshRequest {

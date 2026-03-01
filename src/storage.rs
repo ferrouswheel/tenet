@@ -12,6 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::StoredKeypair;
+use crate::geo::{matches_geo_query, parse_public_message_body, GeoQuery};
 use crate::protocol::{Envelope, MessageKind};
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1261,78 @@ impl Storage {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    /// Return public message IDs in a geohash prefix region.
+    pub fn list_public_message_ids_since_in_geohash_region(
+        &self,
+        since: u64,
+        geohash_prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, StorageError> {
+        let query = GeoQuery {
+            geohash_prefix: Some(geohash_prefix.to_string()),
+            country_code: None,
+            region: None,
+            city: None,
+        };
+        self.list_public_message_ids_since_matching_geo(since, &query, limit)
+    }
+
+    /// Return public message IDs matching text-based geo hierarchy.
+    pub fn list_public_message_ids_since_in_named_region(
+        &self,
+        since: u64,
+        country_code: Option<&str>,
+        region: Option<&str>,
+        city: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, StorageError> {
+        let query = GeoQuery {
+            geohash_prefix: None,
+            country_code: country_code.map(|s| s.to_string()),
+            region: region.map(|s| s.to_string()),
+            city: city.map(|s| s.to_string()),
+        };
+        self.list_public_message_ids_since_matching_geo(since, &query, limit)
+    }
+
+    fn list_public_message_ids_since_matching_geo(
+        &self,
+        since: u64,
+        query: &GeoQuery,
+        limit: u32,
+    ) -> Result<Vec<String>, StorageError> {
+        // A simple scan over recent public messages; geo data is carried inside
+        // each public payload JSON body.
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, raw_envelope FROM messages
+             WHERE message_kind = 'public' AND timestamp >= ?1
+             ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map(params![since as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (message_id, raw_envelope) = row?;
+            let Some(raw) = raw_envelope else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<Envelope>(&raw) else {
+                continue;
+            };
+            let Ok(public_body) = parse_public_message_body(&envelope.payload.body) else {
+                continue;
+            };
+            if matches_geo_query(public_body.geo.as_ref(), query) {
+                out.push(message_id);
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Returns all stored messages from `sender_id` whose signature has not
@@ -3970,6 +4043,52 @@ mod tests {
         }
     }
 
+    fn make_geo_public_row(
+        id: &str,
+        sender: &str,
+        ts: u64,
+        body: &str,
+        geo: crate::geo::GeoLocation,
+    ) -> MessageRow {
+        let payload = crate::geo::PublicMessageBody {
+            body: body.to_string(),
+            geo: Some(geo),
+        }
+        .to_payload_json()
+        .unwrap();
+        let keypair = crate::crypto::generate_keypair();
+        let env = crate::protocol::build_plaintext_envelope(
+            sender,
+            "*",
+            None,
+            None,
+            ts,
+            3600,
+            crate::protocol::MessageKind::Public,
+            None,
+            None,
+            payload,
+            [0u8; 16],
+            &keypair.signing_private_key_hex,
+        )
+        .unwrap();
+        MessageRow {
+            message_id: id.to_string(),
+            sender_id: sender.to_string(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some(body.to_string()),
+            timestamp: ts,
+            received_at: ts,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: Some(serde_json::to_string(&env).unwrap()),
+            reply_to: None,
+            signature_verified: true,
+        }
+    }
+
     #[test]
     fn list_public_message_ids_since_returns_recent() {
         let storage = test_storage();
@@ -4024,6 +4143,57 @@ mod tests {
         }
         let ids = storage.list_public_message_ids_since(0, 3).unwrap();
         assert_eq!(ids.len(), 3, "limit should be respected");
+    }
+
+    #[test]
+    fn list_public_message_ids_geo_filters_work() {
+        let storage = test_storage();
+        let now = 1_700_000_000u64;
+
+        storage
+            .insert_message(&make_geo_public_row(
+                "sf-1",
+                "alice",
+                now - 10,
+                "hello sf",
+                crate::geo::GeoLocation {
+                    precision: crate::geo::GeoPrecision::Neighborhood,
+                    country_code: Some("US".to_string()),
+                    region: Some("California".to_string()),
+                    city: Some("San Francisco".to_string()),
+                    geohash: Some("9q8yy".to_string()),
+                    lat: None,
+                    lon: None,
+                },
+            ))
+            .unwrap();
+        storage
+            .insert_message(&make_geo_public_row(
+                "ldn-1",
+                "bob",
+                now - 5,
+                "hello london",
+                crate::geo::GeoLocation {
+                    precision: crate::geo::GeoPrecision::City,
+                    country_code: Some("GB".to_string()),
+                    region: Some("England".to_string()),
+                    city: Some("London".to_string()),
+                    geohash: None,
+                    lat: None,
+                    lon: None,
+                },
+            ))
+            .unwrap();
+
+        let us = storage
+            .list_public_message_ids_since_in_named_region(now - 100, Some("US"), None, None, 50)
+            .unwrap();
+        assert_eq!(us, vec!["sf-1".to_string()]);
+
+        let sf = storage
+            .list_public_message_ids_since_in_geohash_region(now - 100, "9q8", 50)
+            .unwrap();
+        assert_eq!(sf, vec!["sf-1".to_string()]);
     }
 
     #[test]

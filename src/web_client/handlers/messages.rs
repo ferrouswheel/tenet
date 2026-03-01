@@ -8,6 +8,11 @@ use serde::Deserialize;
 use crate::crypto::{generate_content_key, NONCE_SIZE};
 use base64::Engine as _;
 
+use crate::geo::{
+    matches_geo_query, parse_public_message_body, validate_geo_location, GeoLocation, GeoQuery,
+    PublicMessageBody,
+};
+use crate::identity::load_identity_geo_config;
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_group_message_payload,
     build_plaintext_payload, AttachmentRef, AttachmentTransport, ContentId, MessageKind,
@@ -26,6 +31,10 @@ pub struct ListMessagesQuery {
     group: Option<String>,
     before: Option<u64>,
     limit: Option<u32>,
+    geo_within: Option<String>,
+    geo_country: Option<String>,
+    geo_region: Option<String>,
+    geo_city: Option<String>,
 }
 
 pub async fn list_messages_handler(
@@ -34,6 +43,22 @@ pub async fn list_messages_handler(
 ) -> Response {
     let st = state.lock().await;
     let limit = params.limit.unwrap_or(50).min(200);
+    let geo_query = GeoQuery {
+        geohash_prefix: params.geo_within.clone(),
+        country_code: params.geo_country.clone(),
+        region: params.geo_region.clone(),
+        city: params.geo_city.clone(),
+    };
+    if geo_query.geohash_prefix.is_some()
+        && (geo_query.country_code.is_some()
+            || geo_query.region.is_some()
+            || geo_query.city.is_some())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "geo_within cannot be combined with geo_country/geo_region/geo_city",
+        );
+    }
 
     // For timeline kinds (public / friend_group), filter out posts from muted peers.
     let is_timeline_kind = matches!(
@@ -68,6 +93,29 @@ pub async fn list_messages_handler(
                         return true;
                     }
                     matches!(m.message_kind.as_str(), "direct") || !muted_ids.contains(&m.sender_id)
+                })
+                .filter(|m| {
+                    if geo_query.geohash_prefix.is_none()
+                        && geo_query.country_code.is_none()
+                        && geo_query.region.is_none()
+                        && geo_query.city.is_none()
+                    {
+                        return true;
+                    }
+                    if m.message_kind != "public" {
+                        return false;
+                    }
+                    let Some(raw) = m.raw_envelope.as_deref() else {
+                        return false;
+                    };
+                    let Ok(envelope) = serde_json::from_str::<crate::protocol::Envelope>(raw)
+                    else {
+                        return false;
+                    };
+                    let Ok(public_body) = parse_public_message_body(&envelope.payload.body) else {
+                        return false;
+                    };
+                    matches_geo_query(public_body.geo.as_ref(), &geo_query)
                 })
                 .map(|m| message_to_json(m, &st.storage))
                 .collect();
@@ -255,6 +303,8 @@ pub struct SendPublicRequest {
     body: String,
     #[serde(default)]
     attachments: Vec<SendAttachmentRef>,
+    #[serde(default)]
+    geo: Option<serde_json::Value>,
 }
 
 pub async fn send_public_handler(
@@ -268,7 +318,7 @@ pub async fn send_public_handler(
     let now = now_secs();
 
     // Short lock: extract identity data and attachment blobs
-    let (keypair_id, signing_key, relay_url, attachment_refs) = {
+    let (keypair_id, signing_key, relay_url, attachment_refs, db_path) = {
         let st = state.lock().await;
         let attachment_refs = build_attachment_refs(&st.storage, &req.attachments);
         (
@@ -276,6 +326,7 @@ pub async fn send_public_handler(
             st.keypair.signing_private_key_hex.clone(),
             st.relay_url.clone(),
             attachment_refs,
+            st.db_path.clone(),
         )
     };
     // Lock released
@@ -284,7 +335,38 @@ pub async fn send_public_handler(
     let mut salt = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
 
-    let mut payload = build_plaintext_payload(&req.body, salt);
+    let geo = match req.geo.as_ref() {
+        None => db_path
+            .parent()
+            .and_then(|p| load_identity_geo_config(p).ok())
+            .and_then(|cfg| cfg.to_location()),
+        Some(v) if v.is_null() => None,
+        Some(v) => match serde_json::from_value::<GeoLocation>(v.clone()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                return api_error(StatusCode::BAD_REQUEST, format!("invalid geo payload: {e}"));
+            }
+        },
+    };
+    if let Some(g) = &geo {
+        if let Err(e) = validate_geo_location(g) {
+            return api_error(StatusCode::BAD_REQUEST, e);
+        }
+    }
+    let public_body = PublicMessageBody {
+        body: req.body.clone(),
+        geo,
+    };
+    let payload_body = match public_body.to_payload_json() {
+        Ok(v) => v,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialize payload: {e}"),
+            );
+        }
+    };
+    let mut payload = build_plaintext_payload(payload_body, salt);
     payload.attachments = attachment_refs;
 
     let envelope = match build_envelope_from_payload(

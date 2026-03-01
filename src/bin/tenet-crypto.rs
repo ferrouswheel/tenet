@@ -6,10 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tenet::client::{ClientConfig, ClientEncryption, RelayClient, SyncEventOutcome};
 use tenet::crypto::{derive_user_id_from_public_key, generate_keypair, StoredKeypair};
-use tenet::identity::{
-    create_identity, list_identities, resolve_identity, save_config, TenetConfig,
+use tenet::geo::{
+    parse_public_message_body, validate_geo_location, GeoConfig, GeoLocation, GeoPrecision,
+    PublicMessageBody,
 };
-use tenet::protocol::MessageKind;
+use tenet::identity::{
+    create_identity, list_identities, load_identity_geo_config, resolve_identity, save_config,
+    save_identity_geo_config, TenetConfig,
+};
+use tenet::protocol::{build_envelope_from_payload, build_plaintext_payload, MessageKind};
+use tenet::relay_transport::post_envelope;
 use tenet::storage::{db_path, IdentityRow, OutboxRow, PeerRow, Storage};
 
 fn main() {
@@ -58,6 +64,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "send" => send_message(&command_args, identity_flag.as_deref()),
         "sync" => sync_messages(&command_args, identity_flag.as_deref()),
         "post" => post_message(&command_args, identity_flag.as_deref()),
+        "geo" => geo_cmd(&command_args, identity_flag.as_deref()),
         "receive-all" => receive_all(&command_args, identity_flag.as_deref()),
         "export-key" => export_key(&command_args, identity_flag.as_deref()),
         "import-key" => import_key(&command_args, identity_flag.as_deref()),
@@ -82,6 +89,10 @@ fn print_usage() {
          send <peer_name> <message> [--relay <url>]\n\
          sync [--relay <url>]\n\
          post <message> [--relay <url>]\n\
+         post <message> [--geo <precision> --country <CC> --region <R> --city <C> --geohash <hash>]\n\
+         post <message> [--no-geo]\n\
+         geo show\n\
+         geo set --precision <none|country|region|city|neighborhood|exact> [--country <CC>] [--region <R>] [--city <C>] [--geohash <hash>]\n\
          receive-all [--relay <url>]\n\
          export-key [--public|--private]\n\
          import-key <public_key_hex> <private_key_hex>\n\
@@ -136,7 +147,7 @@ fn ensure_dir(path: &Path) -> Result<(), Box<dyn Error>> {
 /// Resolve identity and return (keypair, storage, stored_relay_url).
 fn resolve_and_log(
     explicit_id: Option<&str>,
-) -> Result<(StoredKeypair, Storage, Option<String>), Box<dyn Error>> {
+) -> Result<(StoredKeypair, Storage, Option<String>, PathBuf), Box<dyn Error>> {
     let dir = data_dir();
     let resolved = resolve_identity(&dir, explicit_id)?;
 
@@ -156,6 +167,7 @@ fn resolve_and_log(
         resolved.keypair,
         resolved.storage,
         resolved.stored_relay_url,
+        resolved.identity_dir,
     ))
 }
 
@@ -268,7 +280,7 @@ fn add_peer(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Er
         return Err("add-peer requires <name> <public_key_hex>".into());
     }
 
-    let (_keypair, storage, _) = resolve_and_log(explicit_id)?;
+    let (_keypair, storage, _, _) = resolve_and_log(explicit_id)?;
 
     let name = args[0].clone();
     let public_key_hex = args[1].clone();
@@ -329,7 +341,7 @@ fn send_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
+    let (identity, storage, stored_relay, _) = resolve_and_log(explicit_id)?;
     let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let peer_name = peer_name.ok_or("send requires <peer_name>")?;
@@ -388,7 +400,7 @@ fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<d
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
+    let (identity, storage, stored_relay, _) = resolve_and_log(explicit_id)?;
     let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let mut client = build_relay_client(identity, &relay_url);
@@ -422,6 +434,12 @@ fn sync_messages(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<d
 fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut relay_url_override: Option<String> = None;
     let mut message_parts: Vec<String> = Vec::new();
+    let mut no_geo = false;
+    let mut geo_precision: Option<GeoPrecision> = None;
+    let mut geo_country: Option<String> = None;
+    let mut geo_region: Option<String> = None;
+    let mut geo_city: Option<String> = None;
+    let mut geo_geohash: Option<String> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -433,6 +451,47 @@ fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
                 }
                 relay_url_override = Some(args[index].clone());
             }
+            "--no-geo" => {
+                no_geo = true;
+            }
+            "--geo" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--geo requires precision".into());
+                }
+                let parsed = args[index]
+                    .parse::<GeoPrecision>()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                geo_precision = Some(parsed);
+            }
+            "--country" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--country requires a value".into());
+                }
+                geo_country = Some(args[index].clone());
+            }
+            "--region" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--region requires a value".into());
+                }
+                geo_region = Some(args[index].clone());
+            }
+            "--city" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--city requires a value".into());
+                }
+                geo_city = Some(args[index].clone());
+            }
+            "--geohash" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--geohash requires a value".into());
+                }
+                geo_geohash = Some(args[index].clone());
+            }
             value => {
                 message_parts.push(value.to_string());
             }
@@ -440,7 +499,7 @@ fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
+    let (identity, storage, stored_relay, identity_dir) = resolve_and_log(explicit_id)?;
     let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let message = message_parts.join(" ");
@@ -448,15 +507,56 @@ fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
         return Err("post requires a message".into());
     }
 
-    let mut client = build_relay_client(identity, &relay_url);
-    populate_peer_registry(&mut client, &storage)?;
+    let geo = if no_geo {
+        None
+    } else if geo_precision.is_some()
+        || geo_country.is_some()
+        || geo_region.is_some()
+        || geo_city.is_some()
+        || geo_geohash.is_some()
+    {
+        let loc = GeoLocation {
+            precision: geo_precision.unwrap_or(GeoPrecision::City),
+            country_code: geo_country,
+            region: geo_region,
+            city: geo_city,
+            geohash: geo_geohash,
+            lat: None,
+            lon: None,
+        };
+        validate_geo_location(&loc).map_err(|e| format!("invalid --geo options: {e}"))?;
+        Some(loc)
+    } else {
+        load_identity_geo_config(&identity_dir)?.to_location()
+    };
 
-    let envelope = client.send_public_message(&message)?;
-
+    let payload_struct = PublicMessageBody {
+        body: message.clone(),
+        geo,
+    };
+    let payload_json = payload_struct.to_payload_json()?;
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    let payload = build_plaintext_payload(payload_json, salt);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let envelope = build_envelope_from_payload(
+        identity.id.clone(),
+        "*",
+        None,
+        None,
+        now,
+        DEFAULT_TTL_SECONDS,
+        MessageKind::Public,
+        None,
+        None,
+        payload,
+        &identity.signing_private_key_hex,
+    )?;
+    post_envelope(&relay_url, &envelope)?;
+
     storage.insert_outbox(&OutboxRow {
         message_id: envelope.header.message_id.0.clone(),
         envelope: serde_json::to_string(&envelope)?,
@@ -466,6 +566,107 @@ fn post_message(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dy
 
     println!("posted public message {}", envelope.header.message_id.0);
     Ok(())
+}
+
+fn geo_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "show" => geo_show(explicit_id),
+        "set" => geo_set(&args[1..], explicit_id),
+        _ => Err("geo requires subcommand: show|set".into()),
+    }
+}
+
+fn geo_show(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let (_identity, _storage, _relay, identity_dir) = resolve_and_log(explicit_id)?;
+    let cfg = load_identity_geo_config(&identity_dir)?;
+    println!("Default precision : {}", cfg.default_precision);
+    println!(
+        "Country           : {}",
+        cfg.country_code.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Region            : {}",
+        cfg.region.as_deref().unwrap_or("-")
+    );
+    println!("City              : {}", cfg.city.as_deref().unwrap_or("-"));
+    println!(
+        "Geohash           : {}",
+        cfg.geohash.as_deref().unwrap_or("-")
+    );
+    Ok(())
+}
+
+fn geo_set(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let (_identity, _storage, _relay, identity_dir) = resolve_and_log(explicit_id)?;
+    let mut precision: Option<GeoPrecision> = None;
+    let mut country: Option<String> = None;
+    let mut region: Option<String> = None;
+    let mut city: Option<String> = None;
+    let mut geohash: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--precision" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--precision requires a value".into());
+                }
+                let parsed = args[i]
+                    .parse::<GeoPrecision>()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                precision = Some(parsed);
+            }
+            "--country" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--country requires a value".into());
+                }
+                country = Some(args[i].clone());
+            }
+            "--region" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--region requires a value".into());
+                }
+                region = Some(args[i].clone());
+            }
+            "--city" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--city requires a value".into());
+                }
+                city = Some(args[i].clone());
+            }
+            "--geohash" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--geohash requires a value".into());
+                }
+                geohash = Some(args[i].clone());
+            }
+            other => {
+                return Err(format!("unknown geo set option: {other}").into());
+            }
+        }
+        i += 1;
+    }
+
+    let cfg = GeoConfig {
+        default_precision: precision.ok_or("--precision is required")?,
+        country_code: country,
+        region,
+        city,
+        geohash,
+    };
+    if let Some(loc) = cfg.to_location() {
+        validate_geo_location(&loc)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    }
+    save_identity_geo_config(&identity_dir, &cfg)?;
+    println!("updated geo settings");
+    geo_show(explicit_id)
 }
 
 fn receive_all(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
@@ -485,7 +686,7 @@ fn receive_all(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn
         index += 1;
     }
 
-    let (identity, storage, stored_relay) = resolve_and_log(explicit_id)?;
+    let (identity, storage, stored_relay, _) = resolve_and_log(explicit_id)?;
     let relay_url = resolve_relay(relay_url_override, stored_relay);
 
     let mut client = build_relay_client(identity, &relay_url);
@@ -510,9 +711,16 @@ fn receive_all(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn
                 MessageKind::FriendGroup => "group",
                 _ => "message",
             };
+            let display_body = if event.envelope.header.message_kind == MessageKind::Public {
+                parse_public_message_body(&message.body)
+                    .map(|b| b.body)
+                    .unwrap_or_else(|_| message.body.clone())
+            } else {
+                message.body.clone()
+            };
             println!(
                 "[{}] from {}: {}",
-                kind_label, message.sender_id, message.body
+                kind_label, message.sender_id, display_body
             );
             storage.store_received_envelope(&event.envelope, Some(&message.body))?;
             received += 1;
@@ -528,7 +736,7 @@ fn export_key(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn 
         return Err("export-key accepts at most one flag".into());
     }
 
-    let (identity, _, _) = resolve_and_log(explicit_id)?;
+    let (identity, _, _, _) = resolve_and_log(explicit_id)?;
     match args.first().map(String::as_str) {
         None => println!("{}", serde_json::to_string_pretty(&identity)?),
         Some("--public") => println!("{}", identity.public_key_hex),
@@ -601,7 +809,7 @@ fn rotate_identity(explicit_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let dir = data_dir();
     ensure_dir(&dir)?;
 
-    let (old_keypair, _, _) = resolve_and_log(explicit_id)?;
+    let (old_keypair, _, _, _) = resolve_and_log(explicit_id)?;
 
     let new_keypair = generate_keypair();
 
@@ -663,7 +871,7 @@ fn list_peers_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<
         index += 1;
     }
 
-    let (keypair, storage, _) = resolve_and_log(explicit_id)?;
+    let (keypair, storage, _, _) = resolve_and_log(explicit_id)?;
 
     let mut peers = storage.list_peers()?;
 
@@ -773,7 +981,7 @@ fn peer_info_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<d
 
     let query = query.ok_or("peer requires <peer_id_or_name>")?;
 
-    let (keypair, storage, _) = resolve_and_log(explicit_id)?;
+    let (keypair, storage, _, _) = resolve_and_log(explicit_id)?;
     let peers = storage.list_peers()?;
 
     let peer = find_peer(&peers, &query).ok_or("peer not found")?;
@@ -872,7 +1080,7 @@ fn feed_cmd(args: &[String], explicit_id: Option<&str>) -> Result<(), Box<dyn Er
         index += 1;
     }
 
-    let (_keypair, storage, _) = resolve_and_log(explicit_id)?;
+    let (_keypair, storage, _, _) = resolve_and_log(explicit_id)?;
 
     let messages = storage.list_messages(Some("public"), None, None, limit)?;
 

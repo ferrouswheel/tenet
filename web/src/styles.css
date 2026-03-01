@@ -413,6 +413,15 @@ body {
     color: #666;
     margin-left: auto;
 }
+.msg-geo-flag {
+    font-size: 0.95rem;
+    line-height: 1;
+}
+.msg-geo-text {
+    font-size: 0.78rem;
+    color: #8e97a6;
+    margin-bottom: 0.35rem;
+}
 .message .msg-body {
     font-size: 0.9rem;
     line-height: 1.5;

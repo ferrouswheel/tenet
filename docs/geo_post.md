@@ -2,25 +2,25 @@
 
 ## Status
 
-- [ ] Plan written
+- [x] Plan written
 - [ ] `Cargo.toml` — add `geohash`, `country-boundaries`, `reverse_geocoder`, `iso3166-1` dependencies
-- [ ] `src/geo.rs` — new module: `GeoLocation`, `GeoPrecision`, country seed table, `resolve_geo()`
-- [ ] `src/protocol.rs` — `GeoMessageRequest` + `GeoMeshAvailable` MetaMessage variants
-- [ ] `src/storage.rs` — schema migration + geo queries
-- [ ] `src/message_handler.rs` — geo mesh protocol arms; geo extraction on ingest
-- [ ] `src/identity.rs` — `[geo]` config section
-- [ ] `src/web_client/handlers/messages.rs` — `geo` field in POST, `geo_within` in GET
-- [ ] `src/web_client/handlers/settings.rs` — `GET/POST /api/settings/geo`
-- [ ] `src/web_client/config.rs` — geo constants
-- [ ] `src/web_client/sync.rs` — send `GeoMessageRequest` after sync
-- [ ] `src/bin/tenet-crypto.rs` — `geo set` / `geo show` subcommands
+- [x] `src/geo.rs` — new module: `GeoLocation`, `GeoPrecision`, country seed table, `resolve_geo()`
+- [x] `src/protocol.rs` — `GeoMessageRequest` + `GeoMeshAvailable` MetaMessage variants
+- [ ] `src/storage.rs` — schema migration + geo queries (geo queries implemented; schema migration deferred)
+- [x] `src/message_handler.rs` — geo mesh protocol arms; geo extraction on ingest
+- [x] `src/identity.rs` — `[geo]` config section
+- [x] `src/web_client/handlers/messages.rs` — `geo` field in POST, `geo_within` in GET
+- [x] `src/web_client/handlers/settings.rs` — `GET/POST /api/settings/geo`
+- [x] `src/web_client/config.rs` — geo constants
+- [x] `src/web_client/sync.rs` — send `GeoMessageRequest` after sync
+- [x] `src/bin/tenet-crypto.rs` — `geo set` / `geo show` subcommands
 - [ ] `src/simulation/config.rs` — `geo` field in peer/cohort config
 - [ ] `src/client.rs` (SimulationClient) — handle `GeoMessageRequest`/`GeoMeshAvailable`
 - [ ] `src/bin/debugger.rs` — `geo-query` and `set-geo` REPL commands
 - [ ] `android/tenet-ffi/src/types.rs` — `FfiGeoLocation`
 - [ ] `android/tenet-ffi/src/lib.rs` — `resolve_geo()`, `FfiMessage.geo`
 - [ ] `android/tenet-ffi/src/tenet_ffi.udl` — UniFFI interface update
-- [ ] Tests passing
+- [ ] Tests passing (core + bin tests pass; `tests/attachment_v2_tests.rs` fails in sandbox due relay bind permission)
 
 ---
 

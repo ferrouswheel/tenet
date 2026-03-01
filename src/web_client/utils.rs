@@ -3,6 +3,8 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+use crate::geo::parse_public_message_body;
+use crate::protocol::Envelope;
 use crate::storage::{MessageAttachmentRow, MessageRow, Storage};
 
 /// Attachment reference included when sending a message.
@@ -37,6 +39,16 @@ pub fn message_to_json(m: &MessageRow, storage: &Storage) -> serde_json::Value {
 
     let (upvotes, downvotes) = storage.count_reactions(&m.message_id).unwrap_or((0, 0));
     let reply_count = storage.count_replies(&m.message_id).unwrap_or(0);
+    let geo = if m.message_kind == "public" {
+        m.raw_envelope
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Envelope>(raw).ok())
+            .and_then(|env| parse_public_message_body(&env.payload.body).ok())
+            .and_then(|body| serde_json::to_value(body.geo).ok())
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
 
     serde_json::json!({
         "message_id": m.message_id,
@@ -53,6 +65,7 @@ pub fn message_to_json(m: &MessageRow, storage: &Storage) -> serde_json::Value {
         "upvotes": upvotes,
         "downvotes": downvotes,
         "reply_count": reply_count,
+        "geo": geo,
     })
 }
 

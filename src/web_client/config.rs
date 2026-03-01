@@ -26,6 +26,7 @@ pub(crate) const CHUNK_SIZE: usize = 256 * 1024; // 256 KiB plaintext per chunk
 /// Maximum total attachment size accepted by `POST /api/attachments`.
 /// Raised to accommodate `RelayBlob` tier uploads.
 pub(crate) const MAX_ATTACHMENT_SIZE: u64 = 50 * 1024 * 1024; // 50 MiB
+pub(crate) const MAX_GEO_GEOHASH_PREFIX_LEN: usize = 12;
 
 /// Web server for the Tenet peer-to-peer social network.
 ///

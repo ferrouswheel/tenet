@@ -13,4 +13,5 @@ pub mod profiles;
 pub mod qr;
 pub mod reactions;
 pub mod replies;
+pub mod settings;
 pub mod websocket;

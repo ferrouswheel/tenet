@@ -21,6 +21,7 @@ use base64::Engine as _;
 use crate::client::{ClientMessage, MessageHandler};
 
 use crate::crypto::{generate_content_key, StoredKeypair, NONCE_SIZE};
+use crate::geo::parse_public_message_body;
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload, AttachmentTransport,
     Envelope, MessageKind, MetaMessage,
@@ -775,6 +776,10 @@ impl StorageMessageHandler {
             return;
         }
         let sender_id = &envelope.header.sender_id;
+        let public_body = match parse_public_message_body(&envelope.payload.body) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
         // Determine whether we can verify the signature now.
         let verified = self.verify_mesh_envelope(envelope, sender_keys);
         let raw = serde_json::to_string(envelope).ok();
@@ -784,7 +789,7 @@ impl StorageMessageHandler {
             recipient_id: self.my_peer_id.clone(),
             message_kind: "public".to_string(),
             group_id: None,
-            body: Some(envelope.payload.body.clone()),
+            body: Some(public_body.body),
             timestamp: envelope.header.timestamp,
             received_at: now,
             ttl_seconds: envelope.header.ttl_seconds,
@@ -1062,6 +1067,15 @@ impl MessageHandler for StorageMessageHandler {
             None
         };
 
+        let extracted_body = if envelope.header.message_kind == MessageKind::Public {
+            match parse_public_message_body(&message.body) {
+                Ok(public_body) => public_body.body,
+                Err(_) => return Vec::new(),
+            }
+        } else {
+            message.body.clone()
+        };
+
         // For public messages from unknown senders, we can't verify the signature.
         // The client accepts them but marks them as unverified. Backfill will verify later
         // if we learn the sender's key (e.g., via friend request or mesh delivery).
@@ -1112,7 +1126,7 @@ impl MessageHandler for StorageMessageHandler {
             recipient_id: self.my_peer_id.clone(),
             message_kind: kind_str.to_string(),
             group_id: envelope.header.group_id.clone(),
-            body: Some(message.body.clone()),
+            body: Some(extracted_body),
             timestamp: message.timestamp,
             received_at: now,
             ttl_seconds: envelope.header.ttl_seconds,
@@ -1295,7 +1309,55 @@ impl MessageHandler for StorageMessageHandler {
                     }
                 }
             }
+            MetaMessage::GeoMessageRequest {
+                peer_id: requester_id,
+                since_timestamp,
+                geohash_prefix,
+                country_code,
+                region,
+                city,
+            } => {
+                let window_start = now
+                    .saturating_sub(MAX_MESH_WINDOW_SECS)
+                    .max(*since_timestamp);
+                let ids = if let Some(prefix) = geohash_prefix.as_deref() {
+                    self.storage
+                        .list_public_message_ids_since_in_geohash_region(
+                            window_start,
+                            prefix,
+                            MAX_MESH_IDS,
+                        )
+                        .unwrap_or_default()
+                } else {
+                    self.storage
+                        .list_public_message_ids_since_in_named_region(
+                            window_start,
+                            country_code.as_deref(),
+                            region.as_deref(),
+                            city.as_deref(),
+                            MAX_MESH_IDS,
+                        )
+                        .unwrap_or_default()
+                };
+                let response = MetaMessage::GeoMeshAvailable {
+                    peer_id: self.my_peer_id.clone(),
+                    message_ids: ids.clone(),
+                    since_timestamp: window_start,
+                    geohash_prefix: geohash_prefix.clone(),
+                    country_code: country_code.clone(),
+                    region: region.clone(),
+                    city: city.clone(),
+                };
+                if let Some(env) = self.build_meta_envelope(requester_id, now, &response) {
+                    outgoing.push(env);
+                }
+            }
             MetaMessage::MeshAvailable {
+                peer_id: sender_id,
+                message_ids,
+                ..
+            }
+            | MetaMessage::GeoMeshAvailable {
                 peer_id: sender_id,
                 message_ids,
                 ..
@@ -2104,6 +2166,40 @@ mod tests {
         msg_id
     }
 
+    fn insert_geo_public_message(
+        storage: &Storage,
+        keypair: &crate::crypto::StoredKeypair,
+        body: &str,
+        ts: u64,
+        geo: crate::geo::GeoLocation,
+    ) -> String {
+        let payload = crate::geo::PublicMessageBody {
+            body: body.to_string(),
+            geo: Some(geo),
+        }
+        .to_payload_json()
+        .unwrap();
+        let env = make_public_envelope(keypair, &payload, ts);
+        let msg_id = env.header.message_id.0.clone();
+        let row = MessageRow {
+            message_id: msg_id.clone(),
+            sender_id: keypair.id.clone(),
+            recipient_id: "*".to_string(),
+            message_kind: "public".to_string(),
+            group_id: None,
+            body: Some(body.to_string()),
+            timestamp: ts,
+            received_at: ts,
+            ttl_seconds: 3600,
+            is_read: false,
+            raw_envelope: Some(serde_json::to_string(&env).unwrap()),
+            reply_to: None,
+            signature_verified: true,
+        };
+        storage.insert_message(&row).unwrap();
+        msg_id
+    }
+
     #[test]
     fn message_request_returns_mesh_available() {
         let alice = generate_keypair();
@@ -2138,6 +2234,63 @@ mod tests {
                 assert!(message_ids.contains(&id2), "id2 should be available");
             }
             other => panic!("expected MeshAvailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn geo_message_request_returns_geo_mesh_available() {
+        let alice = generate_keypair();
+        let bob = generate_keypair();
+        let storage = open_memory_storage();
+        let now = super::now_secs();
+        let sf_id = insert_geo_public_message(
+            &storage,
+            &alice,
+            "rain in sf",
+            now - 50,
+            crate::geo::GeoLocation {
+                precision: crate::geo::GeoPrecision::Neighborhood,
+                country_code: Some("US".to_string()),
+                region: Some("California".to_string()),
+                city: Some("San Francisco".to_string()),
+                geohash: Some("9q8yy".to_string()),
+                lat: None,
+                lon: None,
+            },
+        );
+        insert_geo_public_message(
+            &storage,
+            &alice,
+            "hello london",
+            now - 20,
+            crate::geo::GeoLocation {
+                precision: crate::geo::GeoPrecision::City,
+                country_code: Some("GB".to_string()),
+                region: Some("England".to_string()),
+                city: Some("London".to_string()),
+                geohash: None,
+                lat: None,
+                lon: None,
+            },
+        );
+
+        let mut handler = StorageMessageHandler::new(storage, bob.clone());
+        let request = MetaMessage::GeoMessageRequest {
+            peer_id: bob.id.clone(),
+            since_timestamp: now - 3600,
+            geohash_prefix: Some("9q8".to_string()),
+            country_code: None,
+            region: None,
+            city: None,
+        };
+        let outgoing = handler.on_meta(&request);
+        assert_eq!(outgoing.len(), 1);
+        let meta: MetaMessage = serde_json::from_str(&outgoing[0].payload.body).unwrap();
+        match meta {
+            MetaMessage::GeoMeshAvailable { message_ids, .. } => {
+                assert_eq!(message_ids, vec![sf_id]);
+            }
+            other => panic!("expected GeoMeshAvailable, got {other:?}"),
         }
     }
 

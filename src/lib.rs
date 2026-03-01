@@ -1,5 +1,6 @@
 pub mod client;
 pub mod crypto;
+pub mod geo;
 pub mod groups;
 pub mod identity;
 pub mod logging;

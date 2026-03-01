@@ -42,6 +42,20 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/messages/:message_id/read",
             post(handlers::messages::mark_read_handler),
         )
+        // Geo / settings API
+        .route(
+            "/api/settings/geo",
+            get(handlers::settings::get_geo_settings_handler)
+                .post(handlers::settings::update_geo_settings_handler),
+        )
+        .route(
+            "/api/geo/countries",
+            get(handlers::settings::list_countries_handler),
+        )
+        .route(
+            "/api/geo/resolve",
+            post(handlers::settings::resolve_geo_handler),
+        )
         // Peers API
         .route(
             "/api/peers",

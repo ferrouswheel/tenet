@@ -15,6 +15,8 @@ use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 use crate::client::{ClientConfig, ClientEncryption, ClientMessage, MessageHandler, RelayClient};
+use crate::geo::GeoPrecision;
+use crate::identity::load_identity_geo_config;
 use crate::message_handler::StorageMessageHandler;
 use crate::protocol::{
     build_envelope_from_payload, build_meta_payload, Envelope, MessageKind, MetaMessage,
@@ -500,7 +502,9 @@ impl MessageHandler for WebClientHandler {
                 outgoing
             }
 
-            MetaMessage::MessageRequest { .. } => self.inner.on_meta(meta),
+            MetaMessage::MessageRequest { .. } | MetaMessage::GeoMessageRequest { .. } => {
+                self.inner.on_meta(meta)
+            }
 
             MetaMessage::ProfileRequest {
                 peer_id,
@@ -517,6 +521,7 @@ impl MessageHandler for WebClientHandler {
             // Mesh protocol: delegate storage + response-building to the inner
             // handler.  No additional WebSocket events needed.
             MetaMessage::MeshAvailable { .. }
+            | MetaMessage::GeoMeshAvailable { .. }
             | MetaMessage::MeshRequest { .. }
             | MetaMessage::MeshDelivery { .. } => {
                 // When we receive MeshDelivery, any newly stored messages should
@@ -870,7 +875,7 @@ fn relay_http_to_ws(relay_url: &str, peer_id: &str) -> String {
 /// `MESH_QUERY_INTERVAL_SECS`.  Rate-limits queries per-peer using
 /// `AppState::last_mesh_query_sent`.
 pub async fn send_mesh_queries(state: &SharedState) -> Result<(), String> {
-    let (keypair, relay_url, peers, now) = {
+    let (keypair, relay_url, peers, now, db_path) = {
         let st = state.lock().await;
         let relay_url = st
             .relay_url
@@ -878,10 +883,19 @@ pub async fn send_mesh_queries(state: &SharedState) -> Result<(), String> {
             .ok_or_else(|| "no relay configured".to_string())?;
         let peers = st.storage.list_peers().map_err(|e| e.to_string())?;
         let now = now_secs();
-        (st.keypair.clone(), relay_url, peers, now)
+        (
+            st.keypair.clone(),
+            relay_url,
+            peers,
+            now,
+            st.db_path.clone(),
+        )
     };
 
     let since = now.saturating_sub(DEFAULT_MESH_WINDOW_SECS);
+    let geo_cfg = db_path
+        .parent()
+        .and_then(|p| load_identity_geo_config(p).ok());
     let mut sent_count = 0;
 
     for peer in &peers {
@@ -929,6 +943,82 @@ pub async fn send_mesh_queries(state: &SharedState) -> Result<(), String> {
             );
         } else {
             sent_count += 1;
+        }
+
+        if let Some(cfg) = &geo_cfg {
+            let geo_msg = match cfg.default_precision {
+                GeoPrecision::None => None,
+                GeoPrecision::Country => Some(MetaMessage::GeoMessageRequest {
+                    peer_id: keypair.id.clone(),
+                    since_timestamp: since,
+                    geohash_prefix: None,
+                    country_code: cfg.country_code.clone().filter(|v| !v.is_empty()),
+                    region: None,
+                    city: None,
+                }),
+                GeoPrecision::Region => Some(MetaMessage::GeoMessageRequest {
+                    peer_id: keypair.id.clone(),
+                    since_timestamp: since,
+                    geohash_prefix: None,
+                    country_code: cfg.country_code.clone().filter(|v| !v.is_empty()),
+                    region: cfg.region.clone().filter(|v| !v.is_empty()),
+                    city: None,
+                }),
+                GeoPrecision::City => Some(MetaMessage::GeoMessageRequest {
+                    peer_id: keypair.id.clone(),
+                    since_timestamp: since,
+                    geohash_prefix: None,
+                    country_code: cfg.country_code.clone().filter(|v| !v.is_empty()),
+                    region: cfg.region.clone().filter(|v| !v.is_empty()),
+                    city: cfg.city.clone().filter(|v| !v.is_empty()),
+                }),
+                GeoPrecision::Neighborhood | GeoPrecision::Exact => {
+                    Some(MetaMessage::GeoMessageRequest {
+                        peer_id: keypair.id.clone(),
+                        since_timestamp: since,
+                        geohash_prefix: cfg
+                            .geohash
+                            .clone()
+                            .filter(|g| !g.is_empty())
+                            .map(|g| g.chars().take(5).collect()),
+                        country_code: None,
+                        region: None,
+                        city: None,
+                    })
+                }
+            };
+            if let Some(geo_msg) = geo_msg {
+                let is_empty_geo = matches!(
+                    &geo_msg,
+                    MetaMessage::GeoMessageRequest {
+                        geohash_prefix: None,
+                        country_code: None,
+                        region: None,
+                        city: None,
+                        ..
+                    }
+                );
+                if is_empty_geo {
+                    continue;
+                }
+                if let Ok(payload) = build_meta_payload(&geo_msg) {
+                    if let Ok(envelope) = build_envelope_from_payload(
+                        keypair.id.clone(),
+                        peer.peer_id.clone(),
+                        None,
+                        None,
+                        now,
+                        DEFAULT_TTL_SECONDS,
+                        MessageKind::Meta,
+                        None,
+                        None,
+                        payload,
+                        &keypair.signing_private_key_hex,
+                    ) {
+                        let _ = post_envelope(&relay_url, &envelope);
+                    }
+                }
+            }
         }
     }
 

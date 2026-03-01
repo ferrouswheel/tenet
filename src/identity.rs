@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{generate_keypair, StoredKeypair};
+use crate::geo::GeoConfig;
 use crate::storage::{db_path, IdentityRow, Storage, StorageError};
 
 /// Top-level configuration stored in `{data_dir}/config.toml`.
@@ -99,6 +100,11 @@ fn config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("config.toml")
 }
 
+/// Path to identity-local config (`{identity_dir}/config.toml`).
+fn identity_config_path(identity_dir: &Path) -> PathBuf {
+    identity_dir.join("config.toml")
+}
+
 /// Load the top-level config, returning defaults if it doesn't exist.
 pub fn load_config(data_dir: &Path) -> Result<TenetConfig, IdentityError> {
     let path = config_path(data_dir);
@@ -115,6 +121,44 @@ pub fn save_config(data_dir: &Path, config: &TenetConfig) -> Result<(), Identity
     let contents =
         toml::to_string_pretty(config).map_err(|e| IdentityError::Toml(e.to_string()))?;
     fs::write(&path, contents)?;
+    Ok(())
+}
+
+/// Load identity-local geo config. Missing config defaults to `GeoConfig::default()`.
+pub fn load_identity_geo_config(identity_dir: &Path) -> Result<GeoConfig, IdentityError> {
+    let path = identity_config_path(identity_dir);
+    if !path.exists() {
+        return Ok(GeoConfig::default());
+    }
+    let contents = fs::read_to_string(&path)?;
+    let value: toml::Value =
+        toml::from_str(&contents).map_err(|e| IdentityError::Toml(e.to_string()))?;
+    let Some(geo_val) = value.get("geo").cloned() else {
+        return Ok(GeoConfig::default());
+    };
+    geo_val
+        .try_into()
+        .map_err(|e| IdentityError::Toml(format!("invalid [geo] config: {e}")))
+}
+
+/// Save identity-local geo config to `{identity_dir}/config.toml`, preserving
+/// any unrelated keys already present in the same file.
+pub fn save_identity_geo_config(identity_dir: &Path, geo: &GeoConfig) -> Result<(), IdentityError> {
+    let path = identity_config_path(identity_dir);
+    let mut root = if path.exists() {
+        let contents = fs::read_to_string(&path)?;
+        toml::from_str::<toml::Value>(&contents)
+            .unwrap_or_else(|_| toml::Value::Table(Default::default()))
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let geo_value = toml::Value::try_from(geo).map_err(|e| IdentityError::Toml(e.to_string()))?;
+    let table = root
+        .as_table_mut()
+        .ok_or_else(|| IdentityError::Toml("identity config must be a table".to_string()))?;
+    table.insert("geo".to_string(), geo_value);
+    let rendered = toml::to_string_pretty(&root).map_err(|e| IdentityError::Toml(e.to_string()))?;
+    fs::write(path, rendered)?;
     Ok(())
 }
 
@@ -205,7 +249,7 @@ pub fn resolve_identity(
     // (for tenet-cli which used identity.json directly)
     migrate_legacy_json_to_identities(data_dir)?;
 
-    let mut identities = list_identities(data_dir)?;
+    let identities = list_identities(data_dir)?;
     let config = load_config(data_dir)?;
 
     // Determine which identity to select
@@ -474,7 +518,7 @@ mod tests {
         let data_dir = tmp.path();
 
         // Create two identities
-        let id1 = create_identity(data_dir).unwrap();
+        let _id1 = create_identity(data_dir).unwrap();
         let id2 = create_identity(data_dir).unwrap();
         let sid2 = short_id(&id2.keypair.id);
 
@@ -530,5 +574,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let entries = list_identities(tmp.path()).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_identity_geo_config_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let resolved = resolve_identity(data_dir, None).unwrap();
+
+        let geo = GeoConfig {
+            default_precision: crate::geo::GeoPrecision::City,
+            country_code: Some("US".to_string()),
+            region: Some("California".to_string()),
+            city: Some("San Francisco".to_string()),
+            geohash: None,
+        };
+        save_identity_geo_config(&resolved.identity_dir, &geo).unwrap();
+        let loaded = load_identity_geo_config(&resolved.identity_dir).unwrap();
+        assert_eq!(loaded, geo);
     }
 }

@@ -2526,6 +2526,9 @@ impl SimulationClient {
         match meta {
             MetaMessage::MessageRequest {
                 since_timestamp, ..
+            }
+            | MetaMessage::GeoMessageRequest {
+                since_timestamp, ..
             } => {
                 // Phase 1 responder: offer IDs of public messages we have since the timestamp.
                 let message_ids: Vec<String> = self
@@ -2547,7 +2550,8 @@ impl SimulationClient {
                     .into_iter()
                     .collect()
             }
-            MetaMessage::MeshAvailable { message_ids, .. } => {
+            MetaMessage::MeshAvailable { message_ids, .. }
+            | MetaMessage::GeoMeshAvailable { message_ids, .. } => {
                 // Phase 2 requester: request the IDs we do not have yet.
                 let unknown_ids: Vec<String> = message_ids
                     .iter()

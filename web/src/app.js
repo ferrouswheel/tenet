@@ -36,6 +36,7 @@ let serverBuildTimestamp = null; // build_timestamp from first successful health
 const PAGE_SIZE = 50;
 const COMMENTS_PAGE_SIZE = 100;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024; // 10 MB
+const GEO_COMPOSE_PREF_KEY = 'tenet.geo.compose.pref.v1';
 
 // ---------------------------------------------------------------------------
 // API helpers
@@ -229,11 +230,14 @@ function renderMessage(m) {
         ? `<img src="/api/attachments/${encodeURIComponent(avatarHash)}" alt="" />`
         : avatarInitial;
 
+    const flag = countryFlagFromMessage(m);
+
     return `<div class="message${unreadClass}${clickableClass}" data-id="${m.message_id}" ${onclick}>
         <div class="msg-avatar" onclick="event.stopPropagation();navigateToPeer('${m.sender_id}')">${avatarInner}</div>
         <div class="msg-content">
             <div class="msg-header">
                 <span class="msg-badge ${kindClass}">${kindClass}</span>
+                ${flag ? `<span class="msg-geo-flag" title="${escapeHtml(m.geo.country_code)}">${flag}</span>` : ''}
                 <span class="${senderClass}" title="${m.sender_id}" onclick="event.stopPropagation();navigateToPeer('${m.sender_id}')">${senderLabel}</span>
                 <span class="msg-time" title="${msgTimeTitle(m)}">${timeAgo(m.timestamp)}</span>
             </div>
@@ -243,6 +247,31 @@ function renderMessage(m) {
             ${commentCountHtml}
         </div>
     </div>`;
+}
+
+function countryFlagFromMessage(m) {
+    const code = m && m.geo && m.geo.country_code ? String(m.geo.country_code).toUpperCase() : '';
+    if (!/^[A-Z]{2}$/.test(code)) return '';
+    const A = 0x1F1E6;
+    return String.fromCodePoint(A + code.charCodeAt(0) - 65, A + code.charCodeAt(1) - 65);
+}
+
+function geoLabelFromMessage(m) {
+    const geo = m && m.geo ? m.geo : null;
+    if (!geo) return '';
+    if (geo.city && geo.region && geo.country_code) {
+        return `${geo.city}, ${geo.region}, ${geo.country_code}`;
+    }
+    if (geo.region && geo.country_code) {
+        return `${geo.region}, ${geo.country_code}`;
+    }
+    if (geo.country_code) {
+        return geo.country_code;
+    }
+    if (geo.geohash) {
+        return geo.geohash;
+    }
+    return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +491,13 @@ function updateComposeForTimeline() {
     const select = document.getElementById('compose-kind');
     select.innerHTML = '';
     const groupSelect = document.getElementById('compose-group-id');
+    const geoMode = document.getElementById('compose-geo-mode');
+    const geoCountry = document.getElementById('compose-geo-country');
+    const geoRegion = document.getElementById('compose-geo-region');
+    const geoCity = document.getElementById('compose-geo-city');
+    const geoGeohash = document.getElementById('compose-geo-geohash');
+    const geoLat = document.getElementById('compose-geo-lat');
+    const geoLon = document.getElementById('compose-geo-lon');
 
     if (currentFilter === 'friend_group') {
         const opt = document.createElement('option');
@@ -487,12 +523,23 @@ function updateComposeForTimeline() {
                 }
             }
         }
+        if (geoMode) geoMode.style.display = 'none';
+        if (geoCountry) geoCountry.style.display = 'none';
+        if (geoRegion) geoRegion.style.display = 'none';
+        if (geoCity) geoCity.style.display = 'none';
+        if (geoGeohash) geoGeohash.style.display = 'none';
+        if (geoLat) geoLat.style.display = 'none';
+        if (geoLon) geoLon.style.display = 'none';
     } else {
         const opt = document.createElement('option');
         opt.value = 'public';
         opt.textContent = 'Public';
         select.appendChild(opt);
         if (groupSelect) groupSelect.style.display = 'none';
+        if (geoMode) {
+            geoMode.style.display = '';
+            updateComposeGeoInputs();
+        }
     }
 }
 
@@ -637,6 +684,8 @@ function renderPostDetail(post) {
     const kindClass = post.message_kind || 'public';
     const attachmentsHtml = renderAttachments(post.attachments);
     const reactionsHtml = renderReactions(post);
+    const geoFlag = countryFlagFromMessage(post);
+    const geoLabel = geoLabelFromMessage(post);
 
     const avatarHash = isSelf ? (myProfile && myProfile.avatar_hash) : (peer && peer.avatar_hash);
     const avatarInner = avatarHash
@@ -649,9 +698,11 @@ function renderPostDetail(post) {
             <div class="msg-content">
                 <div class="msg-header" style="margin-bottom:0.4rem;">
                     <span class="msg-badge ${kindClass}">${kindClass}</span>
+                    ${geoFlag ? `<span class="msg-geo-flag" title="${post.geo && post.geo.country_code ? escapeHtml(post.geo.country_code) : ''}">${geoFlag}</span>` : ''}
                     <span class="${senderClass}" title="${post.sender_id}" style="cursor:pointer" onclick="showPeerProfile('${post.sender_id}')">${escapeHtml(senderLabel)}</span>
                     <span class="msg-time" title="${msgTimeTitle(post)}">${timeAgo(post.timestamp)}</span>
                 </div>
+                ${geoLabel ? `<div class="msg-geo-text">${escapeHtml(geoLabel)}</div>` : ''}
                 <div class="post-body">${escapeHtml(post.body || '')}</div>
                 ${attachmentsHtml}
                 ${reactionsHtml}
@@ -841,6 +892,8 @@ async function sendMessage() {
         if (kind === 'public') {
             endpoint = '/api/messages/public';
             payload = { body: body || '', attachments: uploadedAttachments };
+            const geo = buildComposeGeoPayload();
+            if (geo !== undefined) payload.geo = geo;
         } else if (kind === 'group') {
             const groupId = document.getElementById('compose-group-id').value;
             if (!groupId) {
@@ -858,12 +911,124 @@ async function sendMessage() {
         await apiPost(endpoint, payload);
         document.getElementById('compose-body').value = '';
         clearAttachments();
+        saveComposeGeoPreference();
         showToast('Message sent');
     } catch (e) {
         showToast('Send failed: ' + e.message);
     } finally {
         btn.disabled = false;
     }
+}
+
+function composeGeoFields() {
+    return {
+        mode: document.getElementById('compose-geo-mode'),
+        country: document.getElementById('compose-geo-country'),
+        region: document.getElementById('compose-geo-region'),
+        city: document.getElementById('compose-geo-city'),
+        geohash: document.getElementById('compose-geo-geohash'),
+        lat: document.getElementById('compose-geo-lat'),
+        lon: document.getElementById('compose-geo-lon'),
+    };
+}
+
+function saveComposeGeoPreference() {
+    const f = composeGeoFields();
+    if (!f.mode) return;
+    const pref = {
+        mode: f.mode.value,
+        country: f.country.value || '',
+        region: f.region.value || '',
+        city: f.city.value || '',
+        geohash: f.geohash.value || '',
+        lat: f.lat.value || '',
+        lon: f.lon.value || '',
+    };
+    try {
+        localStorage.setItem(GEO_COMPOSE_PREF_KEY, JSON.stringify(pref));
+    } catch (_) {}
+}
+
+function loadComposeGeoPreference() {
+    try {
+        const raw = localStorage.getItem(GEO_COMPOSE_PREF_KEY);
+        if (!raw) return null;
+        const pref = JSON.parse(raw);
+        if (!pref || typeof pref !== 'object') return null;
+        return pref;
+    } catch (_) {
+        return null;
+    }
+}
+
+function updateComposeGeoInputs() {
+    const f = composeGeoFields();
+    if (!f.mode) return;
+    const mode = f.mode.value;
+    const showCountry = ['country', 'region', 'city', 'neighborhood', 'exact'].includes(mode);
+    const showRegion = ['region', 'city', 'neighborhood', 'exact'].includes(mode);
+    const showCity = ['city', 'neighborhood', 'exact'].includes(mode);
+    const showGeohash = ['neighborhood', 'exact'].includes(mode);
+    const showLatLon = mode === 'exact';
+
+    f.country.style.display = showCountry ? '' : 'none';
+    f.region.style.display = showRegion ? '' : 'none';
+    f.city.style.display = showCity ? '' : 'none';
+    f.geohash.style.display = showGeohash ? '' : 'none';
+    f.lat.style.display = showLatLon ? '' : 'none';
+    f.lon.style.display = showLatLon ? '' : 'none';
+}
+
+function nonEmpty(v) {
+    const s = (v || '').trim();
+    return s.length ? s : null;
+}
+
+function buildComposeGeoPayload() {
+    const f = composeGeoFields();
+    if (!f.mode) return undefined;
+    const mode = f.mode.value;
+    if (mode === 'none') return null;
+
+    const geo = { precision: mode };
+    const country = nonEmpty(f.country.value);
+    const region = nonEmpty(f.region.value);
+    const city = nonEmpty(f.city.value);
+    const geohash = nonEmpty(f.geohash.value);
+    const lat = nonEmpty(f.lat.value);
+    const lon = nonEmpty(f.lon.value);
+
+    if (country) geo.country_code = country.toUpperCase();
+    if (region) geo.region = region;
+    if (city) geo.city = city;
+    if (geohash) geo.geohash = geohash.toLowerCase();
+    if (lat) geo.lat = Number(lat);
+    if (lon) geo.lon = Number(lon);
+    return geo;
+}
+
+function applyComposeGeoPreference(pref) {
+    const f = composeGeoFields();
+    if (!f.mode || !pref) return;
+    if (pref.mode) f.mode.value = pref.mode;
+    if (typeof pref.country === 'string') f.country.value = pref.country;
+    if (typeof pref.region === 'string') f.region.value = pref.region;
+    if (typeof pref.city === 'string') f.city.value = pref.city;
+    if (typeof pref.geohash === 'string') f.geohash.value = pref.geohash;
+    if (typeof pref.lat === 'string') f.lat.value = pref.lat;
+    if (typeof pref.lon === 'string') f.lon.value = pref.lon;
+    updateComposeGeoInputs();
+}
+
+function applyComposeGeoSettingsDefault(settings) {
+    const f = composeGeoFields();
+    if (!f.mode || !settings) return;
+    if (settings.default_precision) f.mode.value = settings.default_precision;
+    if (settings.country_code) f.country.value = settings.country_code;
+    if (settings.region) f.region.value = settings.region;
+    if (settings.city) f.city.value = settings.city;
+    if (settings.geohash) f.geohash.value = settings.geohash;
+    updateComposeGeoInputs();
 }
 
 // ---------------------------------------------------------------------------
@@ -2639,6 +2804,31 @@ async function init() {
     handleRoute();
 
     connectWs();
+
+    const geoMode = document.getElementById('compose-geo-mode');
+    if (geoMode) {
+        geoMode.addEventListener('change', () => {
+            updateComposeGeoInputs();
+            saveComposeGeoPreference();
+        });
+        const f = composeGeoFields();
+        [f.country, f.region, f.city, f.geohash, f.lat, f.lon].forEach((el) => {
+            if (!el) return;
+            el.addEventListener('change', saveComposeGeoPreference);
+            el.addEventListener('blur', saveComposeGeoPreference);
+        });
+
+        // Initial behavior: server default setting, overridden by remembered last-used compose setting.
+        try {
+            const settings = await apiGet('/api/settings/geo');
+            applyComposeGeoSettingsDefault(settings);
+        } catch (_) {
+            updateComposeGeoInputs();
+        }
+        const remembered = loadComposeGeoPreference();
+        if (remembered) applyComposeGeoPreference(remembered);
+        updateComposeGeoInputs();
+    }
 }
 
 init();
