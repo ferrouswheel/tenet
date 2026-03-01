@@ -14,8 +14,9 @@
 - [x] `src/web_client/config.rs` — geo constants
 - [x] `src/web_client/sync.rs` — send `GeoMessageRequest` after sync
 - [x] `src/bin/tenet-crypto.rs` — `geo set` / `geo show` subcommands
-- [ ] `src/simulation/config.rs` — `geo` field in peer/cohort config
-- [ ] `src/client.rs` (SimulationClient) — handle `GeoMessageRequest`/`GeoMeshAvailable`
+- [x] `src/simulation/config.rs` — `geo` field in peer/cohort config
+- [x] `src/client.rs` (SimulationClient) — handle `GeoMessageRequest`/`GeoMeshAvailable`
+- [x] `scenarios/geo_messages_test.toml` — geo-enabled simulation fixture
 - [ ] `src/bin/debugger.rs` — `geo-query` and `set-geo` REPL commands
 - [ ] `android/tenet-ffi/src/types.rs` — `FfiGeoLocation`
 - [ ] `android/tenet-ffi/src/lib.rs` — `resolve_geo()`, `FfiMessage.geo`
@@ -813,7 +814,7 @@ Add `FfiGeoLocation? geo` to the existing `FfiMessage` dictionary.
 
 ### `src/simulation/config.rs`
 
-Add an optional `geo` field to cohort and node configuration:
+Add an optional `geo` field to cohort configuration plus per-node overrides:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,7 +835,8 @@ pub struct SimGeoConfig {
 ```
 
 `OnlineCohortDefinition` variants gain `geo: Option<SimGeoConfig>`.
-Individual node overrides can be added in an `overrides` map.
+Individual node overrides are configured via
+`SimulationConfig.node_geo_overrides: HashMap<String, SimGeoConfig>`.
 
 Example scenario snippet:
 

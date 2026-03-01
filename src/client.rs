@@ -6,6 +6,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{generate_content_key, StoredKeypair, CONTENT_KEY_SIZE, NONCE_SIZE};
+use crate::geo::{matches_geo_query, parse_public_message_body, GeoQuery, PublicMessageBody};
 use crate::protocol::{
     build_encrypted_payload, build_envelope_from_payload, build_meta_payload,
     build_plaintext_envelope, decode_meta_payload, decrypt_encrypted_payload, Envelope,
@@ -13,8 +14,9 @@ use crate::protocol::{
 };
 
 use crate::simulation::{
-    HistoricalMessage, MessageEncryption, MetricsTracker, RollingLatencyTracker, SimMessage,
-    SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO, SIMULATION_PAYLOAD_AAD,
+    HistoricalMessage, MessageEncryption, MetricsTracker, RollingLatencyTracker, SimGeoConfig,
+    SimMessage, SimulationMetrics, SIMULATION_ACK_WINDOW_STEPS, SIMULATION_HPKE_INFO,
+    SIMULATION_PAYLOAD_AAD,
 };
 
 use crate::groups::{GroupError, GroupInfo, GroupManager};
@@ -1640,6 +1642,7 @@ pub struct SimulationClient {
     metrics: ClientMetrics,
     log_sink: Option<std::sync::Arc<dyn ClientLogSink>>,
     peer_registry: PeerRegistry,
+    geo_config: Option<SimGeoConfig>,
     public_message_cache: Vec<Envelope>,
     public_message_metadata: HashMap<ContentId, PublicMessageMetadata>,
     group_manager: GroupManager,
@@ -1660,6 +1663,7 @@ impl Clone for SimulationClient {
             metrics: self.metrics.clone(),
             log_sink: self.log_sink.clone(),
             peer_registry: self.peer_registry.clone(),
+            geo_config: self.geo_config.clone(),
             public_message_cache: self.public_message_cache.clone(),
             public_message_metadata: self.public_message_metadata.clone(),
             group_manager: self.group_manager.clone(),
@@ -1682,6 +1686,7 @@ impl std::fmt::Debug for SimulationClient {
             .field("metrics", &self.metrics)
             .field("has_log_sink", &self.log_sink.is_some())
             .field("peer_registry", &self.peer_registry)
+            .field("geo_config", &self.geo_config)
             .field(
                 "public_message_cache_size",
                 &self.public_message_cache.len(),
@@ -1714,6 +1719,7 @@ impl SimulationClient {
             metrics: ClientMetrics::default(),
             log_sink,
             peer_registry: PeerRegistry::new(),
+            geo_config: None,
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
             group_manager: GroupManager::new(),
@@ -1733,6 +1739,10 @@ impl SimulationClient {
 
     pub fn set_log_sink(&mut self, log_sink: Option<std::sync::Arc<dyn ClientLogSink>>) {
         self.log_sink = log_sink;
+    }
+
+    pub fn set_geo_config(&mut self, geo_config: Option<SimGeoConfig>) {
+        self.geo_config = geo_config;
     }
 
     pub fn add_peer(&mut self, peer_id: String, signing_public_key_hex: String) {
@@ -1830,7 +1840,15 @@ impl SimulationClient {
             MessageKind::Public,
             None,
             None,
-            message,
+            PublicMessageBody {
+                body: message.to_string(),
+                geo: self
+                    .geo_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.post_geo_location()),
+            }
+            .to_payload_json()
+            .ok()?,
             [0u8; 16], // salt
             &context.keypairs.get(&self.id)?.signing_private_key_hex,
         )
@@ -1902,7 +1920,9 @@ impl SimulationClient {
             id: envelope.header.message_id.0.clone(),
             sender: envelope.header.sender_id.clone(),
             recipient: self.id.clone(),
-            body: envelope.payload.body.clone(),
+            body: parse_public_message_body(&envelope.payload.body)
+                .map(|p| p.body)
+                .unwrap_or_else(|_| envelope.payload.body.clone()),
             payload: envelope.payload.clone(),
             message_kind: MessageKind::Public,
             group_id: None,
@@ -2526,9 +2546,6 @@ impl SimulationClient {
         match meta {
             MetaMessage::MessageRequest {
                 since_timestamp, ..
-            }
-            | MetaMessage::GeoMessageRequest {
-                since_timestamp, ..
             } => {
                 // Phase 1 responder: offer IDs of public messages we have since the timestamp.
                 let message_ids: Vec<String> = self
@@ -2545,6 +2562,46 @@ impl SimulationClient {
                     peer_id: self.id.clone(),
                     message_ids,
                     since_timestamp: *since_timestamp,
+                };
+                self.build_meta_envelope(&self.id, sender_id, step, &response, context)
+                    .into_iter()
+                    .collect()
+            }
+            MetaMessage::GeoMessageRequest {
+                since_timestamp,
+                geohash_prefix,
+                country_code,
+                region,
+                city,
+                ..
+            } => {
+                let query = GeoQuery {
+                    geohash_prefix: geohash_prefix.clone(),
+                    country_code: country_code.clone(),
+                    region: region.clone(),
+                    city: city.clone(),
+                };
+                let message_ids: Vec<String> = self
+                    .public_message_cache
+                    .iter()
+                    .filter(|env| env.header.timestamp >= *since_timestamp)
+                    .filter(|env| {
+                        parse_public_message_body(&env.payload.body)
+                            .ok()
+                            .map(|p| matches_geo_query(p.geo.as_ref(), &query))
+                            .unwrap_or(false)
+                    })
+                    .map(|env| env.header.message_id.0.clone())
+                    .take(MAX_SIM_MESH_IDS)
+                    .collect();
+                let response = MetaMessage::GeoMeshAvailable {
+                    peer_id: self.id.clone(),
+                    message_ids,
+                    since_timestamp: *since_timestamp,
+                    geohash_prefix: geohash_prefix.clone(),
+                    country_code: country_code.clone(),
+                    region: region.clone(),
+                    city: city.clone(),
                 };
                 self.build_meta_envelope(&self.id, sender_id, step, &response, context)
                     .into_iter()
@@ -2685,6 +2742,7 @@ impl SimulationClient {
             metrics: ClientMetrics::default(),
             log_sink,
             peer_registry: PeerRegistry::new(),
+            geo_config: None,
             public_message_cache: Vec::new(),
             public_message_metadata: HashMap::new(),
             group_manager: GroupManager::new(),

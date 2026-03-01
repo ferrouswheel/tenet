@@ -22,8 +22,8 @@ pub use config::{
     GroupSizeDistribution, GroupsConfig, LatencyDistribution, MessageEncryption,
     MessageSizeDistribution, MessageType, MessageTypeWeights, NetworkConditions,
     OnlineAvailability, OnlineCohortDefinition, PostFrequency, ReactionConfig, RelayConfigToml,
-    SimulatedTimeConfig, SimulationConfig, SimulationScenarioConfig, SimulationTimingConfig,
-    TimeControlConfig, TimeDistribution,
+    SimGeoConfig, SimulatedTimeConfig, SimulationConfig, SimulationScenarioConfig,
+    SimulationTimingConfig, TimeControlConfig, TimeDistribution,
 };
 pub use event::{
     Event, EventLog, EventOutcome, EventQueue, ProcessedEvent, ScheduledEvent, SimulationClock,

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use rand::Rng;
 use rand_distr::{Distribution, LogNormal, Normal};
 use serde::{Deserialize, Serialize};
 
+use crate::geo::{GeoLocation, GeoPrecision, GeoQuery};
 use crate::relay::RelayConfig;
 
 fn default_seconds_per_step() -> u64 {
@@ -101,6 +103,9 @@ pub struct SimulationConfig {
     pub availability: Option<OnlineAvailability>,
     #[serde(default)]
     pub cohorts: Vec<OnlineCohortDefinition>,
+    /// Per-node geo overrides keyed by node ID.
+    #[serde(default)]
+    pub node_geo_overrides: HashMap<String, SimGeoConfig>,
     pub message_size_distribution: MessageSizeDistribution,
     pub encryption: Option<MessageEncryption>,
     #[serde(default)]
@@ -112,6 +117,82 @@ pub struct SimulationConfig {
     #[serde(default)]
     pub friend_request_config: Option<FriendRequestConfig>,
     pub seed: u64,
+}
+
+fn default_geo_precision() -> String {
+    "city".to_string()
+}
+
+/// Geo configuration for simulated peers/cohorts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimGeoConfig {
+    pub country_code: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub geohash: Option<String>,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
+    #[serde(default = "default_geo_precision")]
+    pub post_precision: String,
+    #[serde(default = "default_geo_precision")]
+    pub query_precision: String,
+}
+
+impl SimGeoConfig {
+    pub fn post_geo_location(&self) -> Option<GeoLocation> {
+        let precision = self.post_precision.parse::<GeoPrecision>().ok()?;
+        if precision == GeoPrecision::None {
+            return None;
+        }
+        Some(GeoLocation {
+            precision,
+            country_code: Some(self.country_code.clone()),
+            region: self.region.clone(),
+            city: self.city.clone(),
+            geohash: self.geohash.clone(),
+            lat: self.lat,
+            lon: self.lon,
+        })
+    }
+
+    pub fn query_geo(&self) -> Option<GeoQuery> {
+        let precision = self.query_precision.parse::<GeoPrecision>().ok()?;
+        match precision {
+            GeoPrecision::None => None,
+            GeoPrecision::Country => Some(GeoQuery {
+                geohash_prefix: None,
+                country_code: Some(self.country_code.clone()),
+                region: None,
+                city: None,
+            }),
+            GeoPrecision::Region => Some(GeoQuery {
+                geohash_prefix: None,
+                country_code: Some(self.country_code.clone()),
+                region: self.region.clone(),
+                city: None,
+            }),
+            GeoPrecision::City => Some(GeoQuery {
+                geohash_prefix: None,
+                country_code: Some(self.country_code.clone()),
+                region: self.region.clone(),
+                city: self.city.clone(),
+            }),
+            GeoPrecision::Neighborhood | GeoPrecision::Exact => Some(GeoQuery {
+                geohash_prefix: self
+                    .geohash
+                    .as_ref()
+                    .map(|g| g.chars().take(5).collect::<String>()),
+                country_code: None,
+                region: None,
+                city: None,
+            }),
+        }
+    }
 }
 
 /// Configuration for dynamic friend-request simulation.
@@ -271,6 +352,8 @@ pub enum OnlineCohortDefinition {
         share: f64,
         #[serde(default)]
         message_type_weights: Option<MessageTypeWeights>,
+        #[serde(default)]
+        geo: Option<SimGeoConfig>,
     },
     RarelyOnline {
         name: String,
@@ -278,6 +361,8 @@ pub enum OnlineCohortDefinition {
         online_probability: f64,
         #[serde(default)]
         message_type_weights: Option<MessageTypeWeights>,
+        #[serde(default)]
+        geo: Option<SimGeoConfig>,
     },
     Diurnal {
         name: String,
@@ -289,6 +374,8 @@ pub enum OnlineCohortDefinition {
         hourly_weights: Vec<f64>,
         #[serde(default)]
         message_type_weights: Option<MessageTypeWeights>,
+        #[serde(default)]
+        geo: Option<SimGeoConfig>,
     },
 }
 
@@ -308,6 +395,14 @@ impl OnlineCohortDefinition {
                 message_type_weights,
                 ..
             } => message_type_weights.clone().unwrap_or_default(),
+        }
+    }
+
+    pub fn geo_config(&self) -> Option<&SimGeoConfig> {
+        match self {
+            OnlineCohortDefinition::AlwaysOnline { geo, .. }
+            | OnlineCohortDefinition::RarelyOnline { geo, .. }
+            | OnlineCohortDefinition::Diurnal { geo, .. } => geo.as_ref(),
         }
     }
 }

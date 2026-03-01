@@ -76,6 +76,7 @@ pub struct NodeCohortAssignment {
     pub node_id: String,
     pub cohort_name: String,
     pub message_type_weights: MessageTypeWeights,
+    pub geo_config: Option<super::SimGeoConfig>,
 }
 
 pub struct OnlineSchedulePlan {
@@ -344,6 +345,9 @@ pub fn build_simulation_inputs(config: &SimulationConfig) -> SimulationInputs {
             .cloned()
             .unwrap_or_default();
         let mut client = SimulationHarness::build_client(node_id, schedule);
+        if let Some(assignment) = schedule_plan.node_cohort_assignments.get(node_id) {
+            client.set_geo_config(assignment.geo_config.clone());
+        }
 
         // Attach a per-peer in-memory StorageMessageHandler with crypto params so
         // the group invite flow (GroupInvite → GroupInviteAccept → group_key_distribution)
@@ -893,34 +897,38 @@ pub fn build_online_events(
         .unwrap_or_else(MessageTypeWeights::default);
 
     for node_id in &config.node_ids {
-        let (cohort_name_str, events, message_weights) = if let Some(cohorts) = cohorts {
-            let cohort = select_cohort(cohorts, rng);
-            let name = cohort_name(cohort).to_string();
-            let events =
-                generate_online_schedule_events(node_id, cohort, start_time, end_time, rng);
+        let (cohort_name_str, events, message_weights, mut geo_config) =
+            if let Some(cohorts) = cohorts {
+                let cohort = select_cohort(cohorts, rng);
+                let name = cohort_name(cohort).to_string();
+                let events =
+                    generate_online_schedule_events(node_id, cohort, start_time, end_time, rng);
 
-            // Use cohort-specific weights if defined, otherwise use config default
-            let weights = cohort.message_type_weights();
-            let weights = if weights.direct == 1.0 && weights.public == 0.0 && weights.group == 0.0
-            {
-                default_weights.clone()
+                // Use cohort-specific weights if defined, otherwise use config default
+                let weights = cohort.message_type_weights();
+                let weights =
+                    if weights.direct == 1.0 && weights.public == 0.0 && weights.group == 0.0 {
+                        default_weights.clone()
+                    } else {
+                        weights
+                    };
+                (name, events, weights, cohort.geo_config().cloned())
             } else {
-                weights
+                // Legacy mode: always online
+                let name = "legacy".to_string();
+                let events = vec![ScheduledEvent {
+                    time: start_time,
+                    event: Event::OnlineTransition {
+                        client_id: node_id.clone(),
+                        going_online: true,
+                    },
+                    event_id: 0,
+                }];
+                (name, events, default_weights.clone(), None)
             };
-            (name, events, weights)
-        } else {
-            // Legacy mode: always online
-            let name = "legacy".to_string();
-            let events = vec![ScheduledEvent {
-                time: start_time,
-                event: Event::OnlineTransition {
-                    client_id: node_id.clone(),
-                    going_online: true,
-                },
-                event_id: 0,
-            }];
-            (name, events, default_weights.clone())
-        };
+        if let Some(override_geo) = config.node_geo_overrides.get(node_id) {
+            geo_config = Some(override_geo.clone());
+        }
 
         all_events.extend(events);
 
@@ -930,6 +938,7 @@ pub fn build_online_events(
                 node_id: node_id.clone(),
                 cohort_name: cohort_name_str,
                 message_type_weights: message_weights,
+                geo_config,
             },
         );
     }
@@ -1169,6 +1178,7 @@ pub fn generate_message_events(
                 config,
                 encryption,
                 keypairs,
+                None,
                 crypto_rng,
                 counter,
                 rng,
@@ -1206,7 +1216,9 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
         .unwrap_or_else(MessageTypeWeights::default);
 
     for node_id in &config.node_ids {
-        let (cohort_name_str, schedule, message_weights) = if let Some(cohorts) = cohorts {
+        let (cohort_name_str, schedule, message_weights, mut geo_config) = if let Some(cohorts) =
+            cohorts
+        {
             let cohort = select_cohort(cohorts, rng);
             let name = cohort_name(cohort).to_string();
             let schedule = build_cohort_schedule(cohort, steps, simulated_seconds_per_step, rng);
@@ -1220,12 +1232,15 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
             } else {
                 weights
             };
-            (name, schedule, weights)
+            (name, schedule, weights, cohort.geo_config().cloned())
         } else {
             let name = "legacy".to_string();
             let schedule = build_availability_schedule(config, rng);
-            (name, schedule, default_weights.clone())
+            (name, schedule, default_weights.clone(), None)
         };
+        if let Some(override_geo) = config.node_geo_overrides.get(node_id) {
+            geo_config = Some(override_geo.clone());
+        }
 
         let online_count = schedule.iter().filter(|online| **online).count();
         *cohort_online_counts
@@ -1243,6 +1258,7 @@ pub fn build_online_schedules(config: &SimulationConfig, rng: &mut impl Rng) -> 
                 node_id: node_id.clone(),
                 cohort_name: cohort_name_str,
                 message_type_weights: message_weights,
+                geo_config,
             },
         );
     }
@@ -1300,6 +1316,9 @@ pub fn build_planned_sends(
             .get(node_id)
             .map(|a| &a.message_type_weights)
             .unwrap_or(&default_weights);
+        let node_geo = node_cohort_assignments
+            .get(node_id)
+            .and_then(|a| a.geo_config.as_ref());
 
         match &config.post_frequency {
             PostFrequency::Poisson {
@@ -1331,6 +1350,7 @@ pub fn build_planned_sends(
                             config,
                             encryption,
                             keypairs,
+                            node_geo,
                             &mut crypto_rng,
                             &mut counter,
                             rng,
@@ -1352,6 +1372,7 @@ pub fn build_planned_sends(
                                 config,
                                 encryption,
                                 keypairs,
+                                node_geo,
                                 &mut crypto_rng,
                                 &mut counter,
                                 rng,
@@ -1392,6 +1413,7 @@ pub fn build_planned_sends(
                         config,
                         encryption,
                         keypairs,
+                        node_geo,
                         &mut crypto_rng,
                         &mut counter,
                         rng,
@@ -1414,6 +1436,7 @@ fn build_planned_message(
     config: &SimulationConfig,
     encryption: &MessageEncryption,
     keypairs: &HashMap<String, StoredKeypair>,
+    node_geo: Option<&super::SimGeoConfig>,
     crypto_rng: &mut Option<&mut dyn RngCore>,
     counter: &mut usize,
     rng: &mut impl Rng,
@@ -1450,7 +1473,13 @@ fn build_planned_message(
             let body = generate_message_body(rng, &config.message_size_distribution);
             // Public messages are always plaintext
             let salt = format!("{node_id}-{counter}");
-            let payload = build_plaintext_payload(body.clone(), salt.as_bytes());
+            let payload_body = crate::geo::PublicMessageBody {
+                body: body.clone(),
+                geo: node_geo.and_then(|g| g.post_geo_location()),
+            }
+            .to_payload_json()
+            .expect("serialize simulation public payload");
+            let payload = build_plaintext_payload(payload_body, salt.as_bytes());
             let message_id = ContentId::from_value(&payload).expect("serialize simulation payload");
             *counter += 1;
             Some(SimMessage {
@@ -1739,6 +1768,7 @@ mod tests {
             name: "always".to_string(),
             share: 1.0,
             message_type_weights: None,
+            geo: None,
         };
 
         let events = generate_online_schedule_events("client1", &cohort, 0.0, 3600.0, &mut rng);
@@ -1767,6 +1797,7 @@ mod tests {
             share: 0.3,
             online_probability: 0.5,
             message_type_weights: None,
+            geo: None,
         };
 
         // Test over a full day (86400 seconds)
@@ -1813,6 +1844,7 @@ mod tests {
             timezone_offset_hours: 0,
             hourly_weights: vec![],
             message_type_weights: None,
+            geo: None,
         };
 
         // Test over a full day to ensure we see transitions
@@ -1858,7 +1890,9 @@ mod tests {
                 name: "always".to_string(),
                 share: 1.0,
                 message_type_weights: None,
+                geo: None,
             }],
+            node_geo_overrides: HashMap::new(),
             message_size_distribution: MessageSizeDistribution::Uniform { min: 100, max: 100 },
             encryption: None,
             groups: None,
